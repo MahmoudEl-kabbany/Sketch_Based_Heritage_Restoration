@@ -1,0 +1,11 @@
+# Output images
+contour_outputs/
+
+# Test input images
+test_images/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
