@@ -59,8 +59,9 @@ def extract_and_draw(binary_img, mode, mode_name):
         binary_img.copy(), mode, cv2.CHAIN_APPROX_SIMPLE
     )
 
-    # Convert to BGR so we can draw coloured contours
-    canvas = cv2.cvtColor(binary_img.copy(), cv2.COLOR_GRAY2BGR)
+    # Convert to BGR (inverted: white bg) so we can draw coloured contours
+    display_bg = cv2.bitwise_not(binary_img)
+    canvas = cv2.cvtColor(display_bg, cv2.COLOR_GRAY2BGR)
 
     print(f"\n{'=' * 60}")
     print(f"  Retrieval Mode: {mode_name}  —  {len(contours)} contour(s) found")
@@ -110,7 +111,7 @@ def compare_approximations(binary_img):
         binary_img.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
 
-    canvas = cv2.cvtColor(binary_img.copy(), cv2.COLOR_GRAY2BGR)
+    canvas = cv2.cvtColor(cv2.bitwise_not(binary_img), cv2.COLOR_GRAY2BGR)
 
     total_pts_none = sum(len(c) for c in contours_none)
     total_pts_simple = sum(len(c) for c in contours_simple)
@@ -287,7 +288,7 @@ if __name__ == "__main__":
 
     # Create synthetic test image
     binary_img = create_synthetic_binary_image()
-    cv2.imwrite(os.path.join(OUTPUT_DIR, "synthetic_binary.png"), binary_img)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, "synthetic_binary.png"), cv2.bitwise_not(binary_img))
     print(f"Synthetic binary image saved to {OUTPUT_DIR}/synthetic_binary.png")
 
     # Test all four retrieval modes
