@@ -1,6 +1,7 @@
 # Output images
 contour_outputs/
 preprocessed/
+outputs/
 
 # Test input images
 test_images/
