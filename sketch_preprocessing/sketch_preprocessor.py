@@ -115,7 +115,7 @@ class SketchPreprocessor:
 
     def __init__(
         self,
-        medium: Literal["paper", "stone"] = "stone",
+        medium: Literal["paper", "stone"] = "paper",
         *,
         # ── Stage 1: NLM denoising ─────────────────────────────────────
         nlm_h: Optional[int] = None,

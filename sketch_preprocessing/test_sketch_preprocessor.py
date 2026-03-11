@@ -23,7 +23,7 @@ from sketch_preprocessing.sketch_preprocessor import SketchPreprocessor  # noqa:
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 TEST_IMAGES = [
-    os.path.join(REPO_ROOT, "test_images", "davincidataset_preview.png"),
+    os.path.join(REPO_ROOT, "test_images", "amenherkhepshef.jpg"),
 ]
 OUTPUT_DIR = os.path.join(REPO_ROOT, "test_images", "sketch_preprocessed")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
