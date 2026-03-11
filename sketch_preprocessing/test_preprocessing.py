@@ -82,7 +82,7 @@ TITLES = [
     "Step 1 · Denoised\n(Wiener 5×5)",
     "Step 2 · Texture\n(CLAHE + LBP + Adaptive Gaussian)",
     "Step 3 · Illumination\n(Multi-Scale Retinex)",
-    "Step 4 · Binarized\n(Sauvola  window=15, k=0.2)",
+    "Step 4 · Binarized\n(Sauvola  window=15, k=\u22120.2)",
     "Step 5 · Final\n(Morphological Opening 3×3)",
 ]
 

@@ -54,7 +54,7 @@ class DocumentEnhancer:
         msr_sigmas: Tuple[float, ...] = (15.0, 80.0, 250.0),
         # ── Step 4: Sauvola ─────────────────────────────────────────────
         sauvola_window: int = 15,       # must be odd
-        sauvola_k: float = 0.2,         # positive in skimage's convention (paper uses opposite sign)
+        sauvola_k: float = -0.2,        # paper specifies k=−0.2; raises threshold to capture faint text
         # ── Step 5: Morphological ───────────────────────────────────────
         morph_kernel_size: int = 3,
     ):
