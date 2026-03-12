@@ -24,6 +24,7 @@ from sketch_preprocessing.sketch_preprocessor import SketchPreprocessor  # noqa:
 # ── Paths ──────────────────────────────────────────────────────────────────
 TEST_IMAGES = [
     os.path.join(REPO_ROOT, "test_images", "amenherkhepshef.jpg"),
+    os.path.join(REPO_ROOT, "test_images", "019.png"),
 ]
 OUTPUT_DIR = os.path.join(REPO_ROOT, "test_images", "sketch_preprocessed")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
