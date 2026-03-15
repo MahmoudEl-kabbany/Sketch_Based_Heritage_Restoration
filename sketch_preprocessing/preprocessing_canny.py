@@ -1,86 +1,20 @@
 import cv2
-import numpy as np
 
-# Load original color image and grayscale version
-img = cv2.imread('test_images/aew.webp')
-gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+# 1. Load the image directly in grayscale
+img = cv2.imread("test_images/khepshef.jpg", cv2.IMREAD_GRAYSCALE)
 
-window_name = 'Dual Tuner - Press Q to Save'
-cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+# 2. Apply a Gaussian Blur to reduce high-frequency noise
+blurred = cv2.GaussianBlur(img, (5, 5), 0)
 
-# ==========================================
-# 1. INTERACTIVE UPDATE FUNCTION
-# ==========================================
-def update_ui(val):
-    # Fetch current positions of both trackbars
-    blur_val = cv2.getTrackbarPos('Blur Level', window_name)
-    min_size = cv2.getTrackbarPos('Min Pixel Area', window_name)
-    
-    # Convert slider value (0-10) to an odd kernel size (1, 3, 5 ... 21)
-    ksize = blur_val * 2 + 1 
-    
-    # Apply dynamic Median Blur
-    blurred = cv2.medianBlur(gray, ksize)
-    
-    # Canny Edge Detection
-    edges = cv2.Canny(blurred, 30, 100)
-    
-    # Dilate slightly to connect broken lines
-    kernel = np.ones((2, 2), np.uint8)
-    closed_edges = cv2.dilate(edges, kernel, iterations=1)
-    
-    # Calculate connected components on the fly
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed_edges, connectivity=8)
-    
-    # Filter out tiny dust lines
-    clean_lines = np.zeros_like(gray)
-    for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_AREA] >= min_size:
-            clean_lines[labels == i] = 255
-            
-    # Convert back to 3-channel and stitch next to the original
-    clean_lines_color = cv2.cvtColor(clean_lines, cv2.COLOR_GRAY2BGR)
-    combined_view = cv2.hconcat([img, clean_lines_color])
-    
-    cv2.imshow(window_name, combined_view)
+# 3. Apply Otsu's Thresholding to binarize the image (flattening internal gradients)
+_, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-# ==========================================
-# 2. CREATE TRACKBARS
-# ==========================================
-# Slider for Blur (maps to kernel sizes 1 to 21)
-cv2.createTrackbar('Blur Level', window_name, 3, 10, update_ui)
+# 4. Apply Morphological Closing to fill microscopic holes and solidify the mask
+kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+solid_mask = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
-# Slider for Minimum Line Size
-cv2.createTrackbar('Min Pixel Area', window_name, 50, 500, update_ui)
+# 5. Pass the mathematically flattened mask to the Canny Edge Detector
+edges = cv2.Canny(solid_mask, 100, 200)
 
-# Trigger the UI once to render the first frame
-update_ui(0)
-
-# ==========================================
-# 3. RUN & SAVE LOOP
-# ==========================================
-while True:
-    key = cv2.waitKey(1) & 0xFF
-    if key == 27 or key == ord('q'):
-        break
-
-# Fetch final values
-final_blur = cv2.getTrackbarPos('Blur Level', window_name) * 2 + 1
-final_size = cv2.getTrackbarPos('Min Pixel Area', window_name)
-
-# Re-generate the final pristine canvas
-final_blurred = cv2.medianBlur(gray, final_blur)
-final_edges = cv2.Canny(final_blurred, 30, 100)
-final_closed = cv2.dilate(final_edges, np.ones((2, 2), np.uint8), iterations=1)
-num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(final_closed, connectivity=8)
-
-final_canvas = np.zeros_like(gray)
-for i in range(1, num_labels):
-    if stats[i, cv2.CC_STAT_AREA] >= final_size:
-        final_canvas[labels == i] = 255
-        
-# Save just the black-and-white output
-cv2.imwrite("contour_outputs/final_output.jpg", final_canvas)
-print(f"Saved successfully!\nOptimized Blur Kernel: {final_blur}\nOptimized Minimum Area: {final_size}")
-
-cv2.destroyAllWindows()
+# Save the resulting black-and-white silhouette outline
+cv2.imwrite("contour_outputs/output_contours.jpg", edges)
