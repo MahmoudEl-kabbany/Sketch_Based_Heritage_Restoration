@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 # Load the original image in color for the side-by-side display
-img_color = cv2.imread("test_images/khepshef.jpg")
+img_color = cv2.imread("test_images/walle.avif")
 # Create the grayscale version for your processing pipeline
 img_gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
 
