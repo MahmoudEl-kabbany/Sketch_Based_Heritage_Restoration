@@ -1,13 +1,12 @@
 """
 Elliptic Fourier Descriptor (EFD) Extraction
 =============================================
-Supports both raster images (PNG, JPG, BMP) and vector images (SVG).
+Raster-only EFD extraction and contour reconstruction.
 
 Raster pipeline:  image → denoise → threshold → findContours → EFD
-SVG pipeline:     SVG → svgpathtools parses paths → sample (x,y) points → EFD
 
 Demonstrates:
-  1. Loading & binarizing an image, or parsing SVG paths directly
+    1. Loading & binarizing a raster image
   2. Extracting contours & properties (area, perimeter, bounding box)
   3. Computing EFD coefficients (raw and normalized)
   4. Reconstructing contours from EFD at multiple harmonic orders
@@ -20,6 +19,7 @@ import pyefd
 from pyefd import normalize_efd
 import matplotlib.pyplot as plt
 import os
+import shutil
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "contour_outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -117,85 +117,6 @@ def print_efd_summary(significant, total_count, efd_results):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SVG path extraction  (Approach 2 — direct parsing, no rasterization)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _extract_svg_contours(svg_path, num_samples=300, min_points=5):
-    """
-    Parse an SVG file and extract contour arrays directly from path data.
-
-    Uses svgpathtools to read SVG <path>, <line>, <polyline>, <polygon>,
-    and <rect> elements, then samples evenly-spaced points along each
-    continuous subpath.
-
-    Args:
-        svg_path:    path to the SVG file
-        num_samples: number of points to sample per subpath
-        min_points:  discard subpaths with fewer points
-
-    Returns:
-        contours: list of (N, 2) numpy arrays
-        svg_attributes: dict of SVG-level attributes (width, height, viewBox)
-    """
-    from svgpathtools import svg2paths2
-
-    paths, attributes, svg_attributes = svg2paths2(svg_path)
-
-    contours = []
-    for path in paths:
-        # Split into continuous subpaths (handles M commands / disconnected segments)
-        subpaths = path.continuous_subpaths()
-        for subpath in subpaths:
-            if len(subpath) == 0:
-                continue
-
-            # Sample points along the subpath
-            points = []
-            for t in np.linspace(0, 1, num_samples, endpoint=False):
-                try:
-                    pt = subpath.point(t)
-                    points.append([pt.real, pt.imag])
-                except Exception:
-                    continue
-
-            if len(points) >= min_points:
-                contours.append(np.array(points, dtype=np.float64))
-
-    return contours, svg_attributes
-
-
-def _get_svg_dimensions(svg_attributes):
-    """Extract canvas width and height from SVG attributes."""
-    width, height = 800, 800  # defaults
-
-    # Try viewBox first
-    viewbox = svg_attributes.get("viewBox", "")
-    if viewbox:
-        parts = viewbox.replace(",", " ").split()
-        if len(parts) == 4:
-            try:
-                width = float(parts[2])
-                height = float(parts[3])
-                return width, height
-            except ValueError:
-                pass
-
-    # Fall back to width/height attributes
-    for attr in ["width", "height"]:
-        val = svg_attributes.get(attr, "")
-        val = val.replace("px", "").replace("pt", "").strip()
-        try:
-            if attr == "width":
-                width = float(val)
-            else:
-                height = float(val)
-        except ValueError:
-            pass
-
-    return width, height
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # Raster image contour extraction
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -232,7 +153,7 @@ def _extract_raster_contours(image_path, min_contour_area=100):
 
     cv2.imwrite(os.path.join(OUTPUT_DIR, "real_binary.png"), cv2.bitwise_not(binary))
 
-    # Find contours
+    # Find full contour hierarchy (outer + inner contours)
     contours, hierarchy = cv2.findContours(
         binary.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
     )
@@ -295,69 +216,73 @@ def _process_contours(significant, total_count, efd_orders, colors):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Main entry point — handles both raster and SVG
+# Main entry point — raster only
 # ═══════════════════════════════════════════════════════════════════════════
 
 def process_image(image_path, efd_orders=(5, 10, 20, 40), min_contour_area=100):
     """
-    Process a raster image or SVG file through the full EFD pipeline.
-
-    For raster images: denoise → threshold → findContours → EFD
-    For SVG files:     parse paths → sample points → EFD (no rasterization)
+    Process a raster image through the full EFD pipeline.
 
     Args:
-        image_path:       path to the input image (PNG, JPG, SVG, etc.)
+        image_path:       path to the input raster image (PNG, JPG, BMP, etc.)
         efd_orders:       tuple of harmonic orders to compare
-        min_contour_area: minimum contour area (raster only)
+        min_contour_area: minimum contour area
     """
-    is_svg = image_path.lower().endswith(".svg")
+    if image_path.lower().endswith(".svg"):
+        raise ValueError("SVG parsing has been removed from EFD. Use a raster image instead.")
 
-    if is_svg:
-        _process_svg(image_path, efd_orders)
-    else:
-        _process_raster(image_path, efd_orders, min_contour_area)
+    _process_raster(image_path, efd_orders, min_contour_area)
 
 
-def _process_svg(image_path, efd_orders):
-    """SVG processing pipeline: parse paths → EFD → visualize."""
-    print(f"\n{'=' * 60}")
-    print(f"  SVG Mode  —  Parsing paths directly (no rasterization)")
-    print(f"{'=' * 60}")
+def extract_efd_from_image(image_path, order=10, min_contour_area=100):
+    """
+    Backward-compatible helper to extract EFDs from a raster image.
 
-    try:
-        contours, svg_attrs = _extract_svg_contours(image_path)
-    except ImportError:
-        print("  ⚠  svgpathtools is required for SVG support.")
-        print("     Install with:  pip install svgpathtools")
-        return
-    except Exception as e:
-        print(f"  ⚠  Failed to parse SVG: {e}")
-        return
+    Returns:
+        dict with keys: significant, total_count, efd_results
+    """
+    if image_path.lower().endswith(".svg"):
+        raise ValueError("SVG parsing has been removed from EFD. Use a raster image instead.")
 
-    if not contours:
-        print("  ⚠  No paths found in the SVG file.")
-        return
+    contours, hierarchy, _img, _binary = _extract_raster_contours(
+        image_path, min_contour_area
+    )
+    if contours is None:
+        return {"significant": [], "total_count": 0, "efd_results": []}
+    significant = [(i, cnt) for i, cnt in enumerate(contours)
+                   if cv2.contourArea(cnt) >= min_contour_area]
+    total_count = len(contours)
 
-    print(f"  Found {len(contours)} subpath(s)")
-    for i, c in enumerate(contours):
-        print(f"    Subpath {i}: {len(c)} points, "
-              f"area={_contour_area(c):.1f}, perim={_contour_perimeter(c):.1f}")
-
-    # Build significant list (all SVG contours are kept — no noise filtering)
-    significant = [(i, cnt) for i, cnt in enumerate(contours)]
-
-    # Assign colours
     cmap = plt.cm.tab10(np.linspace(0, 1, max(len(significant), 1)))
     colors = [cmap[i % len(cmap)] for i in range(len(significant))]
+    efd_results = _process_contours(significant, total_count, (order,), colors)
+    return {
+        "significant": significant,
+        "total_count": total_count,
+        "efd_results": efd_results,
+    }
 
-    # Run shared EFD pipeline
-    efd_results = _process_contours(
-        significant, len(contours), efd_orders, colors
+
+def visualize_efd(image_path, order=10, save_path=None, min_contour_area=100):
+    """
+    Backward-compatible visualization wrapper.
+
+    Generates plots/files via the current pipeline and optionally copies the
+    Matplotlib overview image to a custom save path.
+    """
+    process_image(
+        image_path,
+        efd_orders=(order,),
+        min_contour_area=min_contour_area,
     )
 
-    # Visualize
-    _visualize_svg(image_path, contours, significant, colors,
-                   efd_orders, svg_attrs)
+    if save_path:
+        generated = os.path.join(OUTPUT_DIR, "efd_matplotlib_overview.png")
+        if os.path.exists(generated):
+            save_dir = os.path.dirname(save_path)
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+            shutil.copyfile(generated, save_path)
 
 
 def _process_raster(image_path, efd_orders, min_contour_area):
@@ -369,7 +294,7 @@ def _process_raster(image_path, efd_orders, min_contour_area):
         print(f"  ⚠  Could not load image: {image_path}")
         return
 
-    # Filter by minimum area
+    # Keep all contours from the RETR_TREE hierarchy, filtered only by area.
     significant = [(i, cnt) for i, cnt in enumerate(contours)
                    if cv2.contourArea(cnt) >= min_contour_area]
 
@@ -378,9 +303,8 @@ def _process_raster(image_path, efd_orders, min_contour_area):
           f"{len(significant)} with area ≥ {min_contour_area}")
     print(f"{'=' * 60}")
 
-    # Draw original contours
-    display_bg = cv2.bitwise_not(binary)
-    canvas_orig = cv2.cvtColor(display_bg, cv2.COLOR_GRAY2BGR)
+    # Draw RETR_TREE contours on a standalone canvas.
+    canvas_orig = np.zeros((binary.shape[0], binary.shape[1], 3), dtype=np.uint8)
 
     colors_bgr = [tuple(int(c) for c in np.random.randint(60, 255, 3))
                   for _ in significant]
@@ -396,6 +320,7 @@ def _process_raster(image_path, efd_orders, min_contour_area):
               f"  hierarchy(N={hier[0]}, P={hier[1]}, C={hier[2]}, Par={hier[3]})")
 
     cv2.imwrite(os.path.join(OUTPUT_DIR, "contours_real.png"), canvas_orig)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, "contours_tree.png"), canvas_orig)
 
     # Matplotlib-compatible colours
     cmap = plt.cm.tab10(np.linspace(0, 1, max(len(significant), 1)))
@@ -406,9 +331,11 @@ def _process_raster(image_path, efd_orders, min_contour_area):
         significant, len(contours), efd_orders, colors
     )
 
-    # OpenCV-based EFD reconstruction images
+    # OpenCV-based contour-only EFD reconstruction images
+    best_order = efd_orders[-1]
+    best_canvas_efd = np.zeros((binary.shape[0], binary.shape[1], 3), dtype=np.uint8)
     for order in efd_orders:
-        canvas_efd = cv2.cvtColor(display_bg.copy(), cv2.COLOR_GRAY2BGR)
+        canvas_efd = np.zeros((binary.shape[0], binary.shape[1], 3), dtype=np.uint8)
         for idx, (i, cnt) in enumerate(significant):
             recon, coeffs = reconstruct_contour_efd(cnt, order=order)
             if recon is None:
@@ -416,98 +343,44 @@ def _process_raster(image_path, efd_orders, min_contour_area):
             recon_pts = recon.astype(np.int32).reshape((-1, 1, 2))
             cv2.drawContours(canvas_efd, [recon_pts], -1, colors_bgr[idx], 2)
         cv2.imwrite(os.path.join(OUTPUT_DIR, f"efd_order_{order}.png"), canvas_efd)
+        if order == best_order:
+            best_canvas_efd = canvas_efd.copy()
 
-    # Side-by-side comparison
-    best_order = efd_orders[-1]
-    cmp_left = cv2.cvtColor(display_bg.copy(), cv2.COLOR_GRAY2BGR)
-    cmp_right = cv2.cvtColor(display_bg.copy(), cv2.COLOR_GRAY2BGR)
+    cv2.imwrite(
+        os.path.join(OUTPUT_DIR, "efd_reconstructed_contours_only.png"),
+        best_canvas_efd
+    )
+
+    # Side-by-side comparison on contour-only canvases
+    cmp_left = canvas_orig.copy()
+    cmp_right = np.zeros((binary.shape[0], binary.shape[1], 3), dtype=np.uint8)
     for idx, (i, cnt) in enumerate(significant):
-        cv2.drawContours(cmp_left, [cnt], -1, colors_bgr[idx], 2)
         recon, _ = reconstruct_contour_efd(cnt, order=best_order)
         if recon is not None:
             recon_pts = recon.astype(np.int32).reshape((-1, 1, 2))
             cv2.drawContours(cmp_right, [recon_pts], -1, colors_bgr[idx], 2)
-    cv2.putText(cmp_left, "Original", (10, 30),
+    cv2.putText(cmp_left, "Detected Tree Contours", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-    cv2.putText(cmp_right, f"EFD order={best_order}", (10, 30),
+    cv2.putText(cmp_right, f"EFD Contours order={best_order}", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
     cv2.imwrite(os.path.join(OUTPUT_DIR, "efd_comparison.png"),
                 np.hstack([cmp_left, cmp_right]))
 
     # Matplotlib visualization
-    _visualize_raster(image_path, significant, colors, best_order, display_bg)
+    _visualize_raster(image_path, significant, colors, best_order)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Visualization
+# Visualization (raster)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _visualize_svg(image_path, contours, significant, colors, efd_orders, svg_attrs):
-    """
-    3-panel matplotlib visualization for SVG files:
-      Panel 1 — Raw SVG paths (plotted from parsed coordinates)
-      Panel 2 — EFD reconstruction at lowest order  (coarse)
-      Panel 3 — EFD reconstruction at highest order (detailed)
-    """
-    best_order = efd_orders[-1]
-    worst_order = efd_orders[0]
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle(f"SVG EFD Analysis: {os.path.basename(image_path)}", fontsize=14)
-
-    # Panel 1 — Raw SVG paths
-    axes[0].set_title("Original SVG Paths")
-    for idx, (i, cnt) in enumerate(significant):
-        c = np.squeeze(cnt)
-        # Close the path for display
-        closed = np.vstack([c, c[:1]])
-        axes[0].plot(closed[:, 0], closed[:, 1],
-                     color=colors[idx % len(colors)], linewidth=1.5,
-                     label=f"Path {i} ({len(c)} pts)")
-    axes[0].set_aspect("equal")
-    axes[0].invert_yaxis()
-    axes[0].legend(fontsize=8)
-
-    # Panel 2 — EFD at lowest order
-    axes[1].set_title(f"EFD Reconstruction (order={worst_order})")
-    for idx, (i, cnt) in enumerate(significant):
-        recon, _ = reconstruct_contour_efd(cnt, order=worst_order)
-        if recon is None:
-            continue
-        axes[1].plot(recon[:, 0], recon[:, 1],
-                     color=colors[idx % len(colors)], linewidth=1.5,
-                     label=f"Path {i}")
-    axes[1].set_aspect("equal")
-    axes[1].invert_yaxis()
-    axes[1].legend(fontsize=8)
-
-    # Panel 3 — EFD at highest order
-    axes[2].set_title(f"EFD Reconstruction (order={best_order})")
-    for idx, (i, cnt) in enumerate(significant):
-        recon, _ = reconstruct_contour_efd(cnt, order=best_order)
-        if recon is None:
-            continue
-        area = _contour_area(cnt)
-        axes[2].plot(recon[:, 0], recon[:, 1],
-                     color=colors[idx % len(colors)], linewidth=1.5,
-                     label=f"Path {i} (area={area:.0f})")
-    axes[2].set_aspect("equal")
-    axes[2].invert_yaxis()
-    axes[2].legend(fontsize=8)
-
-    plt.tight_layout()
-    out_path = os.path.join(OUTPUT_DIR, "efd_matplotlib_overview.png")
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    print(f"\n  ➜  Matplotlib overview saved to {out_path}")
-    plt.show()
-
-
-def _visualize_raster(image_path, significant, colors, best_order, display_bg):
+def _visualize_raster(image_path, significant, colors, best_order):
     """
     3-panel matplotlib visualization for raster images:
-      Panel 1 — Original image
-      Panel 2 — Detected contours on binary
-      Panel 3 — EFD reconstruction at best order
+    Panel 1 — Original image
+    Panel 2 — RETR_TREE contours filtered by area
+    Panel 3 — EFD reconstruction on a standalone contour canvas
     """
     img_bgr = cv2.imread(image_path)
     if img_bgr is None:
@@ -520,29 +393,30 @@ def _visualize_raster(image_path, significant, colors, best_order, display_bg):
     axes[0].set_title("Original Image")
     axes[0].axis("off")
 
-    # Panel 2 — Detected contours
-    contour_vis = cv2.cvtColor(display_bg.copy(), cv2.COLOR_GRAY2BGR)
+    h, w = img_bgr.shape[:2]
+
+    # Panel 2 — Detected contours (contour-only)
+    contour_vis = np.zeros((h, w, 3), dtype=np.uint8)
     for idx, (i, cnt) in enumerate(significant):
         color_bgr = tuple(int(c * 255) for c in colors[idx][:3])
         cv2.drawContours(contour_vis, [cnt.reshape(-1, 1, 2).astype(np.int32)],
                          -1, color_bgr, 2)
     axes[1].imshow(cv2.cvtColor(contour_vis, cv2.COLOR_BGR2RGB))
-    axes[1].set_title(f"Detected Contours ({len(significant)})")
+    axes[1].set_title(f"Detected Tree Contours ({len(significant)})")
     axes[1].axis("off")
 
-    # Panel 3 — EFD reconstruction
-    axes[2].set_title(f"EFD Reconstruction (order={best_order})")
+    # Panel 3 — EFD reconstruction (contour-only)
+    recon_vis = np.zeros((h, w, 3), dtype=np.uint8)
     for idx, (i, cnt) in enumerate(significant):
         recon, _ = reconstruct_contour_efd(cnt, order=best_order)
         if recon is None:
             continue
-        area = _contour_area(cnt)
-        axes[2].plot(recon[:, 0], recon[:, 1],
-                     color=colors[idx % len(colors)], linewidth=1.5,
-                     label=f"Contour {i} (area={area:.0f})")
-    axes[2].set_aspect("equal")
-    axes[2].invert_yaxis()
-    axes[2].legend(fontsize=8)
+        color_bgr = tuple(int(c * 255) for c in colors[idx][:3])
+        recon_pts = recon.astype(np.int32).reshape((-1, 1, 2))
+        cv2.drawContours(recon_vis, [recon_pts], -1, color_bgr, 2)
+    axes[2].imshow(cv2.cvtColor(recon_vis, cv2.COLOR_BGR2RGB))
+    axes[2].set_title(f"EFD Contours Only (order={best_order})")
+    axes[2].axis("off")
 
     plt.tight_layout()
     out_path = os.path.join(OUTPUT_DIR, "efd_matplotlib_overview.png")
@@ -558,9 +432,9 @@ def _visualize_raster(image_path, significant, colors, best_order, display_bg):
 if __name__ == "__main__":
     print("OpenCV version:", cv2.__version__)
 
-    # Process an image (works with both raster and SVG)
+    # Process a raster image
     process_image(
-        r"C:\Users\Mahmoud\Documents\GitHub\Sketch_Based_Heritage_Restoration\test_images\cloud-rain-alt.svg"
+        r"C:\Users\Mahmoud\Documents\GitHub\Sketch_Based_Heritage_Restoration\test_images\sketches.jpg"
     )
 
     print("\n✅  All tests complete. Check the 'contour_outputs' folder for results.")
