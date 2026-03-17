@@ -533,20 +533,6 @@ def fit_from_image_skeleton(
 # Visualization
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _collect_path_points(
-    paths: List[BezierPath],
-    pts_per_segment: int,
-    include_controls: bool,
-) -> List[np.ndarray]:
-    """Collect sampled curve points and optionally control points."""
-    all_points: List[np.ndarray] = []
-    for bp in paths:
-        for seg in bp.segments:
-            all_points.append(seg.sample(pts_per_segment))
-            if include_controls:
-                all_points.append(seg.control_points)
-    return all_points
-
 
 def _draw_paths_on_canvas(
     canvas: np.ndarray,
@@ -688,7 +674,7 @@ def _visualize_paths_overview(
     axes[2].axis("off")
 
     fig.suptitle(title)
-    plt.tight_layout()
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"  -> Saved visualization -> {save_path}")
