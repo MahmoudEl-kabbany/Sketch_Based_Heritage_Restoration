@@ -1,30 +1,28 @@
 """
 Bezier Curve Extraction Module
 ==============================
-Two extraction paths:
-  1. SVG  → parse raw path segments → cubic Bezier objects
-  2. Contours (OpenCV Nx1x2 arrays) → corner detection → Schneider fit → cubic Bezier
+Contours (OpenCV Nx1x2 arrays) → corner detection → Schneider fit → cubic Bezier
 
 All segments are normalized to cubic Bezier for uniformity.
 
 Output:
-  - Python objects  (BezierSegment / BezierPath with control points)
-  - SVG file export (via svgpathtools)
-  - JSON export     (control-point arrays)
+  - Python objects (BezierSegment / BezierPath with control points)
+  - Visualization on blank canvas with control point overlays
 """
 
 from __future__ import annotations
 
-import json
 import math
 import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-import bezier as _bezier_lib
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.spatial.distance import cdist
+from skimage.morphology import skeletonize
+import sknw
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -41,18 +39,6 @@ class BezierSegment:
     control_points: np.ndarray  # shape (4, 2) — P0, P1, P2, P3
     source_type: str = "unknown"  # "svg" | "contour"
 
-    # lazily-built bezier.Curve handle
-    _curve: object = field(default=None, repr=False, compare=False)
-
-    @property
-    def curve(self) -> _bezier_lib.Curve:
-        """Return a ``bezier.Curve`` wrapping the control points."""
-        if self._curve is None:
-            # bezier lib expects shape (2, 4) — rows = dimensions
-            nodes = self.control_points.T.astype(np.float64)
-            self._curve = _bezier_lib.Curve.from_nodes(nodes)
-        return self._curve
-
     @property
     def start(self) -> np.ndarray:
         return self.control_points[0]
@@ -63,13 +49,21 @@ class BezierSegment:
 
     def evaluate(self, t: float) -> np.ndarray:
         """Evaluate the curve at parameter *t* ∈ [0, 1]."""
-        return self.curve.evaluate(t).flatten()
+        u = 1.0 - t
+        return (u**3) * self.control_points[0] + 3 * (u**2) * t * self.control_points[1] + 3 * u * (t**2) * self.control_points[2] + (t**3) * self.control_points[3]
 
     def sample(self, n: int = 50) -> np.ndarray:
         """Return *n* evenly-spaced (x, y) points along the curve."""
         ts = np.linspace(0.0, 1.0, n)
-        pts = self.curve.evaluate_multi(ts)  # shape (2, n)
-        return pts.T  # (n, 2)
+        u = 1.0 - ts
+        # Vectorized De Casteljau evaluation
+        pts = (
+            (u**3)[:, np.newaxis] * self.control_points[0]
+            + 3 * (u**2)[:, np.newaxis] * ts[:, np.newaxis] * self.control_points[1]
+            + 3 * u[:, np.newaxis] * (ts**2)[:, np.newaxis] * self.control_points[2]
+            + (ts**3)[:, np.newaxis] * self.control_points[3]
+        )  # shape (n, 2)
+        return pts
 
 
 @dataclass
@@ -100,101 +94,6 @@ class BezierPath:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SVG → Bezier  (Phase 1)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _complex_to_xy(c: complex) -> np.ndarray:
-    """Convert a complex point to [x, y]."""
-    return np.array([c.real, c.imag], dtype=np.float64)
-
-
-def _line_to_cubic(start: complex, end: complex) -> np.ndarray:
-    """Convert an SVG Line to a degenerate cubic (4 control points)."""
-    p0 = _complex_to_xy(start)
-    p3 = _complex_to_xy(end)
-    p1 = p0 + (p3 - p0) / 3.0
-    p2 = p0 + 2.0 * (p3 - p0) / 3.0
-    return np.vstack([p0, p1, p2, p3])
-
-
-def _quad_to_cubic(start: complex, control: complex, end: complex) -> np.ndarray:
-    """Degree-elevate a quadratic Bezier to cubic (4 control points)."""
-    p0 = _complex_to_xy(start)
-    q1 = _complex_to_xy(control)
-    p3 = _complex_to_xy(end)
-    p1 = p0 + (2.0 / 3.0) * (q1 - p0)
-    p2 = p3 + (2.0 / 3.0) * (q1 - p3)
-    return np.vstack([p0, p1, p2, p3])
-
-
-def _cubic_controls(seg) -> np.ndarray:
-    """Extract control points from an svgpathtools CubicBezier."""
-    return np.vstack([
-        _complex_to_xy(seg.start),
-        _complex_to_xy(seg.control1),
-        _complex_to_xy(seg.control2),
-        _complex_to_xy(seg.end),
-    ])
-
-
-def _arc_to_cubics(arc_seg) -> List[np.ndarray]:
-    """Convert an svgpathtools Arc to one or more cubic Bezier control-point arrays."""
-    cubics = arc_seg.as_cubic_curves()
-    return [_cubic_controls(c) for c in cubics]
-
-
-class SVGBezierExtractor:
-    """Extract cubic Bezier paths from an SVG file.
-
-    Uses svgpathtools to parse all ``<path>`` elements and converts every
-    segment (Line, QuadraticBezier, CubicBezier, Arc) to cubic Bezier.
-    """
-
-    def __init__(self, svg_path: str):
-        self.svg_path = svg_path
-        self.paths: List[BezierPath] = []
-        self.svg_attributes: dict = {}
-
-    def extract(self) -> List[BezierPath]:
-        from svgpathtools import (
-            svg2paths2, Line, QuadraticBezier, CubicBezier, Arc,
-        )
-
-        paths, attributes, self.svg_attributes = svg2paths2(self.svg_path)
-
-        self.paths = []
-        for path in paths:
-            for subpath in path.continuous_subpaths():
-                if len(subpath) == 0:
-                    continue
-                segments: List[BezierSegment] = []
-                for seg in subpath:
-                    if isinstance(seg, CubicBezier):
-                        cps = _cubic_controls(seg)
-                        segments.append(BezierSegment(cps, source_type="svg"))
-                    elif isinstance(seg, QuadraticBezier):
-                        cps = _quad_to_cubic(seg.start, seg.control, seg.end)
-                        segments.append(BezierSegment(cps, source_type="svg"))
-                    elif isinstance(seg, Line):
-                        cps = _line_to_cubic(seg.start, seg.end)
-                        segments.append(BezierSegment(cps, source_type="svg"))
-                    elif isinstance(seg, Arc):
-                        for cps in _arc_to_cubics(seg):
-                            segments.append(BezierSegment(cps, source_type="svg"))
-
-                if segments:
-                    # Detect closure: does the last endpoint ≈ first start?
-                    closed = np.allclose(
-                        segments[-1].end, segments[0].start, atol=1e-3
-                    )
-                    self.paths.append(
-                        BezierPath(segments, is_closed=closed, source_type="svg")
-                    )
-
-        return self.paths
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # Schneider's cubic-Bezier fitting algorithm
 # (adapted from the Graphics Gems / "An Algorithm for Automatically
 #  Fitting Digitized Curves" — Philip J. Schneider, 1990)
@@ -213,9 +112,11 @@ def _chord_length_parameterize(points: np.ndarray) -> np.ndarray:
 def _estimate_tangent(points: np.ndarray, end: str) -> np.ndarray:
     """Estimate unit tangent at the start or end of a point sequence."""
     if end == "start":
-        tangent = points[1] - points[0]
+        idx = min(5, len(points) - 1)
+        tangent = points[idx] - points[0]
     else:
-        tangent = points[-1] - points[-2]
+        idx = min(5, len(points) - 1)
+        tangent = points[-1] - points[-idx]
     norm = np.linalg.norm(tangent)
     if norm < 1e-12:
         return np.array([1.0, 0.0])
@@ -239,33 +140,32 @@ def _generate_bezier(
     p0 = points[0]
     p3 = points[-1]
 
-    # Build the A matrix (per-point contribution of the two free tangents)
+    # Build the A matrix (per-point contribution of the two free tangents) - vectorized
+    u = 1.0 - params
+    t = params
     A = np.zeros((n, 2, 2))
-    for i, t in enumerate(params):
-        u = 1.0 - t
-        A[i, 0] = 3.0 * u * u * t * left_tangent
-        A[i, 1] = 3.0 * u * t * t * right_tangent
+    A[:, 0] = 3.0 * (u**2)[:, np.newaxis] * t[:, np.newaxis] * left_tangent
+    A[:, 1] = 3.0 * u[:, np.newaxis] * (t**2)[:, np.newaxis] * right_tangent
 
-    # Build C and X matrices for the 2×2 least-squares system
+    # Build C and X matrices for the 2×2 least-squares system - vectorized with einsum
     C = np.zeros((2, 2))
-    X = np.zeros(2)
-    for i in range(n):
-        C[0, 0] += np.dot(A[i, 0], A[i, 0])
-        C[0, 1] += np.dot(A[i, 0], A[i, 1])
-        C[1, 0] = C[0, 1]
-        C[1, 1] += np.dot(A[i, 1], A[i, 1])
+    C[0, 0] = np.einsum('ij,ij->', A[:, 0, :], A[:, 0, :])
+    C[0, 1] = np.einsum('ij,ij->', A[:, 0, :], A[:, 1, :])
+    C[1, 0] = C[0, 1]
+    C[1, 1] = np.einsum('ij,ij->', A[:, 1, :], A[:, 1, :])
 
-        u = 1.0 - params[i]
-        t = params[i]
-        tmp = (
-            points[i]
-            - (u ** 3) * p0
-            - 3 * (u ** 2) * t * p0
-            - 3 * u * (t ** 2) * p3
-            - (t ** 3) * p3
-        )
-        X[0] += np.dot(A[i, 0], tmp)
-        X[1] += np.dot(A[i, 1], tmp)
+    # Compute tmp and X vectorized
+    tmp = (
+        points
+        - (u**3)[:, np.newaxis] * p0
+        - 3 * (u**2)[:, np.newaxis] * t[:, np.newaxis] * p0
+        - 3 * u[:, np.newaxis] * (t**2)[:, np.newaxis] * p3
+        - (t**3)[:, np.newaxis] * p3
+    )
+    X = np.array([
+        np.einsum('ij,ij->', A[:, 0, :], tmp),
+        np.einsum('ij,ij->', A[:, 1, :], tmp)
+    ])
 
     det = C[0, 0] * C[1, 1] - C[0, 1] * C[1, 0]
     if abs(det) < 1e-12:
@@ -291,21 +191,41 @@ def _reparameterize(
     points: np.ndarray, params: np.ndarray, cp: np.ndarray
 ) -> np.ndarray:
     """Newton-Raphson reparameterization to improve parameter values."""
-    new_params = params.copy()
-    for i in range(len(points)):
-        t = params[i]
-        u = 1.0 - t
-        # Bezier and first two derivatives
-        q = _bezier_point(cp, t)
-        q1 = 3.0 * (u * u * (cp[1] - cp[0]) + 2 * u * t * (cp[2] - cp[1]) + t * t * (cp[3] - cp[2]))
-        q2 = 6.0 * (u * (cp[2] - 2 * cp[1] + cp[0]) + t * (cp[3] - 2 * cp[2] + cp[1]))
+    u = 1.0 - params  # shape (n,)
+    t = params        # shape (n,)
 
-        diff = q - points[i]
-        num = np.dot(diff, q1)
-        den = np.dot(q1, q1) + np.dot(diff, q2)
-        if abs(den) > 1e-12:
-            new_params[i] = t - num / den
-        new_params[i] = np.clip(new_params[i], 0.0, 1.0)
+    # Bezier curve value at all parameters
+    q = (
+        (u**3)[:, np.newaxis] * cp[0]
+        + 3 * (u**2)[:, np.newaxis] * t[:, np.newaxis] * cp[1]
+        + 3 * u[:, np.newaxis] * (t**2)[:, np.newaxis] * cp[2]
+        + (t**3)[:, np.newaxis] * cp[3]
+    )  # shape (n, 2)
+
+    # First derivative
+    q1 = (
+        3.0 * (u**2)[:, np.newaxis] * (cp[1] - cp[0])
+        + 6.0 * u[:, np.newaxis] * t[:, np.newaxis] * (cp[2] - cp[1])
+        + 3.0 * (t**2)[:, np.newaxis] * (cp[3] - cp[2])
+    )  # shape (n, 2)
+
+    # Second derivative
+    q2 = (
+        6.0 * u[:, np.newaxis] * (cp[2] - 2 * cp[1] + cp[0])
+        + 6.0 * t[:, np.newaxis] * (cp[3] - 2 * cp[2] + cp[1])
+    )  # shape (n, 2)
+
+    diff = q - points  # shape (n, 2)
+
+    # Newton-Raphson update
+    num = np.sum(diff * q1, axis=1)  # shape (n,)
+    den = np.sum(q1 * q1, axis=1) + np.sum(diff * q2, axis=1)  # shape (n,)
+
+    new_params = params.copy()
+    valid = np.abs(den) > 1e-12
+    new_params[valid] = t[valid] - num[valid] / den[valid]
+    new_params = np.clip(new_params, 0.0, 1.0)
+
     return new_params
 
 
@@ -313,13 +233,23 @@ def _max_error(
     points: np.ndarray, cp: np.ndarray, params: np.ndarray
 ) -> Tuple[float, int]:
     """Return (max squared error, index of worst point)."""
-    max_err = 0.0
-    split_idx = len(points) // 2
-    for i in range(len(points)):
-        err = np.sum((_bezier_point(cp, params[i]) - points[i]) ** 2)
-        if err > max_err:
-            max_err = err
-            split_idx = i
+    # Evaluate Bezier at all parameters using vectorized De Casteljau
+    u = 1.0 - params  # shape (n,)
+    t = params        # shape (n,)
+
+    # Cubic Bernstein: B(t) = (1-t)^3*P0 + 3*(1-t)^2*t*P1 + 3*(1-t)*t^2*P2 + t^3*P3
+    bezier_pts = (
+        (u**3)[:, np.newaxis] * cp[0]
+        + 3 * (u**2)[:, np.newaxis] * t[:, np.newaxis] * cp[1]
+        + 3 * u[:, np.newaxis] * (t**2)[:, np.newaxis] * cp[2]
+        + (t**3)[:, np.newaxis] * cp[3]
+    )  # shape (n, 2)
+
+    # Compute all squared errors
+    errors = np.sum((bezier_pts - points) ** 2, axis=1)  # shape (n,)
+    split_idx = int(np.argmax(errors))
+    max_err = float(errors[split_idx])
+
     return max_err, split_idx
 
 
@@ -465,11 +395,9 @@ class ContourBezierFitter:
         if approx_pts.ndim == 1:
             approx_pts = approx_pts.reshape(1, -1)
 
-        # Map each approximate vertex back to the nearest original point index
-        corner_indices = []
-        for pt in approx_pts:
-            dists = np.linalg.norm(points - pt, axis=1)
-            corner_indices.append(int(np.argmin(dists)))
+        # Compute all distances at once using cdist
+        D = cdist(approx_pts, points, metric='euclidean')  # shape (K, N)
+        corner_indices = list(np.argmin(D, axis=1))  # shape (K,)
 
         # Sort and deduplicate
         corner_indices = sorted(set(corner_indices))
@@ -519,7 +447,7 @@ def _extract_raster_contours(
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
-    contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_TC89_KCOS)
 
     # Filter by area
     contours = [c for c in contours if cv2.contourArea(c) >= min_contour_area]
@@ -527,85 +455,8 @@ def _extract_raster_contours(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Export — SVG
-# ═══════════════════════════════════════════════════════════════════════════
-
-def export_to_svg(
-    paths: List[BezierPath],
-    output_path: str,
-    width: float = 800,
-    height: float = 800,
-    stroke: str = "black",
-    stroke_width: float = 1.5,
-) -> str:
-    """Write Bezier paths to an SVG file.
-
-    Returns the output file path.
-    """
-    from svgpathtools import CubicBezier as SvgCubic, Path as SvgPath, wsvg
-
-    svg_paths = []
-    svg_attrs = []
-    for bp in paths:
-        segs = []
-        for s in bp.segments:
-            cp = s.control_points
-            segs.append(SvgCubic(
-                complex(cp[0, 0], cp[0, 1]),
-                complex(cp[1, 0], cp[1, 1]),
-                complex(cp[2, 0], cp[2, 1]),
-                complex(cp[3, 0], cp[3, 1]),
-            ))
-        if segs:
-            svg_paths.append(SvgPath(*segs))
-            svg_attrs.append({
-                "fill": "none",
-                "stroke": stroke,
-                "stroke-width": str(stroke_width),
-            })
-
-    wsvg(
-        svg_paths,
-        attributes=svg_attrs,
-        svg_attributes={"width": str(width), "height": str(height)},
-        filename=output_path,
-    )
-    return output_path
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Export — JSON
-# ═══════════════════════════════════════════════════════════════════════════
-
-def export_to_json(paths: List[BezierPath], output_path: str) -> str:
-    """Serialize Bezier paths to a JSON file. Returns the output file path."""
-    data = []
-    for bp in paths:
-        path_data = {
-            "is_closed": bp.is_closed,
-            "source_type": bp.source_type,
-            "segments": [],
-        }
-        for s in bp.segments:
-            path_data["segments"].append({
-                "control_points": s.control_points.tolist(),
-                "source_type": s.source_type,
-            })
-        data.append(path_data)
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    return output_path
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # Convenience API
 # ═══════════════════════════════════════════════════════════════════════════
-
-def extract_from_svg(svg_path: str) -> List[BezierPath]:
-    """Parse an SVG file and return its paths as cubic Bezier objects."""
-    extractor = SVGBezierExtractor(svg_path)
-    return extractor.extract()
 
 
 def fit_from_contours(
@@ -629,69 +480,255 @@ def fit_from_image(
     return fit_from_contours(contours, corner_threshold, max_error)
 
 
+def fit_from_image_skeleton(
+    image_path: str,
+    max_error: float = 5.0,
+) -> List[BezierPath]:
+    """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths.
+
+    Preferred over fit_from_image for line drawings, diagrams, and strokes,
+    where findContours would produce two parallel outlines instead of a
+    single centreline.
+    """
+    # Read image as grayscale
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(f"Cannot read image: {image_path}")
+
+    # Binarize with Otsu threshold
+    _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Skeletonize
+    skeleton = skeletonize(binary / 255.0).astype(np.uint8)
+
+    # Build graph from skeleton
+    graph = sknw.build_sknw(skeleton)
+
+    # Process edges
+    paths = []
+    for s, e in graph.edges():
+        edge_data = graph[s][e]
+        pts = edge_data.get('pts', [])
+        if isinstance(pts, list):
+            pts = np.array(pts, dtype=np.float64)
+        else:
+            pts = np.asarray(pts, dtype=np.float64)
+
+        if len(pts) < 2:
+            continue
+
+        # Estimate tangents and fit cubic
+        left_tangent = _estimate_tangent(pts, "start")
+        right_tangent = _estimate_tangent(pts, "end")
+        cps_list = _fit_cubic_single(pts, left_tangent, right_tangent, max_error ** 2)
+
+        segments = [BezierSegment(cps, source_type="skeleton") for cps in cps_list]
+        if segments:
+            paths.append(BezierPath(segments, is_closed=False, source_type="skeleton"))
+
+    return paths
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Visualization
 # ═══════════════════════════════════════════════════════════════════════════
 
-def visualize_paths(
+def _collect_path_points(
     paths: List[BezierPath],
-    title: str = "Bezier Curves",
-    background: Optional[np.ndarray] = None,
-    save_path: Optional[str] = None,
-    show_controls: bool = True,
-    pts_per_segment: int = 80,
-) -> None:
-    """Plot Bezier paths with optional control-point handles.
+    pts_per_segment: int,
+    include_controls: bool,
+) -> List[np.ndarray]:
+    """Collect sampled curve points and optionally control points."""
+    all_points: List[np.ndarray] = []
+    for bp in paths:
+        for seg in bp.segments:
+            all_points.append(seg.sample(pts_per_segment))
+            if include_controls:
+                all_points.append(seg.control_points)
+    return all_points
 
-    Args:
-        paths:           list of BezierPath objects
-        title:           figure title
-        background:      optional grayscale or BGR image to show behind curves
-        save_path:       if given, save figure to this file
-        show_controls:   draw control points and handle lines
-        pts_per_segment: sampling density per segment
-    """
-    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+
+def _draw_paths_on_canvas(
+    canvas: np.ndarray,
+    paths: List[BezierPath],
+    colors: Tuple[Tuple[float, float, float], ...],
+    pts_per_segment: int,
+    show_controls: bool,
+) -> np.ndarray:
+    """Render Bezier paths onto an image-space canvas using OpenCV."""
+    rendered = canvas.copy()
+
+    for idx, bp in enumerate(paths):
+        color_bgr = tuple(int(channel * 255) for channel in colors[idx % len(colors)][:3])
+        for seg in bp.segments:
+            pts = np.round(seg.sample(pts_per_segment)).astype(np.int32).reshape((-1, 1, 2))
+            if len(pts) >= 2:
+                cv2.polylines(rendered, [pts], False, color_bgr, 2, lineType=cv2.LINE_AA)
+
+            if not show_controls:
+                continue
+
+            cp = np.round(seg.control_points).astype(np.int32)
+            cv2.line(rendered, tuple(cp[0]), tuple(cp[1]), color_bgr, 1, lineType=cv2.LINE_AA)
+            cv2.line(rendered, tuple(cp[2]), tuple(cp[3]), color_bgr, 1, lineType=cv2.LINE_AA)
+            for point in cp:
+                cv2.circle(rendered, tuple(point), 3, color_bgr, -1, lineType=cv2.LINE_AA)
+
+    return rendered
+
+
+def _visualize_paths_single_panel(
+    paths: List[BezierPath],
+    title: str,
+    save_path: Optional[str],
+    show_controls: bool,
+    pts_per_segment: int,
+) -> None:
+    """Fallback single-panel plot for callers without source-image context."""
+    fig, ax = plt.subplots(1, 1, figsize=(12, 10))
     ax.set_title(title)
     ax.set_aspect("equal")
 
-    if background is not None:
-        if background.ndim == 2:
-            ax.imshow(background, cmap="gray", alpha=0.4)
-        else:
-            ax.imshow(cv2.cvtColor(background, cv2.COLOR_BGR2RGB), alpha=0.4)
-
+    all_points = []
     colors = plt.cm.tab10.colors
     for idx, bp in enumerate(paths):
         color = colors[idx % len(colors)]
         for seg in bp.segments:
             pts = seg.sample(pts_per_segment)
             ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=1.5)
-            if show_controls:
-                cp = seg.control_points
-                # Draw handle lines P0–P1 and P2–P3
-                ax.plot(
-                    [cp[0, 0], cp[1, 0]], [cp[0, 1], cp[1, 1]],
-                    color=color, linewidth=0.6, linestyle="--", alpha=0.5,
-                )
-                ax.plot(
-                    [cp[2, 0], cp[3, 0]], [cp[2, 1], cp[3, 1]],
-                    color=color, linewidth=0.6, linestyle="--", alpha=0.5,
-                )
-                # Control points
-                ax.plot(
-                    cp[:, 0], cp[:, 1], "o",
-                    color=color, markersize=3, alpha=0.6,
-                )
+            all_points.append(pts)
 
-    ax.invert_yaxis()
+            if not show_controls:
+                continue
+
+            cp = seg.control_points
+            all_points.append(cp)
+            ax.plot(
+                [cp[0, 0], cp[1, 0]], [cp[0, 1], cp[1, 1]],
+                color=color, linewidth=0.6, linestyle="--", alpha=0.5,
+            )
+            ax.plot(
+                [cp[2, 0], cp[3, 0]], [cp[2, 1], cp[3, 1]],
+                color=color, linewidth=0.6, linestyle="--", alpha=0.5,
+            )
+            ax.plot(
+                cp[:, 0], cp[:, 1], "o",
+                color=color, markersize=3, alpha=0.6,
+            )
+
+    if all_points:
+        all_pts_array = np.concatenate(all_points, axis=0)
+        x_min, y_min = all_pts_array.min(axis=0)
+        x_max, y_max = all_pts_array.max(axis=0)
+        x_range = x_max - x_min if x_max != x_min else 1
+        y_range = y_max - y_min if y_max != y_min else 1
+        padding_x = x_range * 0.1
+        padding_y = y_range * 0.1
+        ax.set_xlim(x_min - padding_x, x_max + padding_x)
+        ax.set_ylim(y_min - padding_y, y_max + padding_y)
+
+    if paths and paths[0].source_type == "contour":
+        ax.invert_yaxis()
+
     plt.tight_layout()
     if save_path:
-        fig.savefig(save_path, dpi=150)
-        print(f"  ➜  Saved visualization → {save_path}")
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"  -> Saved visualization -> {save_path}")
         plt.close(fig)
+        return
+
+    plt.show()
+
+
+def _visualize_paths_overview(
+    paths: List[BezierPath],
+    title: str,
+    save_path: Optional[str],
+    image_path: str,
+    show_controls: bool,
+    pts_per_segment: int,
+) -> None:
+    """Render an EFD-style 3-panel overview for Bezier results."""
+    img_bgr = cv2.imread(image_path)
+    if img_bgr is None:
+        _visualize_paths_single_panel(paths, title, save_path, show_controls, pts_per_segment)
+        return
+
+    h, w = img_bgr.shape[:2]
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    axes[0].imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    axes[0].set_title("Original Image")
+    axes[0].axis("off")
+
+    colors = plt.cm.tab10.colors
+    curves_only = _draw_paths_on_canvas(
+        np.zeros((h, w, 3), dtype=np.uint8),
+        paths,
+        colors,
+        pts_per_segment,
+        show_controls=False,
+    )
+    axes[1].imshow(cv2.cvtColor(curves_only, cv2.COLOR_BGR2RGB))
+    axes[1].set_title(f"Bezier Curves Only ({len(paths)})")
+    axes[1].axis("off")
+
+    curves_with_controls = _draw_paths_on_canvas(
+        np.zeros((h, w, 3), dtype=np.uint8),
+        paths,
+        colors,
+        pts_per_segment,
+        show_controls=show_controls,
+    )
+    axes[2].imshow(cv2.cvtColor(curves_with_controls, cv2.COLOR_BGR2RGB))
+    if show_controls:
+        axes[2].set_title("Bezier Curves + Controls")
     else:
-        plt.show()
+        axes[2].set_title("Bezier Curves Overview")
+    axes[2].axis("off")
+
+    fig.suptitle(title)
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"  -> Saved visualization -> {save_path}")
+        plt.close(fig)
+        return
+
+    plt.show()
+
+def visualize_paths(
+    paths: List[BezierPath],
+    title: str = "Bezier Curves",
+    save_path: Optional[str] = None,
+    show_controls: bool = True,
+    pts_per_segment: int = 80,
+    image_path: Optional[str] = None,
+    overview: bool = True,
+) -> None:
+    """Plot Bezier paths with optional EFD-style overview rendering.
+
+    Args:
+        paths:           list of BezierPath objects
+        title:           figure title
+        save_path:       if given, save figure to this file
+        show_controls:   draw control points and handle lines
+        pts_per_segment: sampling density per segment
+        image_path:      source raster used for overview panel 1
+        overview:        when True and image_path is available, use 3-panel layout
+    """
+    if overview and image_path:
+        _visualize_paths_overview(
+            paths,
+            title,
+            save_path,
+            image_path,
+            show_controls,
+            pts_per_segment,
+        )
+        return
+
+    _visualize_paths_single_panel(paths, title, save_path, show_controls, pts_per_segment)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -713,16 +750,15 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python bezier.py <image_or_svg_path> [output.svg]")
+        print("Usage: python bezier.py <image_path> [--skeleton]")
         sys.exit(1)
 
     input_path = sys.argv[1]
-    output_svg = sys.argv[2] if len(sys.argv) > 2 else os.path.join(OUTPUT_DIR, "bezier_output.svg")
+    use_skeleton = "--skeleton" in sys.argv
 
-    ext = os.path.splitext(input_path)[1].lower()
-    if ext == ".svg":
-        paths = extract_from_svg(input_path)
-        label = f"SVG extraction: {input_path}"
+    if use_skeleton:
+        paths = fit_from_image_skeleton(input_path)
+        label = f"Skeleton fitting: {input_path}"
     else:
         paths = fit_from_image(input_path)
         label = f"Contour fitting: {input_path}"
@@ -730,11 +766,4 @@ if __name__ == "__main__":
     _print_summary(paths, label)
 
     if paths:
-        export_to_svg(paths, output_svg)
-        print(f"  ➜  SVG written → {output_svg}")
-
-        json_path = os.path.splitext(output_svg)[0] + ".json"
-        export_to_json(paths, json_path)
-        print(f"  ➜  JSON written → {json_path}")
-
         visualize_paths(paths, title=label, save_path=os.path.join(OUTPUT_DIR, "bezier_vis.png"))
