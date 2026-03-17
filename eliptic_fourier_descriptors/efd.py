@@ -120,7 +120,24 @@ def print_efd_summary(significant, total_count, efd_results):
 # Raster image contour extraction
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _extract_raster_contours(image_path, min_contour_area=100):
+def _morphological_skeleton(binary):
+    """Return a 1-pixel skeleton from a binary uint8 image (0/255)."""
+    img = (binary > 0).astype(np.uint8) * 255
+    skel = np.zeros_like(img)
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+    while True:
+        eroded = cv2.erode(img, kernel)
+        opened = cv2.dilate(eroded, kernel)
+        residue = cv2.subtract(img, opened)
+        skel = cv2.bitwise_or(skel, residue)
+        img = eroded
+        if cv2.countNonZero(img) == 0:
+            break
+
+    return skel
+
+def _extract_raster_contours(image_path, min_contour_area=100, use_skeleton=False):
     """
     Load a raster image, denoise, binarize, and extract contours.
 
@@ -152,6 +169,11 @@ def _extract_raster_contours(image_path, min_contour_area=100):
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
     cv2.imwrite(os.path.join(OUTPUT_DIR, "real_binary.png"), cv2.bitwise_not(binary))
+
+    if use_skeleton:
+        binary = _morphological_skeleton(binary)
+        cv2.imwrite(os.path.join(OUTPUT_DIR, "real_skeleton.png"), cv2.bitwise_not(binary))
+        print(f"  ➜  Skeleton image saved to {OUTPUT_DIR}/real_skeleton.png")
 
     # Find full contour hierarchy (outer + inner contours)
     contours, hierarchy = cv2.findContours(
@@ -219,7 +241,12 @@ def _process_contours(significant, total_count, efd_orders, colors):
 # Main entry point — raster only
 # ═══════════════════════════════════════════════════════════════════════════
 
-def process_image(image_path, efd_orders=(5, 10, 20, 40), min_contour_area=100):
+def process_image(
+    image_path,
+    efd_orders=(5, 10, 20, 40),
+    min_contour_area=100,
+    use_skeleton=False,
+):
     """
     Process a raster image through the full EFD pipeline.
 
@@ -231,10 +258,15 @@ def process_image(image_path, efd_orders=(5, 10, 20, 40), min_contour_area=100):
     if image_path.lower().endswith(".svg"):
         raise ValueError("SVG parsing has been removed from EFD. Use a raster image instead.")
 
-    _process_raster(image_path, efd_orders, min_contour_area)
+    _process_raster(image_path, efd_orders, min_contour_area, use_skeleton)
 
 
-def extract_efd_from_image(image_path, order=10, min_contour_area=100):
+def extract_efd_from_image(
+    image_path,
+    order=10,
+    min_contour_area=100,
+    use_skeleton=False,
+):
     """
     Backward-compatible helper to extract EFDs from a raster image.
 
@@ -245,7 +277,7 @@ def extract_efd_from_image(image_path, order=10, min_contour_area=100):
         raise ValueError("SVG parsing has been removed from EFD. Use a raster image instead.")
 
     contours, hierarchy, _img, _binary = _extract_raster_contours(
-        image_path, min_contour_area
+        image_path, min_contour_area, use_skeleton=use_skeleton
     )
     if contours is None:
         return {"significant": [], "total_count": 0, "efd_results": []}
@@ -263,7 +295,13 @@ def extract_efd_from_image(image_path, order=10, min_contour_area=100):
     }
 
 
-def visualize_efd(image_path, order=10, save_path=None, min_contour_area=100):
+def visualize_efd(
+    image_path,
+    order=10,
+    save_path=None,
+    min_contour_area=100,
+    use_skeleton=False,
+):
     """
     Backward-compatible visualization wrapper.
 
@@ -274,6 +312,7 @@ def visualize_efd(image_path, order=10, save_path=None, min_contour_area=100):
         image_path,
         efd_orders=(order,),
         min_contour_area=min_contour_area,
+        use_skeleton=use_skeleton,
     )
 
     if save_path:
@@ -285,10 +324,10 @@ def visualize_efd(image_path, order=10, save_path=None, min_contour_area=100):
             shutil.copyfile(generated, save_path)
 
 
-def _process_raster(image_path, efd_orders, min_contour_area):
+def _process_raster(image_path, efd_orders, min_contour_area, use_skeleton=False):
     """Raster processing pipeline: denoise → threshold → contours → EFD."""
     contours, hierarchy, img, binary = _extract_raster_contours(
-        image_path, min_contour_area
+        image_path, min_contour_area, use_skeleton=use_skeleton
     )
     if contours is None:
         print(f"  ⚠  Could not load image: {image_path}")
