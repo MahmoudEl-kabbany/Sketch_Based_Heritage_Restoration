@@ -24,6 +24,11 @@ import shutil
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "contour_outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+_CONTOUR_RETRIEVAL_MODES = {
+    "tree": cv2.RETR_TREE,
+    "external": cv2.RETR_EXTERNAL,
+}
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # EFD core helpers
@@ -137,7 +142,12 @@ def _morphological_skeleton(binary):
 
     return skel
 
-def _extract_raster_contours(image_path, min_contour_area=100, use_skeleton=False):
+def _extract_raster_contours(
+    image_path,
+    min_contour_area=100,
+    use_skeleton=False,
+    contour_retrieval="tree",
+):
     """
     Load a raster image, denoise, binarize, and extract contours.
 
@@ -175,9 +185,16 @@ def _extract_raster_contours(image_path, min_contour_area=100, use_skeleton=Fals
         cv2.imwrite(os.path.join(OUTPUT_DIR, "real_skeleton.png"), cv2.bitwise_not(binary))
         print(f"  ➜  Skeleton image saved to {OUTPUT_DIR}/real_skeleton.png")
 
-    # Find full contour hierarchy (outer + inner contours)
+    retrieval_key = contour_retrieval.lower()
+    if retrieval_key not in _CONTOUR_RETRIEVAL_MODES:
+        raise ValueError(
+            f"contour_retrieval must be one of {tuple(_CONTOUR_RETRIEVAL_MODES.keys())}, "
+            f"got {contour_retrieval!r}"
+        )
+
+    # Find contours using selected retrieval mode.
     contours, hierarchy = cv2.findContours(
-        binary.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+        binary.copy(), _CONTOUR_RETRIEVAL_MODES[retrieval_key], cv2.CHAIN_APPROX_SIMPLE
     )
 
     return contours, hierarchy, img, binary
@@ -246,6 +263,7 @@ def process_image(
     efd_orders=(5, 10, 20, 40),
     min_contour_area=100,
     use_skeleton=False,
+    contour_retrieval="tree",
 ):
     """
     Process a raster image through the full EFD pipeline.
@@ -254,11 +272,18 @@ def process_image(
         image_path:       path to the input raster image (PNG, JPG, BMP, etc.)
         efd_orders:       tuple of harmonic orders to compare
         min_contour_area: minimum contour area
+        contour_retrieval: contour retrieval mode: "tree" or "external"
     """
     if image_path.lower().endswith(".svg"):
         raise ValueError("SVG parsing has been removed from EFD. Use a raster image instead.")
 
-    _process_raster(image_path, efd_orders, min_contour_area, use_skeleton)
+    _process_raster(
+        image_path,
+        efd_orders,
+        min_contour_area,
+        use_skeleton,
+        contour_retrieval,
+    )
 
 
 def extract_efd_from_image(
@@ -266,6 +291,7 @@ def extract_efd_from_image(
     order=10,
     min_contour_area=100,
     use_skeleton=False,
+    contour_retrieval="tree",
 ):
     """
     Backward-compatible helper to extract EFDs from a raster image.
@@ -277,7 +303,10 @@ def extract_efd_from_image(
         raise ValueError("SVG parsing has been removed from EFD. Use a raster image instead.")
 
     contours, hierarchy, _img, _binary = _extract_raster_contours(
-        image_path, min_contour_area, use_skeleton=use_skeleton
+        image_path,
+        min_contour_area,
+        use_skeleton=use_skeleton,
+        contour_retrieval=contour_retrieval,
     )
     if contours is None:
         return {"significant": [], "total_count": 0, "efd_results": []}
@@ -301,6 +330,7 @@ def visualize_efd(
     save_path=None,
     min_contour_area=100,
     use_skeleton=False,
+    contour_retrieval="tree",
 ):
     """
     Backward-compatible visualization wrapper.
@@ -313,6 +343,7 @@ def visualize_efd(
         efd_orders=(order,),
         min_contour_area=min_contour_area,
         use_skeleton=use_skeleton,
+        contour_retrieval=contour_retrieval,
     )
 
     if save_path:
@@ -324,25 +355,36 @@ def visualize_efd(
             shutil.copyfile(generated, save_path)
 
 
-def _process_raster(image_path, efd_orders, min_contour_area, use_skeleton=False):
+def _process_raster(
+    image_path,
+    efd_orders,
+    min_contour_area,
+    use_skeleton=False,
+    contour_retrieval="tree",
+):
     """Raster processing pipeline: denoise → threshold → contours → EFD."""
     contours, hierarchy, img, binary = _extract_raster_contours(
-        image_path, min_contour_area, use_skeleton=use_skeleton
+        image_path,
+        min_contour_area,
+        use_skeleton=use_skeleton,
+        contour_retrieval=contour_retrieval,
     )
     if contours is None:
         print(f"  ⚠  Could not load image: {image_path}")
         return
 
-    # Keep all contours from the RETR_TREE hierarchy, filtered only by area.
+    retrieval_key = contour_retrieval.lower()
+
+    # Keep all contours from the selected hierarchy, filtered only by area.
     significant = [(i, cnt) for i, cnt in enumerate(contours)
                    if cv2.contourArea(cnt) >= min_contour_area]
 
     print(f"\n{'=' * 60}")
-    print(f"  Raster Image  —  {len(contours)} total contours, "
+    print(f"  Raster Image ({retrieval_key})  —  {len(contours)} total contours, "
           f"{len(significant)} with area ≥ {min_contour_area}")
     print(f"{'=' * 60}")
 
-    # Draw RETR_TREE contours on a standalone canvas.
+        # Draw extracted contours on a standalone canvas.
     canvas_orig = np.zeros((binary.shape[0], binary.shape[1], 3), dtype=np.uint8)
 
     colors_bgr = [tuple(int(c) for c in np.random.randint(60, 255, 3))
@@ -359,7 +401,7 @@ def _process_raster(image_path, efd_orders, min_contour_area, use_skeleton=False
               f"  hierarchy(N={hier[0]}, P={hier[1]}, C={hier[2]}, Par={hier[3]})")
 
     cv2.imwrite(os.path.join(OUTPUT_DIR, "contours_real.png"), canvas_orig)
-    cv2.imwrite(os.path.join(OUTPUT_DIR, "contours_tree.png"), canvas_orig)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, f"contours_{retrieval_key}.png"), canvas_orig)
 
     # Matplotlib-compatible colours
     cmap = plt.cm.tab10(np.linspace(0, 1, max(len(significant), 1)))
@@ -441,7 +483,7 @@ def _visualize_raster(image_path, significant, colors, best_order):
         cv2.drawContours(contour_vis, [cnt.reshape(-1, 1, 2).astype(np.int32)],
                          -1, color_bgr, 2)
     axes[1].imshow(cv2.cvtColor(contour_vis, cv2.COLOR_BGR2RGB))
-    axes[1].set_title(f"Detected Tree Contours ({len(significant)})")
+    axes[1].set_title(f"Detected Contours ({len(significant)})")
     axes[1].axis("off")
 
     # Panel 3 — EFD reconstruction (contour-only)
