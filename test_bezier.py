@@ -91,15 +91,15 @@ if __name__ == "__main__":
 
     # Test 1: Contour mode
     test_image = "test_images/line_egypt.png"
-    if os.path.exists(test_image):
-        print("▶ Test 1: Contour mode fitting")
-        paths = process_image(test_image, use_skeleton=False)
-    else:
-        print(f"⚠ Test image not found: {test_image}")
+    # if os.path.exists(test_image):
+    #     print("▶ Test 1: Contour mode fitting")
+    #     paths = process_image(test_image, use_skeleton=False)
+    # else:
+    #     print(f"⚠ Test image not found: {test_image}")
 
     # Test 2: Skeleton mode
-    # if os.path.exists(test_image):
-    #     print("\n▶ Test 2: Skeleton mode fitting")
-    #     paths = process_image(test_image, use_skeleton=True)
-    # else:
-    #     print(f"⚠ Test image not found for skeleton test: {test_image}")
+    if os.path.exists(test_image):
+        print("\n▶ Test 2: Skeleton mode fitting")
+        paths = process_image(test_image, use_skeleton=True)
+    else:
+        print(f"⚠ Test image not found for skeleton test: {test_image}")

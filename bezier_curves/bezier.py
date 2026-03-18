@@ -109,16 +109,31 @@ def _chord_length_parameterize(points: np.ndarray) -> np.ndarray:
     return cumlen / total
 
 
-def _estimate_tangent(points: np.ndarray, end: str) -> np.ndarray:
-    """Estimate unit tangent at the start or end of a point sequence."""
+def _estimate_tangent(points: np.ndarray, end: str, lookahead: int = 5) -> np.ndarray:
+    """Estimate a robust unit tangent at the start or end of a point sequence."""
+    if len(points) < 2:
+        return np.array([1.0, 0.0])
+
+    window = max(1, min(int(lookahead), len(points) - 1))
+
     if end == "start":
-        idx = min(5, len(points) - 1)
-        tangent = points[idx] - points[0]
+        local_points = points[: window + 1]
     else:
-        idx = min(5, len(points) - 1)
-        tangent = points[-1] - points[-idx]
+        local_points = points[-(window + 1):]
+
+    vectors = np.diff(local_points, axis=0)
+    if end != "start":
+        vectors = -vectors
+
+    # Average local direction vectors to reduce pixel-level jaggedness.
+    tangent = np.mean(vectors, axis=0)
     norm = np.linalg.norm(tangent)
     if norm < 1e-12:
+        # Fallback to first non-degenerate direction in the local window.
+        for vec in vectors:
+            vec_norm = np.linalg.norm(vec)
+            if vec_norm >= 1e-12:
+                return vec / vec_norm
         return np.array([1.0, 0.0])
     return tangent / norm
 
@@ -326,9 +341,11 @@ class ContourBezierFitter:
         self,
         corner_threshold: float = 2.0,
         max_error: float = 5.0,
+        tangent_lookahead: int = 5,
     ):
         self.corner_threshold = corner_threshold
         self.max_error_sq = max_error ** 2  # Schneider uses squared error
+        self.tangent_lookahead = max(1, int(tangent_lookahead))
 
     def fit(self, contours: list) -> List[BezierPath]:
         """Fit Bezier paths to a list of OpenCV contours (Nx1x2 arrays)."""
@@ -410,8 +427,8 @@ class ContourBezierFitter:
         if len(points) < 2:
             return []
 
-        left_tangent = _estimate_tangent(points, "start")
-        right_tangent = _estimate_tangent(points, "end")
+        left_tangent = _estimate_tangent(points, "start", lookahead=self.tangent_lookahead)
+        right_tangent = _estimate_tangent(points, "end", lookahead=self.tangent_lookahead)
 
         if closed and len(points) > 2:
             # For closed segments make tangents consistent at junction
@@ -463,9 +480,14 @@ def fit_from_contours(
     contours: list,
     corner_threshold: float = 2.0,
     max_error: float = 5.0,
+    tangent_lookahead: int = 5,
 ) -> List[BezierPath]:
     """Fit cubic Bezier paths to a list of OpenCV contours."""
-    fitter = ContourBezierFitter(corner_threshold=corner_threshold, max_error=max_error)
+    fitter = ContourBezierFitter(
+        corner_threshold=corner_threshold,
+        max_error=max_error,
+        tangent_lookahead=tangent_lookahead,
+    )
     return fitter.fit(contours)
 
 
@@ -474,15 +496,17 @@ def fit_from_image(
     min_contour_area: float = 100.0,
     corner_threshold: float = 2.0,
     max_error: float = 5.0,
+    tangent_lookahead: int = 5,
 ) -> List[BezierPath]:
     """End-to-end: raster image → contours → fitted cubic Bezier paths."""
     contours, _ = _extract_raster_contours(image_path, min_contour_area)
-    return fit_from_contours(contours, corner_threshold, max_error)
+    return fit_from_contours(contours, corner_threshold, max_error, tangent_lookahead)
 
 
 def fit_from_image_skeleton(
     image_path: str,
     max_error: float = 5.0,
+    tangent_lookahead: int = 5,
 ) -> List[BezierPath]:
     """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths.
 
@@ -514,12 +538,17 @@ def fit_from_image_skeleton(
         else:
             pts = np.asarray(pts, dtype=np.float64)
 
+        # sknw returns points as (row, col) = (y, x); convert to (x, y).
+        if pts.ndim == 2 and pts.shape[1] >= 2:
+            pts = pts[:, ::-1]
+
         if len(pts) < 2:
             continue
 
         # Estimate tangents and fit cubic
-        left_tangent = _estimate_tangent(pts, "start")
-        right_tangent = _estimate_tangent(pts, "end")
+        lookahead = max(1, int(tangent_lookahead))
+        left_tangent = _estimate_tangent(pts, "start", lookahead=lookahead)
+        right_tangent = _estimate_tangent(pts, "end", lookahead=lookahead)
         cps_list = _fit_cubic_single(pts, left_tangent, right_tangent, max_error ** 2)
 
         segments = [BezierSegment(cps, source_type="skeleton") for cps in cps_list]
@@ -543,9 +572,19 @@ def _draw_paths_on_canvas(
 ) -> np.ndarray:
     """Render Bezier paths onto an image-space canvas using OpenCV."""
     rendered = canvas.copy()
+    curve_palette_bgr = [
+        (255, 255, 0),   # neon cyan
+        (0, 255, 255),   # bright yellow
+        (255, 140, 0),   # bright orange
+        (50, 255, 50),   # bright lime
+        (255, 60, 255),  # bright magenta
+        (100, 200, 255), # light orange-blue tint
+    ]
+    control_line_bgr = (180, 180, 180)
+    control_point_bgr = (255, 255, 255)
 
     for idx, bp in enumerate(paths):
-        color_bgr = tuple(int(channel * 255) for channel in colors[idx % len(colors)][:3])
+        color_bgr = curve_palette_bgr[idx % len(curve_palette_bgr)]
         for seg in bp.segments:
             pts = np.round(seg.sample(pts_per_segment)).astype(np.int32).reshape((-1, 1, 2))
             if len(pts) >= 2:
@@ -555,10 +594,10 @@ def _draw_paths_on_canvas(
                 continue
 
             cp = np.round(seg.control_points).astype(np.int32)
-            cv2.line(rendered, tuple(cp[0]), tuple(cp[1]), color_bgr, 1, lineType=cv2.LINE_AA)
-            cv2.line(rendered, tuple(cp[2]), tuple(cp[3]), color_bgr, 1, lineType=cv2.LINE_AA)
+            cv2.line(rendered, tuple(cp[0]), tuple(cp[1]), control_line_bgr, 1, lineType=cv2.LINE_AA)
+            cv2.line(rendered, tuple(cp[2]), tuple(cp[3]), control_line_bgr, 1, lineType=cv2.LINE_AA)
             for point in cp:
-                cv2.circle(rendered, tuple(point), 3, color_bgr, -1, lineType=cv2.LINE_AA)
+                cv2.circle(rendered, tuple(point), 3, control_point_bgr, -1, lineType=cv2.LINE_AA)
 
     return rendered
 
@@ -572,16 +611,33 @@ def _visualize_paths_single_panel(
 ) -> None:
     """Fallback single-panel plot for callers without source-image context."""
     fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+    fig.patch.set_facecolor("black")
+    ax.set_facecolor("black")
     ax.set_title(title)
+    ax.title.set_color("white")
     ax.set_aspect("equal")
+    ax.tick_params(colors="white")
+    for spine in ax.spines.values():
+        spine.set_color("white")
 
     all_points = []
-    colors = plt.cm.tab10.colors
+    bright_colors = [
+        "#00FFFF",  # neon cyan
+        "#FFFF00",  # bright yellow
+        "#39FF14",  # neon green
+        "#FF5F1F",  # bright orange
+        "#FF2CF0",  # bright magenta
+        "#6EE7FF",  # bright sky
+        "#FFD166",  # warm bright yellow
+        "#8BFF9E",  # mint bright
+        "#FF8BA7",  # bright rose
+        "#B794FF",  # bright violet
+    ]
     for idx, bp in enumerate(paths):
-        color = colors[idx % len(colors)]
+        color = bright_colors[idx % len(bright_colors)]
         for seg in bp.segments:
             pts = seg.sample(pts_per_segment)
-            ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=1.5)
+            ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=2.0)
             all_points.append(pts)
 
             if not show_controls:
@@ -591,15 +647,15 @@ def _visualize_paths_single_panel(
             all_points.append(cp)
             ax.plot(
                 [cp[0, 0], cp[1, 0]], [cp[0, 1], cp[1, 1]],
-                color=color, linewidth=0.6, linestyle="--", alpha=0.5,
+                color="#CCCCCC", linewidth=0.9, linestyle="--", alpha=0.8,
             )
             ax.plot(
                 [cp[2, 0], cp[3, 0]], [cp[2, 1], cp[3, 1]],
-                color=color, linewidth=0.6, linestyle="--", alpha=0.5,
+                color="#CCCCCC", linewidth=0.9, linestyle="--", alpha=0.8,
             )
             ax.plot(
                 cp[:, 0], cp[:, 1], "o",
-                color=color, markersize=3, alpha=0.6,
+                color="#FFFFFF", markersize=3.5, alpha=0.9,
             )
 
     if all_points:
@@ -613,12 +669,13 @@ def _visualize_paths_single_panel(
         ax.set_xlim(x_min - padding_x, x_max + padding_x)
         ax.set_ylim(y_min - padding_y, y_max + padding_y)
 
-    if paths and paths[0].source_type == "contour":
+    # Matplotlib uses Cartesian y-up; image-derived data is y-down.
+    if paths and paths[0].source_type in {"contour", "skeleton"}:
         ax.invert_yaxis()
 
     plt.tight_layout()
     if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="black")
         print(f"  -> Saved visualization -> {save_path}")
         plt.close(fig)
         return
@@ -642,9 +699,13 @@ def _visualize_paths_overview(
 
     h, w = img_bgr.shape[:2]
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.patch.set_facecolor("black")
+    for ax in axes:
+        ax.set_facecolor("black")
 
     axes[0].imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
     axes[0].set_title("Original Image")
+    axes[0].title.set_color("white")
     axes[0].axis("off")
 
     colors = plt.cm.tab10.colors
@@ -657,6 +718,7 @@ def _visualize_paths_overview(
     )
     axes[1].imshow(cv2.cvtColor(curves_only, cv2.COLOR_BGR2RGB))
     axes[1].set_title(f"Bezier Curves Only ({len(paths)})")
+    axes[1].title.set_color("white")
     axes[1].axis("off")
 
     curves_with_controls = _draw_paths_on_canvas(
@@ -671,12 +733,14 @@ def _visualize_paths_overview(
         axes[2].set_title("Bezier Curves + Controls")
     else:
         axes[2].set_title("Bezier Curves Overview")
+    axes[2].title.set_color("white")
     axes[2].axis("off")
 
-    fig.suptitle(title)
+    suptitle = fig.suptitle(title)
+    suptitle.set_color("white")
     plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="black")
         print(f"  -> Saved visualization -> {save_path}")
         plt.close(fig)
         return
@@ -733,21 +797,38 @@ def _print_summary(paths: List[BezierPath], label: str) -> None:
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    if len(sys.argv) < 2:
-        print("Usage: python bezier.py <image_path> [--skeleton]")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Fit cubic Bezier curves from raster plans.")
+    parser.add_argument("image_path", help="Path to input image")
+    parser.add_argument("--skeleton", action="store_true", help="Use skeleton-based fitting")
+    parser.add_argument(
+        "--min-area",
+        type=float,
+        default=100.0,
+        help="Minimum contour area for contour extraction",
+    )
+    parser.add_argument(
+        "--tangent-lookahead",
+        type=int,
+        default=5,
+        help="Lookahead window used for tangent estimation",
+    )
+    args = parser.parse_args()
 
-    input_path = sys.argv[1]
-    use_skeleton = "--skeleton" in sys.argv
-
-    if use_skeleton:
-        paths = fit_from_image_skeleton(input_path)
-        label = f"Skeleton fitting: {input_path}"
+    if args.skeleton:
+        paths = fit_from_image_skeleton(
+            args.image_path,
+            tangent_lookahead=args.tangent_lookahead,
+        )
+        label = f"Skeleton fitting: {args.image_path}"
     else:
-        paths = fit_from_image(input_path)
-        label = f"Contour fitting: {input_path}"
+        paths = fit_from_image(
+            args.image_path,
+            min_contour_area=args.min_area,
+            tangent_lookahead=args.tangent_lookahead,
+        )
+        label = f"Contour fitting: {args.image_path}"
 
     _print_summary(paths, label)
 
