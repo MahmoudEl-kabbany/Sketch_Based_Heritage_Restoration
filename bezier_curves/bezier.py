@@ -747,6 +747,57 @@ def _visualize_paths_overview(
 
     plt.show()
 
+
+def _comparison_save_path_from_overview_path(save_path: str) -> str:
+    """Derive a companion compare filename from the main overview path."""
+    directory, filename = os.path.split(save_path)
+    stem, ext = os.path.splitext(filename)
+    if stem.endswith("_bezier_vis"):
+        stem = stem[: -len("_bezier_vis")]
+    if not ext:
+        ext = ".png"
+    return os.path.join(directory, f"{stem}_bezier_compare{ext}")
+
+
+def _save_original_vs_bezier_controls(
+    paths: List[BezierPath],
+    image_path: str,
+    save_path: str,
+    pts_per_segment: int,
+) -> None:
+    """Save a 2-panel comparison image: original and Bezier+controls."""
+    img_bgr = cv2.imread(image_path)
+    if img_bgr is None:
+        return
+
+    h, w = img_bgr.shape[:2]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    fig.patch.set_facecolor("black")
+    for ax in axes:
+        ax.set_facecolor("black")
+
+    axes[0].imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    axes[0].set_title("Original Image")
+    axes[0].title.set_color("white")
+    axes[0].axis("off")
+
+    curves_with_controls = _draw_paths_on_canvas(
+        np.zeros((h, w, 3), dtype=np.uint8),
+        paths,
+        plt.cm.tab10.colors,
+        pts_per_segment,
+        show_controls=True,
+    )
+    axes[1].imshow(cv2.cvtColor(curves_with_controls, cv2.COLOR_BGR2RGB))
+    axes[1].set_title("Bezier Curves + Controls")
+    axes[1].title.set_color("white")
+    axes[1].axis("off")
+
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="black")
+    print(f"  -> Saved comparison visualization -> {save_path}")
+    plt.close(fig)
+
 def visualize_paths(
     paths: List[BezierPath],
     title: str = "Bezier Curves",
@@ -776,6 +827,15 @@ def visualize_paths(
             show_controls,
             pts_per_segment,
         )
+
+        if save_path:
+            compare_path = _comparison_save_path_from_overview_path(save_path)
+            _save_original_vs_bezier_controls(
+                paths,
+                image_path,
+                compare_path,
+                pts_per_segment,
+            )
         return
 
     _visualize_paths_single_panel(paths, title, save_path, show_controls, pts_per_segment)
