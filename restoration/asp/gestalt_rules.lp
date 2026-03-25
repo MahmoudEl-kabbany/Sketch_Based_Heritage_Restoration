@@ -18,24 +18,24 @@
 %% ═══════════════════════════════════════════════════════════════════════════
 
 %% --- Closure → complete a contour that is not already observed closed ------
-complete_contour(C) :-
+complete_contour(C, Conf) :-
     closure(C, Conf, _),
-    Conf > 75,
+    Conf > 50,
     not observed_closed(C).
 
 %% --- Good Continuation → extend a curve between two endpoints ---------------
-extend_curve(A, B) :-
+extend_curve(A, B, Conf) :-
     continues(A, B, Gap, Angle, Conf),
-    Gap < 2000,        % 20.0 px scaled ×100
-    Angle < 1500,      % 15.0 deg scaled ×100
-    Conf > 80.         % 0.80 scaled ×100
+    Gap < 5000,
+    Angle < 3000,
+    Conf > 40.
 
 %% --- Symmetry → mirror an element across axis --------------------------------
 mirror_element(E, Axis) :-
     symmetric(G, Axis, Res, Conf),
     member(E, G),
-    Res < 500,         % 5.0 px scaled ×100
-    Conf > 85,         % 0.85 scaled ×100
+    Res < 1000,
+    Conf > 55,
     not observed_at_mirror(E, Axis).
 
 %% --- Periodicity → replicate a motif at an expected position -----------------
@@ -54,22 +54,22 @@ group_elements(E1, E2) :-
 %% --- Similarity → flag a pair where one may be missing -----------------------
 flag_similar_missing(A, B) :-
     similar_shape(A, B, D, C),
-    C > 85,            % confidence > 0.85
-    D < 15,            % distance   < 0.15
+    C > 55,
+    D < 50,
     not both_observed(A, B).
 
 %% --- Pragnanz → simplify an interpretation -----------------------------------
 simplify_interpretation(L) :-
     pragnanz(L, Interp, Conf),
-    Conf > 80.
+    Conf > 60.
 
 %% ═══════════════════════════════════════════════════════════════════════════
 %% Optimisation — minimise total cost (negated confidence of chosen actions)
 %% ═══════════════════════════════════════════════════════════════════════════
 
 #minimize {
-    100 - Conf, complete_contour, C : complete_contour(C), closure(C, Conf, _);
-    100 - Conf, extend_curve, A, B  : extend_curve(A, B), continues(A, B, _, _, Conf);
+    100 - Conf, complete_contour, C : complete_contour(C, Conf), closure(C, Conf, _);
+    100 - Conf, extend_curve, A, B  : extend_curve(A, B, Conf), continues(A, B, _, _, Conf);
     100 - Conf, mirror, E, Axis     : mirror_element(E, Axis), symmetric(G, Axis, _, Conf), member(E, G);
     100 - C,    similar, A, B       : flag_similar_missing(A, B), similar_shape(A, B, _, C)
 }.

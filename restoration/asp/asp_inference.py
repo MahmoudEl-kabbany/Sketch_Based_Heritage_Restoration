@@ -280,9 +280,13 @@ class ASPInferenceEngine:
 
             if name == "complete_contour" and len(raw_args) >= 1:
                 arguments["contour_id"] = _safe_int(raw_args[0])
+                if len(raw_args) >= 2:
+                    confidence = _safe_int(raw_args[1]) / 100.0
             elif name == "extend_curve" and len(raw_args) >= 2:
                 arguments["path_a"] = _safe_int(raw_args[0])
                 arguments["path_b"] = _safe_int(raw_args[1])
+                if len(raw_args) >= 3:
+                    confidence = _safe_int(raw_args[2]) / 100.0
             elif name == "mirror_element" and len(raw_args) >= 2:
                 arguments["element_id"] = _safe_int(raw_args[0])
                 arguments["axis"] = raw_args[1]

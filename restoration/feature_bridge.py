@@ -186,50 +186,53 @@ def extract_endpoint_gaps(
 
         for idx_b in range(idx_a + 1, len(open_paths)):
             pid_b, pb = open_paths[idx_b]
-            start_b = pb.segments[0].control_points[0]
-            tan_b = _unit_vector(
-                pb.segments[0].control_points[1] - pb.segments[0].control_points[0]
-            )
-            dist = float(np.linalg.norm(end_a - start_b))
 
-            if dist > cfg.max_gap_distance:
-                # Also check reverse direction
-                end_b = pb.segments[-1].control_points[3]
-                start_a = pa.segments[0].control_points[0]
-                dist_rev = float(np.linalg.norm(end_b - start_a))
-                if dist_rev > cfg.max_gap_distance:
-                    continue
-                # Use reverse pairing
-                tan_b_rev = _unit_vector(
-                    pb.segments[-1].control_points[3]
-                    - pb.segments[-1].control_points[2]
-                )
-                tan_a_rev = _unit_vector(
-                    pa.segments[0].control_points[1]
-                    - pa.segments[0].control_points[0]
-                )
-                dot = float(np.clip(np.dot(tan_b_rev, tan_a_rev), -1.0, 1.0))
+            start_a = pa.segments[0].control_points[0]
+            end_a = pa.segments[-1].control_points[3]
+            tan_start_a = _unit_vector(
+                pa.segments[0].control_points[0] - pa.segments[0].control_points[1]
+            )
+            tan_end_a = _unit_vector(
+                pa.segments[-1].control_points[3] - pa.segments[-1].control_points[2]
+            )
+
+            start_b = pb.segments[0].control_points[0]
+            end_b = pb.segments[-1].control_points[3]
+            tan_start_b = _unit_vector(
+                pb.segments[0].control_points[0] - pb.segments[0].control_points[1]
+            )
+            tan_end_b = _unit_vector(
+                pb.segments[-1].control_points[3] - pb.segments[-1].control_points[2]
+            )
+
+            pairings = [
+                (end_a, start_b, tan_end_a, tan_start_b),
+                (end_a, end_b, tan_end_a, tan_end_b),
+                (start_a, start_b, tan_start_a, tan_start_b),
+                (start_a, end_b, tan_start_a, tan_end_b),
+            ]
+
+            best_pair = None
+            min_dist = float("inf")
+
+            for pt_a, pt_b, t_a, t_b in pairings:
+                d = float(np.linalg.norm(pt_a - pt_b))
+                if d <= cfg.max_gap_distance and d < min_dist:
+                    min_dist = d
+                    best_pair = (t_a, t_b, d)
+
+            if best_pair:
+                t_a, t_b, final_dist = best_pair
+                dot = float(np.clip(np.dot(t_a, t_b), -1.0, 1.0))
                 angle_deg = float(np.degrees(np.arccos(abs(dot))))
                 records.append(
                     GapRecord(
-                        path_id_a=pid_b,
-                        path_id_b=pid_a,
-                        gap_dist=dist_rev,
+                        path_id_a=pid_a,
+                        path_id_b=pid_b,
+                        gap_dist=final_dist,
                         tangent_angle_deg=angle_deg,
                     )
                 )
-                continue
-
-            dot = float(np.clip(np.dot(tan_a, tan_b), -1.0, 1.0))
-            angle_deg = float(np.degrees(np.arccos(abs(dot))))
-            records.append(
-                GapRecord(
-                    path_id_a=pid_a,
-                    path_id_b=pid_b,
-                    gap_dist=dist,
-                    tangent_angle_deg=angle_deg,
-                )
-            )
 
     logger.debug("Extracted %d endpoint gaps from %d paths", len(records), len(paths))
     return records
@@ -696,6 +699,7 @@ def _asp_int(v: float) -> int:
 def serialize_features_to_asp(
     bundle: FeatureBundle,
     paths: Optional[List[BezierPath]] = None,
+    config: Optional[FeatureBridgeConfig] = None,
 ) -> str:
     """Convert a :class:`FeatureBundle` directly into ASP fact strings.
 
@@ -730,6 +734,7 @@ def serialize_features_to_asp(
     >>> isinstance(s, str)
     True
     """
+    cfg = config or FeatureBridgeConfig()
     _paths: List[BezierPath] = paths or []
     lines: List[str] = ["%% Auto-generated feature facts"]
 
@@ -752,9 +757,9 @@ def serialize_features_to_asp(
             end = path.segments[-1].control_points[3]
             self_gap = float(np.linalg.norm(end - start))
             # Confidence: closer endpoints → higher confidence
-            max_gap = 100.0  # px ceiling
+            max_gap = cfg.max_gap_distance
             conf = max(0.0, 1.0 - self_gap / max_gap)
-            if conf >= 0.50:
+            if conf >= 0.20:
                 persistence = _asp_int(self_gap)
                 lines.append(
                     f"closure({pid},{_asp_int(conf)},{persistence})."
@@ -762,12 +767,12 @@ def serialize_features_to_asp(
 
     # ── Good continuation: from endpoint gaps ────────────────────────────
     for g in bundle.gaps:
-        max_gap = 50.0
+        max_gap = cfg.max_gap_distance * 0.4
         max_angle = 30.0
         dist_score = max(0.0, 1.0 - g.gap_dist / max_gap)
         angle_score = max(0.0, 1.0 - g.tangent_angle_deg / max_angle)
         conf = dist_score * angle_score
-        if conf >= 0.50:
+        if conf >= 0.20:
             lines.append(
                 f"continues({g.path_id_a},{g.path_id_b},"
                 f"{_asp_int(g.gap_dist)},{_asp_int(g.tangent_angle_deg)},"
@@ -845,6 +850,13 @@ def serialize_features_to_asp(
             lines.append(
                 f"expected_position({idx},identity,{_asp_int(expected_next)})."
             )
+
+    # ── Pragnanz facts: simple interpretation triggers ───────────────────
+    for pid, stypes in bundle.segment_types.items():
+        if any(t in ("arch", "loop") for t in stypes):
+            lines.append(f"pragnanz({pid},arch,75).")
+        elif all(t == "straight" for t in stypes) and stypes:
+            lines.append(f"pragnanz({pid},line,80).")
 
     logger.info("Serialised %d ASP fact lines from features", len(lines) - 1)
     return "\n".join(lines)
