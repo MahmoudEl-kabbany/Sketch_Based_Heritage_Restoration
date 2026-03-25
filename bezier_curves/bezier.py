@@ -861,7 +861,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Fit cubic Bezier curves from raster plans.")
     parser.add_argument("image_path", help="Path to input image")
-    parser.add_argument("--skeleton", action="store_true", help="Use skeleton-based fitting")
+    parser.add_argument("--no-skeleton", action="store_false", dest="skeleton", help="Disable skeleton-based fitting")
     parser.add_argument(
         "--min-area",
         type=float,
@@ -874,6 +874,7 @@ if __name__ == "__main__":
         default=5,
         help="Lookahead window used for tangent estimation",
     )
+    parser.set_defaults(skeleton=True)
     args = parser.parse_args()
 
     if args.skeleton:

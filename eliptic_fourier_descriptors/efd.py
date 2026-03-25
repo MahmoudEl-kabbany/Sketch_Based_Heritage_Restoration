@@ -166,7 +166,7 @@ def _extract_raster_contours(
         img, h=10, templateWindowSize=7, searchWindowSize=21
     )
     cv2.imwrite(os.path.join(OUTPUT_DIR, "real_denoised.png"), denoised)
-    print(f"  ➜  Denoised image saved to {OUTPUT_DIR}/real_denoised.png")
+    print(f"  ->  Denoised image saved to {OUTPUT_DIR}/real_denoised.png")
 
     # Adaptive threshold
     binary = cv2.adaptiveThreshold(
@@ -183,7 +183,7 @@ def _extract_raster_contours(
     if use_skeleton:
         binary = _morphological_skeleton(binary)
         cv2.imwrite(os.path.join(OUTPUT_DIR, "real_skeleton.png"), cv2.bitwise_not(binary))
-        print(f"  ➜  Skeleton image saved to {OUTPUT_DIR}/real_skeleton.png")
+        print(f"  ->  Skeleton image saved to {OUTPUT_DIR}/real_skeleton.png")
 
     retrieval_key = contour_retrieval.lower()
     if retrieval_key not in _CONTOUR_RETRIEVAL_MODES:
@@ -248,7 +248,7 @@ def _process_contours(significant, total_count, efd_orders, colors):
             recon, coeffs = reconstruct_contour_efd(cnt, order=order)
             if recon is None:
                 continue
-            print(f"    Contour {i:>2d} → {len(recon)} pts reconstructed "
+            print(f"    Contour {i:>2d} -> {len(recon)} pts reconstructed "
                   f"({coeffs.shape[0]} harmonics × {coeffs.shape[1]} coeffs)")
 
     return efd_results
@@ -262,7 +262,7 @@ def process_image(
     image_path,
     efd_orders=(5, 10, 20, 40),
     min_contour_area=100,
-    use_skeleton=False,
+    use_skeleton=True,
     contour_retrieval="tree",
 ):
     """
@@ -290,7 +290,7 @@ def extract_efd_from_image(
     image_path,
     order=10,
     min_contour_area=100,
-    use_skeleton=False,
+    use_skeleton=True,
     contour_retrieval="tree",
 ):
     """
@@ -329,7 +329,7 @@ def visualize_efd(
     order=10,
     save_path=None,
     min_contour_area=100,
-    use_skeleton=False,
+    use_skeleton=True,
     contour_retrieval="tree",
 ):
     """
@@ -359,7 +359,7 @@ def _process_raster(
     image_path,
     efd_orders,
     min_contour_area,
-    use_skeleton=False,
+    use_skeleton=True,
     contour_retrieval="tree",
 ):
     """Raster processing pipeline: denoise → threshold → contours → EFD."""
@@ -370,7 +370,7 @@ def _process_raster(
         contour_retrieval=contour_retrieval,
     )
     if contours is None:
-        print(f"  ⚠  Could not load image: {image_path}")
+        print(f"  !  Could not load image: {image_path}")
         return
 
     retrieval_key = contour_retrieval.lower()
@@ -502,7 +502,7 @@ def _visualize_raster(image_path, significant, colors, best_order):
     plt.tight_layout()
     out_path = os.path.join(OUTPUT_DIR, "efd_matplotlib_overview.png")
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    print(f"\n  ➜  Matplotlib overview saved to {out_path}")
+    print(f"\n  ->  Matplotlib overview saved to {out_path}")
     plt.show()
 
 
@@ -518,4 +518,4 @@ if __name__ == "__main__":
         r"C:\Users\Mahmoud\Documents\GitHub\Sketch_Based_Heritage_Restoration\test_images\sketches.jpg"
     )
 
-    print("\n✅  All tests complete. Check the 'contour_outputs' folder for results.")
+    print("\n[OK]  All tests complete. Check the 'contour_outputs' folder for results.")
