@@ -206,29 +206,27 @@ def extract_endpoint_gaps(
             )
 
             pairings = [
-                (end_a, start_b, tan_end_a, tan_start_b),
-                (end_a, end_b, tan_end_a, tan_end_b),
-                (start_a, start_b, tan_start_a, tan_start_b),
-                (start_a, end_b, tan_start_a, tan_end_b),
+                (end_a, start_b, tan_end_a, tan_start_b, pid_a, pid_b),
+                (end_b, start_a, tan_end_b, tan_start_a, pid_b, pid_a),
             ]
 
             best_pair = None
             min_dist = float("inf")
 
-            for pt_a, pt_b, t_a, t_b in pairings:
+            for pt_a, pt_b, t_a, t_b, id_a, id_b in pairings:
                 d = float(np.linalg.norm(pt_a - pt_b))
                 if d <= cfg.max_gap_distance and d < min_dist:
                     min_dist = d
-                    best_pair = (t_a, t_b, d)
+                    best_pair = (t_a, t_b, d, id_a, id_b)
 
             if best_pair:
-                t_a, t_b, final_dist = best_pair
+                t_a, t_b, final_dist, id_a, id_b = best_pair
                 dot = float(np.clip(np.dot(t_a, t_b), -1.0, 1.0))
                 angle_deg = float(np.degrees(np.arccos(abs(dot))))
                 records.append(
                     GapRecord(
-                        path_id_a=pid_a,
-                        path_id_b=pid_b,
+                        path_id_a=id_a,
+                        path_id_b=id_b,
                         gap_dist=final_dist,
                         tangent_angle_deg=angle_deg,
                     )
