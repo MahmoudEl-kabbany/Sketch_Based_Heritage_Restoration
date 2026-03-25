@@ -174,17 +174,20 @@ def close_contour_g1(
         cp = np.vstack([P0, P1, P2, Pn]).astype(np.float64)
         return BezierSegment(cp)
 
+    tol_alpha = max(cfg.g1_newton_step * 0.1, 1e-6)
+    tol_err = 1.0
+
     for _ in range(cfg.g1_newton_iterations):
         seg_cur = _build_closing(alpha)
         pts_cur = seg_cur.sample(30)
 
-        # Error = max distance from closing segment sample to the arc midpoints
+        # Error uses median distance to reduce outlier sensitivity.
         if len(ref_pts) > 0 and len(pts_cur) > 0:
             from scipy.spatial import cKDTree
 
             tree = cKDTree(ref_pts)
             dists, _ = tree.query(pts_cur)
-            err = float(np.max(dists))
+            err = float(np.median(dists))
         else:
             err = 0.0
 
@@ -193,14 +196,17 @@ def close_contour_g1(
         pts_plus = seg_plus.sample(30)
         if len(ref_pts) > 0 and len(pts_plus) > 0:
             dists_p, _ = tree.query(pts_plus)
-            err_plus = float(np.max(dists_p))
+            err_plus = float(np.median(dists_p))
         else:
             err_plus = err
 
         grad = (err_plus - err) / cfg.g1_newton_step
         if abs(grad) > 1e-12:
+            prev_alpha = alpha
             alpha = alpha - err / grad
             alpha = max(alpha, chord * 0.05)  # floor
+            if abs(alpha - prev_alpha) < tol_alpha and err < tol_err:
+                break
 
     return _build_closing(alpha)
 
@@ -224,15 +230,6 @@ def bridge_curves(
     Returns
     -------
     BezierSegment
-
-    Examples
-    --------
-    >>> cp1 = np.array([[0,0],[1,0],[2,0],[3,0]], dtype=np.float64)
-    >>> cp2 = np.array([[5,0],[6,0],[7,0],[8,0]], dtype=np.float64)
-    >>> s1 = BezierSegment(cp1); s2 = BezierSegment(cp2)
-    >>> bridge = bridge_curves(BezierPath([s1]), BezierPath([s2]))
-    >>> bridge.control_points.shape
-    (4, 2)
     """
     cfg = config or RestorationConfig()
 
@@ -241,6 +238,7 @@ def bridge_curves(
 
     # Tangent at P0 (exit direction of path A)
     T0 = P0 - path_a.segments[-1].control_points[2]
+
     n0 = np.linalg.norm(T0)
     T0 = T0 / n0 if n0 > 1e-12 else np.array([1.0, 0.0], dtype=np.float64)
 
@@ -702,81 +700,55 @@ def visualise(
     output_path: Optional[str] = None,
     config: Optional[RestorationConfig] = None,
 ) -> None:
-    """Plot original vs restored sketch side-by-side.
-
-    Parameters
-    ----------
-    result : RestorationResult
-    image_path : str, optional
-        Path to the original image to use as background.
-    output_path : str, optional
-        If given, saves the figure to disk.
-    config : RestorationConfig, optional
-
-    Examples
-    --------
-    >>> visualise(RestorationResult())
-    """
+    """Save an exact copy of the image and one with new paths overlaid."""
     cfg = config or RestorationConfig()
 
-    fig, (ax_orig, ax_rest) = plt.subplots(
-        1, 2, figsize=cfg.vis_figsize
-    )
-    fig.patch.set_facecolor("black")
-
-    img = None
+    img_bgr = None
     if image_path and os.path.exists(image_path):
         img_bgr = cv2.imread(image_path)
-        if img_bgr is not None:
-            img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    
+    if img_bgr is None:
+        logger.warning("No valid image_path provided to visualise, creating blank canvas.")
+        img_bgr = np.zeros((1000, 1000, 3), dtype=np.uint8)
 
-    for ax, title in [(ax_orig, "Original Sketch"), (ax_rest, "Restored Sketch")]:
-        ax.set_facecolor("black")
-        ax.set_title(title, color="white")
-        ax.set_aspect("equal")
-        ax.tick_params(colors="white")
-        for spine in ax.spines.values():
-            spine.set_color("white")
-        if img is not None:
-            ax.imshow(img)
-
-    colors_orig = ["#00FFFF", "#FFFF00", "#39FF14", "#FF5F1F", "#FF2CF0"]
-    colors_new = ["#FF8BA7", "#B794FF", "#6EE7FF", "#FFD166", "#8BFF9E"]
-
-    # Draw originals on both panels with some transparency
-    for idx, path in enumerate(result.original_paths):
-        pts = path.sample(50)
-        if len(pts) == 0:
-            continue
-        c = colors_orig[idx % len(colors_orig)]
-        ax_orig.plot(pts[:, 0], pts[:, 1], color=c, linewidth=2.0)
-        ax_rest.plot(pts[:, 0], pts[:, 1], color=c, linewidth=2.0, alpha=0.3)
-
-    # Draw new segments on restored panel
-    for idx, seg in enumerate(result.new_segments):
-        pts = seg.sample(50)
-        c = colors_new[idx % len(colors_new)]
-        ax_rest.plot(pts[:, 0], pts[:, 1], color=c, linewidth=3.0, linestyle="--")
-
-    # Draw new paths on restored panel
-    for idx, path in enumerate(result.new_paths):
-        pts = path.sample(50)
-        if len(pts) == 0:
-            continue
-        c = colors_new[(idx + len(result.new_segments)) % len(colors_new)]
-        ax_rest.plot(pts[:, 0], pts[:, 1], color=c, linewidth=3.0, linestyle="--")
-
-    # Invert y-axis for image coordinates only if an image wasn't shown
-    # (imshow automatically sets up a top-left origin)
-    if img is None:
-        for ax in (ax_orig, ax_rest):
-            ax.invert_yaxis()
-
-    plt.tight_layout()
+    # 1. Save original image unaltered
     if output_path:
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        fig.savefig(output_path, dpi=cfg.vis_dpi, bbox_inches="tight", facecolor="black")
-        logger.info("Saved visualisation to %s", output_path)
-        plt.close(fig)
+        orig_path = output_path.replace("visualisation", "original") if "visualisation" in output_path else output_path.replace(".png", "_orig.png")
+        cv2.imwrite(orig_path, img_bgr)
+        logger.info("Saved original visualisation to %s", orig_path)
+
+    # 2. Draw restored overlays
+    overlaid = img_bgr.copy()
+
+    # Vibrant native BGR colors for drawing new paths cleanly
+    vibrant_colors = [
+        (0, 255, 255),   # Yellow
+        (255, 0, 255),   # Magenta
+        (0, 255, 0),     # Lime Green
+        (255, 128, 0),   # Cyan
+        (0, 165, 255),   # Orange
+        (200, 100, 255), # Pink/Purple
+    ]
+
+    # Draw new segments
+    for idx, seg in enumerate(result.new_segments):
+        pts = seg.sample(200) # Heavy sampling for smooth curve
+        pts_int = np.round(pts).astype(np.int32).reshape((-1, 1, 2))
+        c = vibrant_colors[idx % len(vibrant_colors)]
+        cv2.polylines(overlaid, [pts_int], False, c, thickness=3, lineType=cv2.LINE_AA)
+
+    # Draw new paths (merged components)
+    for idx, path in enumerate(result.new_paths):
+        pts = path.sample(200)
+        if len(pts) == 0:
+            continue
+        c = vibrant_colors[(idx + len(result.new_segments)) % len(vibrant_colors)]
+        pts_int = np.round(pts).astype(np.int32).reshape((-1, 1, 2))
+        cv2.polylines(overlaid, [pts_int], False, c, thickness=3, lineType=cv2.LINE_AA)
+
+    if output_path:
+        cv2.imwrite(output_path, overlaid)
+        logger.info("Saved restored visualisation to %s", output_path)
     else:
-        plt.show()
+        logger.info("No output_path specified, visualisations not saved.")

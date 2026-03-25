@@ -47,7 +47,7 @@ class FeatureBridgeConfig:
     """All tuneable thresholds for *feature_bridge*."""
 
     # endpoint-gap detection
-    max_gap_distance: float = 50.0
+    max_gap_distance: float = 500.0
     """Maximum pixel distance between endpoints to consider a gap."""
 
     # curvature classification
@@ -183,6 +183,7 @@ def extract_endpoint_gaps(
         tan_a = _unit_vector(
             pa.segments[-1].control_points[3] - pa.segments[-1].control_points[2]
         )
+
         for idx_b in range(idx_a + 1, len(open_paths)):
             pid_b, pb = open_paths[idx_b]
             start_b = pb.segments[0].control_points[0]
@@ -566,15 +567,22 @@ def build_skeleton_graph(
 
     graph = sknw.build_sknw(skeleton)
 
-    # Filter short edges
+    # Filter short edges, supporting both Graph and MultiGraph-like outputs.
     edges_to_remove = []
-    for s, e, key, data in graph.edges(keys=True, data=True):
-        pts = data.get("pts", np.empty((0, 2)))
-        if len(pts) < cfg.skeleton_min_edge_length:
-            edges_to_remove.append((s, e, key))
-
-    for s, e, key in edges_to_remove:
-        graph.remove_edge(s, e, key=key)
+    if graph.is_multigraph():
+        for s, e, key, data in graph.edges(keys=True, data=True):
+            pts = data.get("pts", np.empty((0, 2)))
+            if len(pts) < cfg.skeleton_min_edge_length:
+                edges_to_remove.append((s, e, key))
+        for s, e, key in edges_to_remove:
+            graph.remove_edge(s, e, key=key)
+    else:
+        for s, e, data in graph.edges(data=True):
+            pts = data.get("pts", np.empty((0, 2)))
+            if len(pts) < cfg.skeleton_min_edge_length:
+                edges_to_remove.append((s, e))
+        for s, e in edges_to_remove:
+            graph.remove_edge(s, e)
 
     # Remove isolated nodes left behind
     isolated = [n for n in graph.nodes() if graph.degree(n) == 0]
@@ -758,7 +766,7 @@ def serialize_features_to_asp(
         max_angle = 30.0
         dist_score = max(0.0, 1.0 - g.gap_dist / max_gap)
         angle_score = max(0.0, 1.0 - g.tangent_angle_deg / max_angle)
-        conf = (dist_score + angle_score) / 2.0
+        conf = dist_score * angle_score
         if conf >= 0.50:
             lines.append(
                 f"continues({g.path_id_a},{g.path_id_b},"
