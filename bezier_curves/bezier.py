@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import matplotlib.pyplot as plt
@@ -507,12 +507,22 @@ def fit_from_image_skeleton(
     image_path: str,
     max_error: float = 5.0,
     tangent_lookahead: int = 5,
-) -> List[BezierPath]:
+    merge_radius: float = 3.0,
+) -> Tuple[List[BezierPath], Dict[int, set]]:
     """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths.
 
     Preferred over fit_from_image for line drawings, diagrams, and strokes,
     where findContours would produce two parallel outlines instead of a
     single centreline.
+
+    Returns
+    -------
+    paths : List[BezierPath]
+        Fitted B\u00e9zier paths.
+    adjacency : Dict[int, set]
+        Mapping path_index → set of path_indices that share a skeleton
+        node (i.e. paths that are already connected and should not be
+        bridged by the gap detector).
     """
     # Read image as grayscale
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
@@ -527,6 +537,9 @@ def fit_from_image_skeleton(
 
     # Build graph from skeleton
     graph = sknw.build_sknw(skeleton)
+
+    # Track which skeleton node each edge connects so we can build adjacency
+    edge_to_path_idx: Dict[int, List[int]] = {}  # skeleton node → [path indices]
 
     # Process edges
     paths = []
@@ -553,9 +566,45 @@ def fit_from_image_skeleton(
 
         segments = [BezierSegment(cps, source_type="skeleton") for cps in cps_list]
         if segments:
+            path_idx = len(paths)
             paths.append(BezierPath(segments, is_closed=False, source_type="skeleton"))
+            # Record skeleton node connections
+            for node in (s, e):
+                edge_to_path_idx.setdefault(node, []).append(path_idx)
 
-    return paths
+    # Build adjacency: paths sharing a skeleton node are connected
+    adjacency: Dict[int, set] = {}
+    for node, path_indices in edge_to_path_idx.items():
+        for i in range(len(path_indices)):
+            for j in range(i + 1, len(path_indices)):
+                pi, pj = path_indices[i], path_indices[j]
+                adjacency.setdefault(pi, set()).add(pj)
+                adjacency.setdefault(pj, set()).add(pi)
+
+    # Endpoint merging: snap endpoints of adjacent paths to exact same point
+    if merge_radius > 0:
+        for pi, neighbours in adjacency.items():
+            if pi >= len(paths):
+                continue
+            for pj in neighbours:
+                if pj >= len(paths) or pj <= pi:
+                    continue
+                pa, pb = paths[pi], paths[pj]
+                # Check all four endpoint combinations
+                endpoints = [
+                    (pa.segments[-1].control_points, 3, pb.segments[0].control_points, 0),
+                    (pa.segments[-1].control_points, 3, pb.segments[-1].control_points, 3),
+                    (pa.segments[0].control_points, 0, pb.segments[0].control_points, 0),
+                    (pa.segments[0].control_points, 0, pb.segments[-1].control_points, 3),
+                ]
+                for cp_a, idx_a, cp_b, idx_b in endpoints:
+                    d = np.linalg.norm(cp_a[idx_a] - cp_b[idx_b])
+                    if 0 < d <= merge_radius:
+                        midpoint = (cp_a[idx_a] + cp_b[idx_b]) / 2.0
+                        cp_a[idx_a] = midpoint
+                        cp_b[idx_b] = midpoint
+
+    return paths, adjacency
 
 
 # ═══════════════════════════════════════════════════════════════════════════

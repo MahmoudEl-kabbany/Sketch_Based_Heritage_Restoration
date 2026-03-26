@@ -49,6 +49,10 @@ class FeatureBridgeConfig:
     # endpoint-gap detection
     max_gap_distance: float = 500.0
     """Maximum pixel distance between endpoints to consider a gap."""
+    min_gap_px: float = 2.0
+    """Minimum gap distance; pairs closer than this are already connected."""
+    min_closure_gap: float = 3.0
+    """Minimum self-gap (start↔end of same path) to emit a closure fact."""
 
     # curvature classification
     curvature_straight_threshold: float = 0.01
@@ -93,6 +97,10 @@ class GapRecord:
     path_id_b: int
     gap_dist: float
     tangent_angle_deg: float
+    endpoint_a: str = "end"
+    """Which endpoint of path_a was used: 'start' or 'end'."""
+    endpoint_b: str = "start"
+    """Which endpoint of path_b was used: 'start' or 'end'."""
 
 
 @dataclass
@@ -149,8 +157,13 @@ def _unit_vector(v: np.ndarray) -> np.ndarray:
 def extract_endpoint_gaps(
     paths: List[BezierPath],
     config: Optional[FeatureBridgeConfig] = None,
+    adjacency: Optional[Dict[int, set]] = None,
 ) -> List[GapRecord]:
     """Find all open-endpoint pairs whose gap is below threshold.
+
+    Evaluates all four endpoint pairings (end→start, start→end,
+    end→end, start→start) and emits every qualifying gap rather
+    than only the best one per path-pair.
 
     Parameters
     ----------
@@ -158,6 +171,9 @@ def extract_endpoint_gaps(
         Bézier paths extracted from the sketch.
     config : FeatureBridgeConfig, optional
         Threshold configuration.  Uses defaults when *None*.
+    adjacency : dict, optional
+        Mapping path_id → set of path_ids that share a skeleton node
+        (already connected).  These pairs are skipped.
 
     Returns
     -------
@@ -173,28 +189,29 @@ def extract_endpoint_gaps(
     True
     """
     cfg = config or FeatureBridgeConfig()
+    adj = adjacency or {}
     records: List[GapRecord] = []
 
     open_paths = [(i, p) for i, p in enumerate(paths) if not p.is_closed and p.segments]
 
     for idx_a in range(len(open_paths)):
         pid_a, pa = open_paths[idx_a]
+
+        start_a = pa.segments[0].control_points[0]
         end_a = pa.segments[-1].control_points[3]
-        tan_a = _unit_vector(
+        tan_start_a = _unit_vector(
+            pa.segments[0].control_points[0] - pa.segments[0].control_points[1]
+        )
+        tan_end_a = _unit_vector(
             pa.segments[-1].control_points[3] - pa.segments[-1].control_points[2]
         )
 
         for idx_b in range(idx_a + 1, len(open_paths)):
             pid_b, pb = open_paths[idx_b]
 
-            start_a = pa.segments[0].control_points[0]
-            end_a = pa.segments[-1].control_points[3]
-            tan_start_a = _unit_vector(
-                pa.segments[0].control_points[0] - pa.segments[0].control_points[1]
-            )
-            tan_end_a = _unit_vector(
-                pa.segments[-1].control_points[3] - pa.segments[-1].control_points[2]
-            )
+            # Skip paths already connected via skeleton adjacency
+            if pid_b in adj.get(pid_a, set()):
+                continue
 
             start_b = pb.segments[0].control_points[0]
             end_b = pb.segments[-1].control_points[3]
@@ -205,30 +222,29 @@ def extract_endpoint_gaps(
                 pb.segments[-1].control_points[3] - pb.segments[-1].control_points[2]
             )
 
+            # All four endpoint pairings
             pairings = [
-                (end_a, start_b, tan_end_a, tan_start_b, pid_a, pid_b),
-                (end_b, start_a, tan_end_b, tan_start_a, pid_b, pid_a),
+                (end_a,   start_b, tan_end_a,   tan_start_b, pid_a, pid_b, "end",   "start"),
+                (end_a,   end_b,   tan_end_a,   tan_end_b,   pid_a, pid_b, "end",   "end"),
+                (start_a, start_b, tan_start_a, tan_start_b, pid_a, pid_b, "start", "start"),
+                (start_a, end_b,   tan_start_a, tan_end_b,   pid_a, pid_b, "start", "end"),
             ]
 
-            best_pair = None
-            min_dist = float("inf")
-
-            for pt_a, pt_b, t_a, t_b, id_a, id_b in pairings:
+            for pt_a, pt_b, t_a, t_b, id_a, id_b, ep_a, ep_b in pairings:
                 d = float(np.linalg.norm(pt_a - pt_b))
-                if d <= cfg.max_gap_distance and d < min_dist:
-                    min_dist = d
-                    best_pair = (t_a, t_b, d, id_a, id_b)
-
-            if best_pair:
-                t_a, t_b, final_dist, id_a, id_b = best_pair
+                # Skip already-connected endpoints and out-of-range gaps
+                if d < cfg.min_gap_px or d > cfg.max_gap_distance:
+                    continue
                 dot = float(np.clip(np.dot(t_a, t_b), -1.0, 1.0))
                 angle_deg = float(np.degrees(np.arccos(abs(dot))))
                 records.append(
                     GapRecord(
                         path_id_a=id_a,
                         path_id_b=id_b,
-                        gap_dist=final_dist,
+                        gap_dist=d,
                         tangent_angle_deg=angle_deg,
+                        endpoint_a=ep_a,
+                        endpoint_b=ep_b,
                     )
                 )
 
@@ -597,6 +613,7 @@ def extract_all_features(
     efd_data: Optional[Dict[int, np.ndarray]] = None,
     binary_img: Optional[np.ndarray] = None,
     config: Optional[FeatureBridgeConfig] = None,
+    adjacency: Optional[Dict[int, set]] = None,
 ) -> FeatureBundle:
     """Orchestrate all feature extraction routines.
 
@@ -608,6 +625,8 @@ def extract_all_features(
     binary_img : np.ndarray, optional
         Skeleton source image.
     config : FeatureBridgeConfig, optional
+    adjacency : dict, optional
+        Mapping path_id → set of connected path_ids (from skeleton).
 
     Returns
     -------
@@ -625,21 +644,26 @@ def extract_all_features(
 
     # 1. Endpoint gaps
     try:
-        bundle.gaps = extract_endpoint_gaps(paths, cfg)
+        bundle.gaps = extract_endpoint_gaps(paths, cfg, adjacency=adjacency)
     except Exception as exc:
         logger.error("Gap extraction failed: %s", exc)
 
     # 2. Curvature profiles & segment classification
     for pid, path in enumerate(paths):
         seg_types: List[str] = []
-        for seg in path.segments:
+        profiles: List[Tuple[np.ndarray, np.ndarray]] = []
+        for seg_idx, seg in enumerate(path.segments):
             try:
                 ts, ks = extract_curvature_profile(seg, cfg.curvature_samples)
-                bundle.curvature_profiles[pid] = (ts, ks)
+                profiles.append((ts, ks))
                 seg_types.append(classify_segment_type(ks, cfg))
             except Exception as exc:
-                logger.error("Curvature extraction failed for path %d: %s", pid, exc)
+                logger.error("Curvature extraction failed for path %d seg %d: %s", pid, seg_idx, exc)
                 seg_types.append("unknown")
+        # Store the last profile under pid for backward compat,
+        # but also expose all profiles
+        if profiles:
+            bundle.curvature_profiles[pid] = profiles[-1]
         bundle.segment_types[pid] = seg_types
 
     # 3. Symmetry axis
@@ -754,6 +778,9 @@ def serialize_features_to_asp(
             start = path.segments[0].control_points[0]
             end = path.segments[-1].control_points[3]
             self_gap = float(np.linalg.norm(end - start))
+            # Skip paths whose endpoints are already effectively closed
+            if self_gap < cfg.min_closure_gap:
+                continue
             # Confidence: closer endpoints → higher confidence
             max_gap = cfg.max_gap_distance
             conf = max(0.0, 1.0 - self_gap / max_gap)
@@ -770,9 +797,13 @@ def serialize_features_to_asp(
         dist_score = max(0.0, 1.0 - g.gap_dist / max_gap)
         angle_score = max(0.0, 1.0 - g.tangent_angle_deg / max_angle)
         conf = dist_score * angle_score
+        # Encode endpoint labels: start=0, end=1
+        ep_a_int = 0 if g.endpoint_a == "start" else 1
+        ep_b_int = 0 if g.endpoint_b == "start" else 1
         if conf >= 0.20:
             lines.append(
                 f"continues({g.path_id_a},{g.path_id_b},"
+                f"{ep_a_int},{ep_b_int},"
                 f"{_asp_int(g.gap_dist)},{_asp_int(g.tangent_angle_deg)},"
                 f"{_asp_int(conf)})."
             )

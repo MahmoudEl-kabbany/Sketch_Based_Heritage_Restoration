@@ -139,8 +139,9 @@ def restore(
     # ── Stage 0: Preprocessing (existing modules) ────────────────────────
     logger.info("[0/4] Preprocessing: extracting Bézier paths & EFD ...")
 
+    adjacency: Dict[int, set] = {}
     if cfg.use_skeleton:
-        paths = fit_from_image_skeleton(image_path, max_error=cfg.max_bezier_error)
+        paths, adjacency = fit_from_image_skeleton(image_path, max_error=cfg.max_bezier_error)
     else:
         paths = fit_from_image(
             image_path,
@@ -162,7 +163,9 @@ def restore(
 
     # ── Stage 1: Feature Bridge (R-1) ────────────────────────────────────
     logger.info("[1/4] Feature extraction ...")
-    features = extract_all_features(paths, efd_data, config=cfg.feature_bridge)
+    features = extract_all_features(
+        paths, efd_data, config=cfg.feature_bridge, adjacency=adjacency
+    )
     logger.info("  -> %d gaps, symmetry=%s",
                 len(features.gaps), features.symmetry_axis is not None)
 
@@ -276,12 +279,12 @@ def main() -> None:
         description="Sketch-Based Heritage Restoration Pipeline"
     )
     # Default image allows running `python pipeline.py` without arguments
-    default_img = os.path.join(_PROJECT_ROOT, "test_images", "restoration_test.png")
+    default_img = os.path.join(_PROJECT_ROOT, "test_images", "damaged_bolt.png")
     parser.add_argument("--image", default=default_img, help="Input sketch image path")
     parser.add_argument("--no-skeleton", action="store_false", dest="skeleton", help="Disable skeleton fitting")
     parser.add_argument("--vocab", default="", help="Shape vocabulary directory")
     parser.add_argument("--output", default="restoration_output", help="Output directory")
-    parser.add_argument("--efd-order", type=int, default=10, help="EFD harmonic order")
+    parser.add_argument("--efd-order", type=int, default=40, help="EFD harmonic order")
     parser.set_defaults(skeleton=True)
     args = parser.parse_args()
 

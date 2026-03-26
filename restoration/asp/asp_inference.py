@@ -285,7 +285,12 @@ class ASPInferenceEngine:
             elif name == "extend_curve" and len(raw_args) >= 2:
                 arguments["path_a"] = _safe_int(raw_args[0])
                 arguments["path_b"] = _safe_int(raw_args[1])
-                if len(raw_args) >= 3:
+                # New arity: extend_curve(A, B, EA, EB, Conf)
+                if len(raw_args) >= 5:
+                    arguments["endpoint_a"] = "start" if _safe_int(raw_args[2]) == 0 else "end"
+                    arguments["endpoint_b"] = "start" if _safe_int(raw_args[3]) == 0 else "end"
+                    confidence = _safe_int(raw_args[4]) / 100.0
+                elif len(raw_args) >= 3:
                     confidence = _safe_int(raw_args[2]) / 100.0
             elif name == "mirror_element" and len(raw_args) >= 2:
                 arguments["element_id"] = _safe_int(raw_args[0])

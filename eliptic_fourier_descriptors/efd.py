@@ -204,14 +204,13 @@ def _extract_raster_contours(
 # Shared EFD processing pipeline
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _process_contours(significant, total_count, efd_orders, colors):
+def _process_contours(significant, total_count, order, colors):
     """
     Run the shared EFD pipeline on a list of (index, contour_Nx2) tuples.
 
     Returns:
         efd_results: list of per-contour result dicts
     """
-    best_order = efd_orders[-1]
     efd_results = []
 
     for idx, (i, cnt) in enumerate(significant):
@@ -219,12 +218,16 @@ def _process_contours(significant, total_count, efd_orders, colors):
         if coords.ndim != 2 or len(coords) < 5:
             continue
 
+        # Translation invariance: subtract centroid
+        centroid = coords.mean(axis=0)
+        centered_coords = coords - centroid
+
         raw_coeffs = pyefd.elliptic_fourier_descriptors(
-            coords, order=best_order, normalize=False
+            centered_coords, order=order, normalize=False
         )
         norm_coeffs = normalize_efd(raw_coeffs)
         a0, c0 = pyefd.calculate_dc_coefficients(coords)
-        features = compute_efd_features(cnt, order=best_order)
+        features = compute_efd_features(cnt, order=order)
 
         efd_results.append({
             "coeffs": raw_coeffs,
@@ -238,18 +241,17 @@ def _process_contours(significant, total_count, efd_orders, colors):
     # Print structured summary
     print_efd_summary(significant, total_count, efd_results)
 
-    # EFD reconstruction at multiple harmonic orders
-    for order in efd_orders:
-        print(f"\n{'-' * 60}")
-        print(f"  EFD Reconstruction  —  order = {order}")
-        print(f"{'-' * 60}")
+    # EFD reconstruction
+    print(f"\n{'-' * 60}")
+    print(f"  EFD Reconstruction  —  order = {order}")
+    print(f"{'-' * 60}")
 
-        for idx, (i, cnt) in enumerate(significant):
-            recon, coeffs = reconstruct_contour_efd(cnt, order=order)
-            if recon is None:
-                continue
-            print(f"    Contour {i:>2d} -> {len(recon)} pts reconstructed "
-                  f"({coeffs.shape[0]} harmonics × {coeffs.shape[1]} coeffs)")
+    for idx, (i, cnt) in enumerate(significant):
+        recon, coeffs = reconstruct_contour_efd(cnt, order=order)
+        if recon is None:
+            continue
+        print(f"    Contour {i:>2d} -> {len(recon)} pts reconstructed "
+              f"({coeffs.shape[0]} harmonics × {coeffs.shape[1]} coeffs)")
 
     return efd_results
 
@@ -260,7 +262,7 @@ def _process_contours(significant, total_count, efd_orders, colors):
 
 def process_image(
     image_path,
-    efd_orders=(5, 10, 20, 40),
+    order=10,
     min_contour_area=100,
     use_skeleton=True,
     contour_retrieval="tree",
@@ -279,7 +281,7 @@ def process_image(
 
     _process_raster(
         image_path,
-        efd_orders,
+        order,
         min_contour_area,
         use_skeleton,
         contour_retrieval,
@@ -316,7 +318,7 @@ def extract_efd_from_image(
 
     cmap = plt.cm.tab10(np.linspace(0, 1, max(len(significant), 1)))
     colors = [cmap[i % len(cmap)] for i in range(len(significant))]
-    efd_results = _process_contours(significant, total_count, (order,), colors)
+    efd_results = _process_contours(significant, total_count, order, colors)
     return {
         "significant": significant,
         "total_count": total_count,
@@ -340,7 +342,7 @@ def visualize_efd(
     """
     process_image(
         image_path,
-        efd_orders=(order,),
+        order=order,
         min_contour_area=min_contour_area,
         use_skeleton=use_skeleton,
         contour_retrieval=contour_retrieval,
@@ -357,7 +359,7 @@ def visualize_efd(
 
 def _process_raster(
     image_path,
-    efd_orders,
+    order,
     min_contour_area,
     use_skeleton=True,
     contour_retrieval="tree",
@@ -409,23 +411,20 @@ def _process_raster(
 
     # Run shared EFD pipeline
     efd_results = _process_contours(
-        significant, len(contours), efd_orders, colors
+        significant, len(contours), order, colors
     )
 
     # OpenCV-based contour-only EFD reconstruction images
-    best_order = efd_orders[-1]
     best_canvas_efd = np.zeros((binary.shape[0], binary.shape[1], 3), dtype=np.uint8)
-    for order in efd_orders:
-        canvas_efd = np.zeros((binary.shape[0], binary.shape[1], 3), dtype=np.uint8)
-        for idx, (i, cnt) in enumerate(significant):
-            recon, coeffs = reconstruct_contour_efd(cnt, order=order)
-            if recon is None:
-                continue
-            recon_pts = recon.astype(np.int32).reshape((-1, 1, 2))
-            cv2.drawContours(canvas_efd, [recon_pts], -1, colors_bgr[idx], 2)
-        cv2.imwrite(os.path.join(OUTPUT_DIR, f"efd_order_{order}.png"), canvas_efd)
-        if order == best_order:
-            best_canvas_efd = canvas_efd.copy()
+    canvas_efd = np.zeros((binary.shape[0], binary.shape[1], 3), dtype=np.uint8)
+    for idx, (i, cnt) in enumerate(significant):
+        recon, coeffs = reconstruct_contour_efd(cnt, order=order)
+        if recon is None:
+            continue
+        recon_pts = recon.astype(np.int32).reshape((-1, 1, 2))
+        cv2.drawContours(canvas_efd, [recon_pts], -1, colors_bgr[idx], 2)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, f"efd_order_{order}.png"), canvas_efd)
+    best_canvas_efd = canvas_efd.copy()
 
     cv2.imwrite(
         os.path.join(OUTPUT_DIR, "efd_reconstructed_contours_only.png"),
@@ -436,7 +435,7 @@ def _process_raster(
     cmp_left = canvas_orig.copy()
     cmp_right = np.zeros((binary.shape[0], binary.shape[1], 3), dtype=np.uint8)
     for idx, (i, cnt) in enumerate(significant):
-        recon, _ = reconstruct_contour_efd(cnt, order=best_order)
+        recon, _ = reconstruct_contour_efd(cnt, order=order)
         if recon is not None:
             recon_pts = recon.astype(np.int32).reshape((-1, 1, 2))
             cv2.drawContours(cmp_right, [recon_pts], -1, colors_bgr[idx], 2)

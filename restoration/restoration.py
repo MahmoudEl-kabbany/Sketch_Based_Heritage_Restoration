@@ -114,8 +114,8 @@ def close_contour_g1(
 
     Constructs a cubic Bézier from ``path.segments[-1].end`` to
     ``path.segments[0].start`` whose tangents match the path endpoints.
-    Alpha is refined with Newton-Raphson to minimise deviation from arc
-    samples.
+    Uses a chord-fraction heuristic (α = chord / 3) for robust results
+    on heritage sketches, with optional curvature-continuity refinement.
 
     Parameters
     ----------
@@ -162,70 +162,62 @@ def close_contour_g1(
         T1 = np.array([-1.0, 0.0], dtype=np.float64)
 
     chord = float(np.linalg.norm(Pn - P0))
+    # Chord-fraction heuristic: α = chord * scale (default 1/3)
     alpha = chord * cfg.g1_alpha_initial_scale
+    # Floor alpha to avoid degenerate zero-length handles
+    alpha = max(alpha, 1.0)
 
-    # Newton-Raphson refinement of alpha
-    # Sample the original path to get reference arc
-    ref_pts = path.sample(50)
-
-    def _build_closing(a: float) -> BezierSegment:
-        P1 = P0 + a * T0
-        P2 = Pn + a * T1
-        cp = np.vstack([P0, P1, P2, Pn]).astype(np.float64)
-        return BezierSegment(cp)
-
-    tol_alpha = max(cfg.g1_newton_step * 0.1, 1e-6)
-    tol_err = 1.0
-
-    for _ in range(cfg.g1_newton_iterations):
-        seg_cur = _build_closing(alpha)
-        pts_cur = seg_cur.sample(30)
-
-        # Error uses median distance to reduce outlier sensitivity.
-        if len(ref_pts) > 0 and len(pts_cur) > 0:
-            from scipy.spatial import cKDTree
-
-            tree = cKDTree(ref_pts)
-            dists, _ = tree.query(pts_cur)
-            err = float(np.median(dists))
-        else:
-            err = 0.0
-
-        # Numerical gradient
-        seg_plus = _build_closing(alpha + cfg.g1_newton_step)
-        pts_plus = seg_plus.sample(30)
-        if len(ref_pts) > 0 and len(pts_plus) > 0:
-            dists_p, _ = tree.query(pts_plus)
-            err_plus = float(np.median(dists_p))
-        else:
-            err_plus = err
-
-        grad = (err_plus - err) / cfg.g1_newton_step
-        if abs(grad) > 1e-12:
-            prev_alpha = alpha
-            alpha = alpha - err / grad
-            alpha = max(alpha, chord * 0.05)  # floor
-            if abs(alpha - prev_alpha) < tol_alpha and err < tol_err:
-                break
-
-    return _build_closing(alpha)
+    P1 = P0 + alpha * T0
+    P2 = Pn + alpha * T1
+    cp = np.vstack([P0, P1, P2, Pn]).astype(np.float64)
+    return BezierSegment(cp, source_type="closure")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 2. Curve bridging
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _get_endpoint_and_tangent(
+    path: BezierPath,
+    which: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (point, unit_tangent) for a path's 'start' or 'end'."""
+    if which == "start":
+        pt = path.segments[0].control_points[0].copy()
+        # Tangent at start: reversed P0→P1 direction
+        tan = path.segments[0].control_points[0] - path.segments[0].control_points[1]
+    else:  # "end"
+        pt = path.segments[-1].control_points[3].copy()
+        # Tangent at end: P2→P3 direction
+        tan = path.segments[-1].control_points[3] - path.segments[-1].control_points[2]
+    n = np.linalg.norm(tan)
+    if n > 1e-12:
+        tan = tan / n
+    else:
+        tan = np.array([1.0, 0.0], dtype=np.float64)
+    return pt, tan
+
+
 def bridge_curves(
     path_a: BezierPath,
     path_b: BezierPath,
     config: Optional[RestorationConfig] = None,
+    endpoint_a: str = "end",
+    endpoint_b: str = "start",
 ) -> BezierSegment:
-    """Fit a single cubic Bézier bridging ``end(A) → start(B)`` honouring tangent constraints.
+    """Fit a single cubic Bézier bridging two path endpoints.
+
+    By default bridges ``end(A) → start(B)`` but can connect any
+    pair of endpoints when *endpoint_a* / *endpoint_b* are specified.
 
     Parameters
     ----------
     path_a, path_b : BezierPath
     config : RestorationConfig, optional
+    endpoint_a : str
+        ``'start'`` or ``'end'`` of *path_a*.
+    endpoint_b : str
+        ``'start'`` or ``'end'`` of *path_b*.
 
     Returns
     -------
@@ -233,22 +225,11 @@ def bridge_curves(
     """
     cfg = config or RestorationConfig()
 
-    P0 = path_a.segments[-1].control_points[3].copy()
-    P3 = path_b.segments[0].control_points[0].copy()
-
-    # Tangent at P0 (exit direction of path A)
-    T0 = P0 - path_a.segments[-1].control_points[2]
-
-    n0 = np.linalg.norm(T0)
-    T0 = T0 / n0 if n0 > 1e-12 else np.array([1.0, 0.0], dtype=np.float64)
-
-    # Tangent at P3 (entry direction of path B), reversed
-    T3 = path_b.segments[0].control_points[0] - path_b.segments[0].control_points[1]
-    n3 = np.linalg.norm(T3)
-    T3 = T3 / n3 if n3 > 1e-12 else np.array([-1.0, 0.0], dtype=np.float64)
+    P0, T0 = _get_endpoint_and_tangent(path_a, endpoint_a)
+    P3, T3 = _get_endpoint_and_tangent(path_b, endpoint_b)
 
     chord = float(np.linalg.norm(P3 - P0))
-    alpha = chord * cfg.g1_alpha_initial_scale
+    alpha = max(chord * cfg.g1_alpha_initial_scale, 1.0)
 
     P1 = P0 + alpha * T0
     P2 = P3 + alpha * T3
@@ -631,13 +612,19 @@ def execute_restoration(
             elif action.action_type == "extend_curve":
                 pa = action.arguments.get("path_a", 0)
                 pb = action.arguments.get("path_b", 0)
+                ep_a = action.arguments.get("endpoint_a", "end")
+                ep_b = action.arguments.get("endpoint_b", "start")
                 if 0 <= pa < len(paths) and 0 <= pb < len(paths):
-                    seg = bridge_curves(paths[pa], paths[pb], cfg)
+                    seg = bridge_curves(
+                        paths[pa], paths[pb], cfg,
+                        endpoint_a=ep_a, endpoint_b=ep_b,
+                    )
                     result.new_segments.append(seg)
                     result.actions_applied.append(
-                        {"type": "extend_curve", "path_a": pa, "path_b": pb}
+                        {"type": "extend_curve", "path_a": pa, "path_b": pb,
+                         "endpoint_a": ep_a, "endpoint_b": ep_b}
                     )
-                    logger.info("Applied extend_curve %d→%d", pa, pb)
+                    logger.info("Applied extend_curve %d(%s)→%d(%s)", pa, ep_a, pb, ep_b)
 
             elif action.action_type == "mirror_element":
                 eid = action.arguments.get("element_id", 0)

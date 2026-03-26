@@ -4,7 +4,8 @@
 %%
 %% Predicate conventions (integer-scaled × 100):
 %%   closure(ContourID, Confidence, Persistence)
-%%   continues(PathA, PathB, Gap, Angle, Confidence)
+%%   continues(PathA, PathB, EndpointA, EndpointB, Gap, Angle, Confidence)
+%%     EndpointA/B: 0 = start, 1 = end
 %%   symmetric(GroupID, Axis, Residual, Confidence)
 %%   proximity_group(GroupID, EpsG, Size)
 %%   member(ElementID, GroupID)
@@ -12,7 +13,7 @@
 %%   pragnanz(LoopID, Interpretation, Confidence)
 %%
 %% Derived action atoms:
-%%   complete_contour/1, extend_curve/2, mirror_element/2,
+%%   complete_contour/2, extend_curve/4, mirror_element/2,
 %%   replicate_motif/3, group_elements/2, flag_similar_missing/2,
 %%   simplify_interpretation/1
 %% ═══════════════════════════════════════════════════════════════════════════
@@ -24,11 +25,19 @@ complete_contour(C, Conf) :-
     not observed_closed(C).
 
 %% --- Good Continuation → extend a curve between two endpoints ---------------
-extend_curve(A, B, Conf) :-
-    continues(A, B, Gap, Angle, Conf),
+%% Now carries endpoint labels (0=start, 1=end) so bridge_curves uses correct ends
+extend_curve(A, B, EA, EB, Conf) :-
+    continues(A, B, EA, EB, Gap, Angle, Conf),
     Gap < 5000,
     Angle < 3000,
     Conf > 40.
+
+%% --- Mutual exclusion: an endpoint can only be used by one extend_curve ------
+:- extend_curve(A, _, EA, _, _), extend_curve(A, _, EA, _, _),
+   #count { B,EB : extend_curve(A, B, EA, EB, _) } > 1.
+
+:- extend_curve(_, B, _, EB, _), extend_curve(_, B, _, EB, _),
+   #count { A,EA : extend_curve(A, B, EA, EB, _) } > 1.
 
 %% --- Symmetry → mirror an element across axis --------------------------------
 mirror_element(E, Axis) :-
@@ -69,7 +78,7 @@ simplify_interpretation(L) :-
 
 #minimize {
     100 - Conf, complete_contour, C : complete_contour(C, Conf), closure(C, Conf, _);
-    100 - Conf, extend_curve, A, B  : extend_curve(A, B, Conf), continues(A, B, _, _, Conf);
+    100 - Conf, extend_curve, A, B, EA, EB : extend_curve(A, B, EA, EB, Conf), continues(A, B, EA, EB, _, _, Conf);
     100 - Conf, mirror, E, Axis     : mirror_element(E, Axis), symmetric(G, Axis, _, Conf), member(E, G);
     100 - C,    similar, A, B       : flag_similar_missing(A, B), similar_shape(A, B, _, C)
 }.
