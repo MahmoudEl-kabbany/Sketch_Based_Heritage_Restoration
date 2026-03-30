@@ -1,0 +1,454 @@
+[
+  {
+    "type": "efd_completion_efd",
+    "confidence": 0.269,
+    "confidence_label": "LOW",
+    "gestalt": [
+      "closure",
+      "continuity"
+    ],
+    "scores": {
+      "efd_score": 0.269
+    },
+    "explanation": "Path 0 has a large gap. EFD reconstruction (20 harmonics) identified the gap region and extracted a smooth closing arc guided by the Gestalt closure principle.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_efd",
+    "confidence": 0.402,
+    "confidence_label": "LOW",
+    "gestalt": [
+      "closure",
+      "continuity"
+    ],
+    "scores": {
+      "efd_score": 0.402
+    },
+    "explanation": "Path 1 has a large gap. EFD reconstruction (20 harmonics) identified the gap region and extracted a smooth closing arc guided by the Gestalt closure principle.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_symmetry",
+    "confidence": 1.0,
+    "confidence_label": "HIGH",
+    "gestalt": [
+      "symmetry",
+      "continuity"
+    ],
+    "scores": {
+      "symmetry_score": 1.0
+    },
+    "explanation": "Path 3 has a large gap. Bilateral symmetry (score=100%) was used to reflect the surviving arc across its principal axis, inferring the missing segment.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_efd",
+    "confidence": 0.411,
+    "confidence_label": "LOW",
+    "gestalt": [
+      "closure",
+      "continuity"
+    ],
+    "scores": {
+      "efd_score": 0.411
+    },
+    "explanation": "Path 4 has a large gap. EFD reconstruction (20 harmonics) identified the gap region and extracted a smooth closing arc guided by the Gestalt closure principle.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_symmetry",
+    "confidence": 1.0,
+    "confidence_label": "HIGH",
+    "gestalt": [
+      "symmetry",
+      "continuity"
+    ],
+    "scores": {
+      "symmetry_score": 1.0
+    },
+    "explanation": "Path 7 has a large gap. Bilateral symmetry (score=100%) was used to reflect the surviving arc across its principal axis, inferring the missing segment.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_efd",
+    "confidence": 0.35,
+    "confidence_label": "LOW",
+    "gestalt": [
+      "closure",
+      "continuity"
+    ],
+    "scores": {
+      "efd_score": 0.35
+    },
+    "explanation": "Path 9 has a large gap. EFD reconstruction (20 harmonics) identified the gap region and extracted a smooth closing arc guided by the Gestalt closure principle.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_symmetry",
+    "confidence": 0.98,
+    "confidence_label": "HIGH",
+    "gestalt": [
+      "symmetry",
+      "continuity"
+    ],
+    "scores": {
+      "symmetry_score": 0.98
+    },
+    "explanation": "Path 10 has a large gap. Bilateral symmetry (score=98%) was used to reflect the surviving arc across its principal axis, inferring the missing segment.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_symmetry",
+    "confidence": 1.0,
+    "confidence_label": "HIGH",
+    "gestalt": [
+      "symmetry",
+      "continuity"
+    ],
+    "scores": {
+      "symmetry_score": 1.0
+    },
+    "explanation": "Path 12 has a large gap. Bilateral symmetry (score=100%) was used to reflect the surviving arc across its principal axis, inferring the missing segment.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_symmetry",
+    "confidence": 1.0,
+    "confidence_label": "HIGH",
+    "gestalt": [
+      "symmetry",
+      "continuity"
+    ],
+    "scores": {
+      "symmetry_score": 1.0
+    },
+    "explanation": "Path 13 has a large gap. Bilateral symmetry (score=100%) was used to reflect the surviving arc across its principal axis, inferring the missing segment.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_symmetry",
+    "confidence": 1.0,
+    "confidence_label": "HIGH",
+    "gestalt": [
+      "symmetry",
+      "continuity"
+    ],
+    "scores": {
+      "symmetry_score": 1.0
+    },
+    "explanation": "Path 17 has a large gap. Bilateral symmetry (score=100%) was used to reflect the surviving arc across its principal axis, inferring the missing segment.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_symmetry",
+    "confidence": 1.0,
+    "confidence_label": "HIGH",
+    "gestalt": [
+      "symmetry",
+      "continuity"
+    ],
+    "scores": {
+      "symmetry_score": 1.0
+    },
+    "explanation": "Path 19 has a large gap. Bilateral symmetry (score=100%) was used to reflect the surviving arc across its principal axis, inferring the missing segment.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_symmetry",
+    "confidence": 1.0,
+    "confidence_label": "HIGH",
+    "gestalt": [
+      "symmetry",
+      "continuity"
+    ],
+    "scores": {
+      "symmetry_score": 1.0
+    },
+    "explanation": "Path 21 has a large gap. Bilateral symmetry (score=100%) was used to reflect the surviving arc across its principal axis, inferring the missing segment.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_symmetry",
+    "confidence": 1.0,
+    "confidence_label": "HIGH",
+    "gestalt": [
+      "symmetry",
+      "continuity"
+    ],
+    "scores": {
+      "symmetry_score": 1.0
+    },
+    "explanation": "Path 23 has a large gap. Bilateral symmetry (score=100%) was used to reflect the surviving arc across its principal axis, inferring the missing segment.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_symmetry",
+    "confidence": 1.0,
+    "confidence_label": "HIGH",
+    "gestalt": [
+      "symmetry",
+      "continuity"
+    ],
+    "scores": {
+      "symmetry_score": 1.0
+    },
+    "explanation": "Path 25 has a large gap. Bilateral symmetry (score=100%) was used to reflect the surviving arc across its principal axis, inferring the missing segment.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_symmetry",
+    "confidence": 1.0,
+    "confidence_label": "HIGH",
+    "gestalt": [
+      "symmetry",
+      "continuity"
+    ],
+    "scores": {
+      "symmetry_score": 1.0
+    },
+    "explanation": "Path 27 has a large gap. Bilateral symmetry (score=100%) was used to reflect the surviving arc across its principal axis, inferring the missing segment.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_symmetry",
+    "confidence": 1.0,
+    "confidence_label": "HIGH",
+    "gestalt": [
+      "symmetry",
+      "continuity"
+    ],
+    "scores": {
+      "symmetry_score": 1.0
+    },
+    "explanation": "Path 29 has a large gap. Bilateral symmetry (score=100%) was used to reflect the surviving arc across its principal axis, inferring the missing segment.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_symmetry",
+    "confidence": 0.98,
+    "confidence_label": "HIGH",
+    "gestalt": [
+      "symmetry",
+      "continuity"
+    ],
+    "scores": {
+      "symmetry_score": 0.98
+    },
+    "explanation": "Path 30 has a large gap. Bilateral symmetry (score=98%) was used to reflect the surviving arc across its principal axis, inferring the missing segment.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_symmetry",
+    "confidence": 1.0,
+    "confidence_label": "HIGH",
+    "gestalt": [
+      "symmetry",
+      "continuity"
+    ],
+    "scores": {
+      "symmetry_score": 1.0
+    },
+    "explanation": "Path 31 has a large gap. Bilateral symmetry (score=100%) was used to reflect the surviving arc across its principal axis, inferring the missing segment.",
+    "alternatives": []
+  },
+  {
+    "type": "efd_completion_symmetry",
+    "confidence": 1.0,
+    "confidence_label": "HIGH",
+    "gestalt": [
+      "symmetry",
+      "continuity"
+    ],
+    "scores": {
+      "symmetry_score": 1.0
+    },
+    "explanation": "Path 32 has a large gap. Bilateral symmetry (score=100%) was used to reflect the surviving arc across its principal axis, inferring the missing segment.",
+    "alternatives": []
+  },
+  {
+    "type": "bezier_bridge",
+    "confidence": 0.624,
+    "confidence_label": "MEDIUM",
+    "gestalt": [
+      "continuity",
+      "proximity",
+      "similarity"
+    ],
+    "scores": {
+      "continuity": 1.926,
+      "proximity": 1.411,
+      "closure": 0.0,
+      "symmetry": 0.0,
+      "similarity": 0.719
+    },
+    "explanation": "G\u00b9 bridge: path 29(end) \u2192 path 31(start), gap=46.8px. Outward tangents are 10\u00b0 apart (collinear threshold=35.0\u00b0). Gestalt: continuity, proximity, similarity. Scores: cont=1.93, prox=1.41, clos=0.00.",
+    "alternatives": [
+      {
+        "partner_path": 30,
+        "score": 3.5
+      },
+      {
+        "partner_path": 32,
+        "score": 2.378
+      },
+      {
+        "partner_path": 10,
+        "score": 2.279
+      }
+    ]
+  },
+  {
+    "type": "bezier_bridge",
+    "confidence": 0.621,
+    "confidence_label": "MEDIUM",
+    "gestalt": [
+      "continuity",
+      "proximity",
+      "similarity"
+    ],
+    "scores": {
+      "continuity": 1.909,
+      "proximity": 1.39,
+      "closure": 0.0,
+      "symmetry": 0.0,
+      "similarity": 0.738
+    },
+    "explanation": "G\u00b9 bridge: path 25(end) \u2192 path 30(start), gap=58.7px. Outward tangents are 0\u00b0 apart (collinear threshold=35.0\u00b0). Gestalt: continuity, proximity, similarity. Scores: cont=1.91, prox=1.39, clos=0.00.",
+    "alternatives": [
+      {
+        "partner_path": 29,
+        "score": 3.5
+      },
+      {
+        "partner_path": 10,
+        "score": 3.058
+      },
+      {
+        "partner_path": 32,
+        "score": 2.615
+      }
+    ]
+  },
+  {
+    "type": "bezier_bridge",
+    "confidence": 0.555,
+    "confidence_label": "MEDIUM",
+    "gestalt": [
+      "continuity",
+      "proximity",
+      "similarity"
+    ],
+    "scores": {
+      "continuity": 1.933,
+      "proximity": 1.321,
+      "closure": 0.0,
+      "symmetry": 0.0,
+      "similarity": 0.356
+    },
+    "explanation": "G\u00b9 bridge: path 9(start) \u2192 path 10(start), gap=97.5px. Outward tangents are 23\u00b0 apart (collinear threshold=35.0\u00b0). Gestalt: continuity, proximity, similarity. Scores: cont=1.93, prox=1.32, clos=0.00.",
+    "alternatives": [
+      {
+        "partner_path": 10,
+        "score": 3.058
+      },
+      {
+        "partner_path": 10,
+        "score": 2.279
+      },
+      {
+        "partner_path": 10,
+        "score": 2.111
+      }
+    ]
+  },
+  {
+    "type": "bezier_bridge",
+    "confidence": 0.527,
+    "confidence_label": "MEDIUM",
+    "gestalt": [
+      "continuity",
+      "proximity"
+    ],
+    "scores": {
+      "continuity": 1.981,
+      "proximity": 1.444,
+      "closure": 0.0,
+      "symmetry": 0.0,
+      "similarity": 0.0
+    },
+    "explanation": "G\u00b9 bridge: path 0(end) \u2192 path 1(end), gap=29.3px. Outward tangents are 0\u00b0 apart (collinear threshold=35.0\u00b0). Gestalt: continuity, proximity. Scores: cont=1.98, prox=1.44, clos=0.00.",
+    "alternatives": [
+      {
+        "partner_path": 1,
+        "score": 2.919
+      }
+    ]
+  },
+  {
+    "type": "bezier_bridge",
+    "confidence": 0.307,
+    "confidence_label": "LOW",
+    "gestalt": [
+      "continuity",
+      "proximity",
+      "similarity"
+    ],
+    "scores": {
+      "continuity": 0.911,
+      "proximity": 0.721,
+      "closure": 0.0,
+      "symmetry": 0.0,
+      "similarity": 0.363
+    },
+    "explanation": "G\u00b9 bridge: path 0(start) \u2192 path 6(start), gap=562.8px. Outward tangents are 6\u00b0 apart (collinear threshold=35.0\u00b0). Gestalt: continuity, proximity, similarity. Scores: cont=0.91, prox=0.72, clos=0.00.",
+    "alternatives": []
+  },
+  {
+    "type": "bezier_bridge",
+    "confidence": 0.24,
+    "confidence_label": "LOW",
+    "gestalt": [
+      "continuity",
+      "proximity",
+      "similarity"
+    ],
+    "scores": {
+      "continuity": 0.725,
+      "proximity": 0.556,
+      "closure": 0.0,
+      "symmetry": 0.0,
+      "similarity": 0.276
+    },
+    "explanation": "G\u00b9 bridge: path 3(end) \u2192 path 5(start), gap=761.6px. Outward tangents are 17\u00b0 apart (collinear threshold=35.0\u00b0). Gestalt: continuity, proximity, similarity. Scores: cont=0.73, prox=0.56, clos=0.00.",
+    "alternatives": [
+      {
+        "partner_path": 9,
+        "score": 1.481
+      }
+    ]
+  },
+  {
+    "type": "bezier_bridge",
+    "confidence": 0.171,
+    "confidence_label": "LOW",
+    "gestalt": [
+      "continuity",
+      "proximity",
+      "similarity"
+    ],
+    "scores": {
+      "continuity": 0.222,
+      "proximity": 0.726,
+      "closure": 0.0,
+      "symmetry": 0.0,
+      "similarity": 0.161
+    },
+    "explanation": "G\u00b9 bridge: path 1(start) \u2192 path 6(end), gap=557.2px. Outward tangents are 24\u00b0 apart (collinear threshold=35.0\u00b0). Gestalt: continuity, proximity, similarity. Scores: cont=0.22, prox=0.73, clos=0.00.",
+    "alternatives": [
+      {
+        "partner_path": 1,
+        "score": 2.919
+      }
+    ]
+  }
+]
