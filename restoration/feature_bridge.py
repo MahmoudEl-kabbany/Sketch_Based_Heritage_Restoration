@@ -235,8 +235,26 @@ def extract_endpoint_gaps(
                 # Skip already-connected endpoints and out-of-range gaps
                 if d < cfg.min_gap_px or d > cfg.max_gap_distance:
                     continue
-                dot = float(np.clip(np.dot(t_a, t_b), -1.0, 1.0))
-                angle_deg = float(np.degrees(np.arccos(abs(dot))))
+                
+                # Refined Good Continuation: check alignment with chord
+                # chord_vec points from A to B
+                chord_vec = _unit_vector(pt_b - pt_a)
+                # t_a (outward from A) should point towards B (align with chord_vec)
+                # t_b (outward from B) should point towards A (align with -chord_vec)
+                align_a = float(np.dot(t_a, chord_vec))
+                align_b = float(np.dot(t_b, -chord_vec))
+                
+                # Overall alignment score: both must point towards each other
+                # We use the minimum alignment to be conservative
+                combined_align = min(align_a, align_b)
+                
+                # Convert alignment [1.0 (perfect) to -1.0 (opposite)] to an error angle
+                # We only care about positive alignment (pointing towards)
+                if combined_align < 0:
+                    angle_deg = 180.0
+                else:
+                    angle_deg = float(np.degrees(np.arccos(np.clip(combined_align, 0.0, 1.0))))
+
                 records.append(
                     GapRecord(
                         path_id_a=id_a,
@@ -792,11 +810,15 @@ def serialize_features_to_asp(
 
     # ── Good continuation: from endpoint gaps ────────────────────────────
     for g in bundle.gaps:
-        max_gap = cfg.max_gap_distance * 0.4
-        max_angle = 30.0
-        dist_score = max(0.0, 1.0 - g.gap_dist / max_gap)
+        # Use full dynamic range for distance scoring
+        max_dist = cfg.max_gap_distance
+        max_angle = 45.0  # Slightly more relaxed angle tolerance for heritage sketches
+        
+        dist_score = max(0.0, 1.0 - g.gap_dist / max_dist)
         angle_score = max(0.0, 1.0 - g.tangent_angle_deg / max_angle)
-        conf = dist_score * angle_score
+        
+        # Combined confidence: highly distance-weighted
+        conf = (dist_score ** 0.5) * angle_score 
         # Encode endpoint labels: start=0, end=1
         ep_a_int = 0 if g.endpoint_a == "start" else 1
         ep_b_int = 0 if g.endpoint_b == "start" else 1

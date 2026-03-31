@@ -28,6 +28,7 @@ complete_contour(C, Conf) :-
 %% Now carries endpoint labels (0=start, 1=end) so bridge_curves uses correct ends
 extend_curve(A, B, EA, EB, Conf) :-
     continues(A, B, EA, EB, Gap, Angle, Conf),
+    A != B,
     Gap < 5000,
     Angle < 3000,
     Conf > 40.

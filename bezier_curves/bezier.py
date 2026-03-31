@@ -538,6 +538,21 @@ def fit_from_image_skeleton(
     # Build graph from skeleton
     graph = sknw.build_sknw(skeleton)
 
+    # Prune spurs: remove degree-1 nodes and their short edges
+    # This prevents sharp corners from being split into separate paths due to skeleton artifacts
+    nodes_to_remove = []
+    for node in graph.nodes():
+        if graph.degree(node) == 1:
+            for neighbor in graph.neighbors(node):
+                edge_data = graph[node][neighbor]
+                pts = edge_data.get('pts', [])
+                if len(pts) < 10:  # Prune spurs shorter than 10px
+                    nodes_to_remove.append(node)
+    
+    for node in nodes_to_remove:
+        if node in graph:
+            graph.remove_node(node)
+
     # Track which skeleton node each edge connects so we can build adjacency
     edge_to_path_idx: Dict[int, List[int]] = {}  # skeleton node → [path indices]
 

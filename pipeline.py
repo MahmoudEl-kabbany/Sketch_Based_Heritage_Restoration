@@ -17,6 +17,7 @@ import argparse
 import logging
 import os
 import sys
+import cv2
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -139,6 +140,19 @@ def restore(
     # ── Stage 0: Preprocessing (existing modules) ────────────────────────
     logger.info("[0/4] Preprocessing: extracting Bézier paths & EFD ...")
 
+    # Load image first to get dimensions for adaptive thresholds
+    img = cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"Cannot read image: {image_path}")
+    h, w = img.shape[:2]
+    diagonal = np.sqrt(h**2 + w**2)
+    
+    # Adaptive gap threshold: 5% of diagonal by default
+    if cfg.feature_bridge.max_gap_distance == 500.0:  # If default
+        cfg.feature_bridge.max_gap_distance = float(diagonal * 0.05)
+        logger.info("  -> Adaptive max_gap_distance: %.1f px (5%% of diagonal)", 
+                    cfg.feature_bridge.max_gap_distance)
+
     adjacency: Dict[int, set] = {}
     if cfg.use_skeleton:
         paths, adjacency = fit_from_image_skeleton(image_path, max_error=cfg.max_bezier_error)
@@ -150,16 +164,15 @@ def restore(
         )
     logger.info("  -> %d Bézier paths extracted", len(paths))
 
-    # EFD extraction
-    efd_result = extract_efd_from_image(
-        image_path, order=cfg.efd_order, min_contour_area=cfg.min_contour_area, use_skeleton=cfg.use_skeleton
-    )
+    # Synchronized EFD extraction: compute EFDs for EVERY extracted path
     efd_data: Dict[int, np.ndarray] = {}
-    for idx, res in enumerate(efd_result.get("efd_results", [])):
-        feat = res.get("features")
-        if feat is not None:
-            efd_data[idx] = feat
-    logger.info("  -> %d EFD feature vectors", len(efd_data))
+    for idx, path in enumerate(paths):
+        pts = path.sample(100)  # Sample enough points for meaningful EFD
+        if len(pts) >= 5:
+            feat = compute_efd_features(pts, order=cfg.efd_order)
+            if feat is not None:
+                efd_data[idx] = feat
+    logger.info("  -> %d EFD feature vectors synchronized with paths", len(efd_data))
 
     # ── Stage 1: Feature Bridge (R-1) ────────────────────────────────────
     logger.info("[1/4] Feature extraction ...")
