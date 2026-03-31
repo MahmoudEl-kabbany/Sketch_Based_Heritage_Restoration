@@ -244,16 +244,13 @@ def extract_endpoint_gaps(
                 align_a = float(np.dot(t_a, chord_vec))
                 align_b = float(np.dot(t_b, -chord_vec))
                 
-                # Overall alignment score: both must point towards each other
-                # We use the minimum alignment to be conservative
-                combined_align = min(align_a, align_b)
-                
-                # Convert alignment [1.0 (perfect) to -1.0 (opposite)] to an error angle
-                # We only care about positive alignment (pointing towards)
-                if combined_align < 0:
-                    angle_deg = 180.0
-                else:
+                # Robust alignment score: the sum must be positive and sufficiently high. 
+                # Allows one end to be slightly off (e.g. -0.1) if the other is strong.
+                combined_align = (align_a + align_b) / 2.0
+                if combined_align > 0.2 and min(align_a, align_b) > -0.2:
                     angle_deg = float(np.degrees(np.arccos(np.clip(combined_align, 0.0, 1.0))))
+                else:
+                    angle_deg = 180.0
 
                 records.append(
                     GapRecord(
@@ -799,9 +796,29 @@ def serialize_features_to_asp(
             # Skip paths whose endpoints are already effectively closed
             if self_gap < cfg.min_closure_gap:
                 continue
-            # Confidence: closer endpoints → higher confidence
-            max_gap = cfg.max_gap_distance
-            conf = max(0.0, 1.0 - self_gap / max_gap)
+            # Tangent alignment check for closure
+            # tan_start (outward) should point towards 'end'
+            tan_start = _unit_vector(path.segments[0].control_points[0] - path.segments[0].control_points[1])
+            # tan_end (outward) should point towards 'start'
+            tan_end = _unit_vector(path.segments[-1].control_points[3] - path.segments[-1].control_points[2])
+            
+            chord_vec = _unit_vector(end - start)
+            align_start = float(np.dot(tan_start, chord_vec))
+            align_end = float(np.dot(tan_end, -chord_vec))
+            
+            # Robust alignment for closure: allow one side to be slightly jittery
+            align_score = (align_start + align_end) / 2.0
+            if align_score < 0.2 or min(align_start, align_end) < -0.2:
+                align_score = 0.0
+            
+            # Distance-based score
+            dist_score = max(0.0, 1.0 - self_gap / cfg.max_gap_distance)
+            
+            # Direction-first score: prioritise alignment over distance
+            # align_score is 1.0 (perfect) to 0.0 (perpendicular/opposite)
+            # dist_score^0.2 weights alignment heavily even for long gaps
+            # Robust score: alignment dominance (dist^0.1)
+            conf = (dist_score ** 0.1) * (align_score ** 1.2)
             if conf >= 0.20:
                 persistence = _asp_int(self_gap)
                 lines.append(
@@ -812,13 +829,13 @@ def serialize_features_to_asp(
     for g in bundle.gaps:
         # Use full dynamic range for distance scoring
         max_dist = cfg.max_gap_distance
-        max_angle = 45.0  # Slightly more relaxed angle tolerance for heritage sketches
+        max_angle = 75.0  # Be more tolerant in Stage 1; let the ASP solver filter.
         
         dist_score = max(0.0, 1.0 - g.gap_dist / max_dist)
         angle_score = max(0.0, 1.0 - g.tangent_angle_deg / max_angle)
         
-        # Combined confidence: highly distance-weighted
-        conf = (dist_score ** 0.5) * angle_score 
+        # Robust scoring for continuous gaps
+        conf = (dist_score ** 0.1) * (angle_score ** 1.2)
         # Encode endpoint labels: start=0, end=1
         ep_a_int = 0 if g.endpoint_a == "start" else 1
         ep_b_int = 0 if g.endpoint_b == "start" else 1

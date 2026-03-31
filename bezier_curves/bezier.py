@@ -109,13 +109,14 @@ def _chord_length_parameterize(points: np.ndarray) -> np.ndarray:
     return cumlen / total
 
 
-def _estimate_tangent(points: np.ndarray, end: str, lookahead: int = 5) -> np.ndarray:
-    """Estimate a robust unit tangent at the start or end of a point sequence."""
+def _estimate_tangent(points: np.ndarray, end: str, lookahead: int = 3) -> np.ndarray:
+    """Estimate a robust unit tangent at the start or end of a point sequence.
+    Includes 'hook removal' to ignore pixel-level artifacts at stroke ends.
+    """
     if len(points) < 2:
         return np.array([1.0, 0.0])
 
     window = max(1, min(int(lookahead), len(points) - 1))
-
     if end == "start":
         local_points = points[: window + 1]
     else:
@@ -123,13 +124,29 @@ def _estimate_tangent(points: np.ndarray, end: str, lookahead: int = 5) -> np.nd
 
     vectors = np.diff(local_points, axis=0)
     if end != "start":
-        vectors = -vectors
+        vectors = -vectors # Outward
 
-    # Average local direction vectors to reduce pixel-level jaggedness.
-    tangent = np.mean(vectors, axis=0)
+    # Hook removal: if the terminal segment is > 90 deg from the window mean, ignore it
+    if len(vectors) >= 2:
+        terminal_vec = vectors[0] if end == "start" else vectors[-1]
+        other_vecs = vectors[1:] if end == "start" else vectors[:-1]
+        mean_other = np.mean(other_vecs, axis=0)
+        
+        n1, n2 = np.linalg.norm(terminal_vec), np.linalg.norm(mean_other)
+        if n1 > 1e-6 and n2 > 1e-6:
+            dot = np.dot(terminal_vec, mean_other) / (n1 * n2)
+            if dot < 0.0: # Sharp turn (> 90 deg)
+                # Use the mean of the rest instead
+                tangent = mean_other
+            else:
+                tangent = np.mean(vectors, axis=0)
+        else:
+            tangent = np.mean(vectors, axis=0)
+    else:
+        tangent = np.mean(vectors, axis=0)
+
     norm = np.linalg.norm(tangent)
     if norm < 1e-12:
-        # Fallback to first non-degenerate direction in the local window.
         for vec in vectors:
             vec_norm = np.linalg.norm(vec)
             if vec_norm >= 1e-12:

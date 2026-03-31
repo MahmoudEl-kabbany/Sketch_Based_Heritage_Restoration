@@ -5,7 +5,7 @@ from pipeline import restore, visualise_result, PipelineConfig
 
 logging.basicConfig(level=logging.INFO)
 
-image_path = os.path.join("test_images", "restoration_test_damaged_big.png")
+image_path = os.path.join("test_images", "restoration_test.png")
 output_dir = "restoration_output_test"
 
 if not os.path.exists(image_path):

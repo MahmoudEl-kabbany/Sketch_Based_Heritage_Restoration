@@ -21,7 +21,7 @@
 %% --- Closure → complete a contour that is not already observed closed ------
 complete_contour(C, Conf) :-
     closure(C, Conf, _),
-    Conf > 50,
+    Conf > 45,
     not observed_closed(C).
 
 %% --- Good Continuation → extend a curve between two endpoints ---------------
@@ -31,7 +31,7 @@ extend_curve(A, B, EA, EB, Conf) :-
     A != B,
     Gap < 5000,
     Angle < 3000,
-    Conf > 40.
+    Conf > 35.
 
 %% --- Mutual exclusion: an endpoint can only be used by one extend_curve ------
 :- extend_curve(A, _, EA, _, _), extend_curve(A, _, EA, _, _),
