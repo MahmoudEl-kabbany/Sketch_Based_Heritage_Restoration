@@ -3,6 +3,7 @@ contour_outputs/
 preprocessed/
 outputs/
 restoration_output/
+restoration_outputs/
 tests/
 
 # Test input images

@@ -1,741 +1,558 @@
 """
-Geometric Synthesis  (R-4)
-==========================
-Translates ASP restoration atoms into concrete BezierPath / EFD
-completions:  G1 contour closure, curve bridging, affine reflection,
-motif replication, and EFD coefficient blending with a shape vocabulary.
+R-4: Geometric Synthesis (Restoration)
+========================================
+Constructs the actual restoration geometry from ASP decisions.
+
+Key operations
+--------------
+* ``bridge_curves``       – Bézier bridge between two path endpoints (G1)
+* ``close_contour_g1``    – G1-continuous closure of an open path
+* ``efd_close_contour``   – EFD-based closure for single-gap contours
+* ``mirror_bezier_path``  – Affine reflection
+* ``replicate_motif``     – Translation-based replication
+* ``blend_efd_completion``– Weighted blend of EFD coefficient matrices
+* ``execute_restoration`` – Top-level dispatch from ranked hypotheses
 """
 
 from __future__ import annotations
 
-import glob
-import logging
-import os
+import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
-import matplotlib.pyplot as plt
 import numpy as np
 
-# ── project imports ──────────────────────────────────────────────────────
-import sys
-
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+import sys, os
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from bezier_curves.bezier import BezierPath, BezierSegment
-from eliptic_fourier_descriptors.efd import compute_efd_features, reconstruct_contour_efd
-
-logger = logging.getLogger(__name__)
-
-# ── optional FAISS -------------------------------------------------------
-try:
-    import faiss
-except ImportError:  # pragma: no cover
-    faiss = None
-    logger.info("faiss-cpu not installed; falling back to scipy KDTree for kNN")
+from restoration.asp.asp_inference import RankedHypothesis, RestorationAction
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Configuration
-# ═══════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class RestorationConfig:
-    """Tuneable parameters for the geometric-synthesis stage."""
-
-    # G1 closure
-    g1_alpha_initial_scale: float = 1.0 / 3.0
-    """Initial α = scale * |Pn − P0|."""
-    g1_newton_iterations: int = 10
-    """Number of Newton-Raphson iterations for α refinement."""
-    g1_newton_step: float = 0.01
-    """Finite-difference step for numerical Jacobian."""
-
-    # EFD blending
-    efd_order: int = 10
-    """Default EFD harmonic order."""
-
-    # Shape vocabulary
-    vocab_efd_order: int = 10
-    vocab_k: int = 3
-    """Number of nearest neighbours to retrieve."""
-
-    # Visualisation
-    vis_dpi: int = 150
-    vis_figsize: Tuple[int, int] = (14, 6)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Result data classes
-# ═══════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class VocabMatch:
-    """A matched template from the shape vocabulary."""
-
-    label: str
-    distance: float
-    coeffs: np.ndarray
-
+# ═══════════════════════════════════════════════════════════════════════
+# Shape vocabulary (for template matching)
+# ═══════════════════════════════════════════════════════════════════════
 
 @dataclass
 class ShapeVocab:
-    """Pre-computed shape vocabulary with FAISS / KDTree index."""
-
-    labels: List[str] = field(default_factory=list)
-    features: Optional[np.ndarray] = None  # (N, D)
-    coeffs_list: List[np.ndarray] = field(default_factory=list)
-    _index: Any = None  # faiss.IndexFlatL2 or scipy KDTree
+    """Library of known shapes for template-driven completion."""
+    entries: Dict[str, np.ndarray] = field(default_factory=dict)
 
 
-@dataclass
-class RestorationResult:
-    """Aggregated output of the synthesis stage."""
-
-    new_segments: List[BezierSegment] = field(default_factory=list)
-    new_paths: List[BezierPath] = field(default_factory=list)
-    blended_coeffs: List[np.ndarray] = field(default_factory=list)
-    actions_applied: List[Dict[str, Any]] = field(default_factory=list)
-    original_paths: List[BezierPath] = field(default_factory=list)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 1. G1-continuous contour closure
-# ═══════════════════════════════════════════════════════════════════════════
-
-def close_contour_g1(
-    path: BezierPath,
-    config: Optional[RestorationConfig] = None,
-) -> BezierSegment:
-    """Synthesise a G1-continuous closing segment for an open path.
-
-    Constructs a cubic Bézier from ``path.segments[-1].end`` to
-    ``path.segments[0].start`` whose tangents match the path endpoints.
-    Uses a chord-fraction heuristic (α = chord / 3) for robust results
-    on heritage sketches, with optional curvature-continuity refinement.
-
-    Parameters
-    ----------
-    path : BezierPath
-        An open path (``is_closed=False``).
-    config : RestorationConfig, optional
-
-    Returns
-    -------
-    BezierSegment
-        The closing segment.
-
-    Examples
-    --------
-    >>> cp = np.array([[0,0],[1,1],[2,1],[3,0]], dtype=np.float64)
-    >>> seg = BezierSegment(cp)
-    >>> p = BezierPath([seg], is_closed=False)
-    >>> closing = close_contour_g1(p)
-    >>> closing.control_points.shape
-    (4, 2)
-    """
-    cfg = config or RestorationConfig()
-
-    last_seg = path.segments[-1]
-    first_seg = path.segments[0]
-
-    P0 = last_seg.control_points[3].copy()  # start of closing segment
-    Pn = first_seg.control_points[0].copy()  # end of closing segment
-
-    # Tangent at P0: direction of last segment's P2→P3
-    T0 = P0 - last_seg.control_points[2]
-    norm_t0 = np.linalg.norm(T0)
-    if norm_t0 > 1e-12:
-        T0 = T0 / norm_t0
-    else:
-        T0 = np.array([1.0, 0.0], dtype=np.float64)
-
-    # Tangent at Pn: direction of first segment's P0→P1 (reversed)
-    T1 = first_seg.control_points[0] - first_seg.control_points[1]
-    norm_t1 = np.linalg.norm(T1)
-    if norm_t1 > 1e-12:
-        T1 = T1 / norm_t1
-    else:
-        T1 = np.array([-1.0, 0.0], dtype=np.float64)
-
-    chord = float(np.linalg.norm(Pn - P0))
-    # Chord-fraction heuristic: α = chord * scale (default 1/3)
-    alpha = chord * cfg.g1_alpha_initial_scale
-    # Floor alpha to avoid degenerate zero-length handles
-    alpha = max(alpha, 1.0)
-
-    P1 = P0 + alpha * T0
-    P2 = Pn + alpha * T1
-    cp = np.vstack([P0, P1, P2, Pn]).astype(np.float64)
-    return BezierSegment(cp, source_type="closure")
+def query_shape_vocabulary(
+    feature_vec: np.ndarray, vocab: ShapeVocab, top_k: int = 3,
+) -> List[Tuple[str, float]]:
+    """Find the closest shapes in the vocabulary."""
+    if not vocab.entries:
+        return []
+    results = []
+    for name, ref_vec in vocab.entries.items():
+        dist = float(np.linalg.norm(feature_vec - ref_vec))
+        results.append((name, dist))
+    results.sort(key=lambda x: x[1])
+    return results[:top_k]
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 2. Curve bridging
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Bridge curves (Bézier bridging for multi-gap shapes)
+# ═══════════════════════════════════════════════════════════════════════
 
 def _get_endpoint_and_tangent(
-    path: BezierPath,
-    which: str,
+    path: BezierPath, which: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Return (point, unit_tangent) for a path's 'start' or 'end'."""
+    """Return (point, inward_tangent) for an endpoint."""
     if which == "start":
-        pt = path.segments[0].control_points[0].copy()
-        # Tangent at start: reversed P0→P1 direction
-        tan = path.segments[0].control_points[0] - path.segments[0].control_points[1]
-    else:  # "end"
-        pt = path.segments[-1].control_points[3].copy()
-        # Tangent at end: P2→P3 direction
-        tan = path.segments[-1].control_points[3] - path.segments[-1].control_points[2]
-    n = np.linalg.norm(tan)
-    if n > 1e-12:
-        tan = tan / n
+        seg = path.segments[0]
+        pt = seg.control_points[0].copy()
+        handle = seg.control_points[1]
+        # Inward tangent: from endpoint toward the interior
+        tangent = handle - pt
     else:
-        tan = np.array([1.0, 0.0], dtype=np.float64)
-    return pt, tan
+        seg = path.segments[-1]
+        pt = seg.control_points[3].copy()
+        handle = seg.control_points[2]
+        tangent = handle - pt
+    norm = np.linalg.norm(tangent)
+    if norm < 1e-12:
+        tangent = np.array([1.0, 0.0])
+    else:
+        tangent = tangent / norm
+    return pt, tangent
 
 
 def bridge_curves(
     path_a: BezierPath,
     path_b: BezierPath,
-    config: Optional[RestorationConfig] = None,
     endpoint_a: str = "end",
     endpoint_b: str = "start",
 ) -> BezierSegment:
-    """Fit a single cubic Bézier bridging two path endpoints.
+    """Create a G1-continuous cubic Bézier bridge between two path endpoints.
 
-    By default bridges ``end(A) → start(B)`` but can connect any
-    pair of endpoints when *endpoint_a* / *endpoint_b* are specified.
+    The bridge handles are aligned with the existing endpoint tangents
+    so the join is smooth.  Handle length is proportional to the gap
+    distance (1/3 rule — the standard heuristic for Bézier fitting).
 
     Parameters
     ----------
     path_a, path_b : BezierPath
-    config : RestorationConfig, optional
+        The two paths to bridge.
     endpoint_a : str
-        ``'start'`` or ``'end'`` of *path_a*.
+        Which end of path_a to connect ("start" or "end").
     endpoint_b : str
-        ``'start'`` or ``'end'`` of *path_b*.
+        Which end of path_b to connect ("start" or "end").
 
     Returns
     -------
     BezierSegment
+        A cubic Bézier segment bridging the gap.
     """
-    cfg = config or RestorationConfig()
+    pt_a, tan_a = _get_endpoint_and_tangent(path_a, endpoint_a)
+    pt_b, tan_b = _get_endpoint_and_tangent(path_b, endpoint_b)
 
-    P0, T0 = _get_endpoint_and_tangent(path_a, endpoint_a)
-    P3, T3 = _get_endpoint_and_tangent(path_b, endpoint_b)
+    gap = np.linalg.norm(pt_b - pt_a)
+    handle_len = gap / 3.0  # Standard Bézier heuristic
 
-    chord = float(np.linalg.norm(P3 - P0))
-    alpha = max(chord * cfg.g1_alpha_initial_scale, 1.0)
+    # For "end" endpoint, the tangent points inward → we need outward
+    # direction for the bridge handle.  The bridge goes FROM pt_a TO pt_b,
+    # so handle at pt_a should continue the tangent direction of path_a,
+    # and handle at pt_b should continue the tangent direction of path_b.
 
-    P1 = P0 + alpha * T0
-    P2 = P3 + alpha * T3
-    cp = np.vstack([P0, P1, P2, P3]).astype(np.float64)
-    return BezierSegment(cp, source_type="bridge")
+    if endpoint_a == "end":
+        # Tangent is inward (toward path interior).
+        # Bridge handle should continue outward = opposite of inward tangent?
+        # No — G1 means the bridge should smoothly continue the curve.
+        # So the handle at pt_a is pt_a + (outward_extension) = pt_a - tan_a * len
+        # Wait: tan_a = handle - pt, so tan_a points from pt toward handle (inward).
+        # For the bridge, we want to continue in the direction the curve was going
+        # at the end, which is the direction from the handle TO the endpoint,
+        # i.e., -tan_a.  But the bridge CP1 should be on the "other side",
+        # continuing the motion.  Actually for G1 at pt_a:
+        #   last_seg.P2, last_seg.P3 = handle, pt_a
+        #   bridge.P0, bridge.P1 = pt_a, pt_a + alpha * (pt_a - handle)
+        # So bridge P1 = pt_a - alpha * tan_a  (where tan_a = handle - pt_a)
+        cp1 = pt_a - handle_len * tan_a
+    else:
+        # endpoint_a == "start": tangent = P1 - P0 (inward).
+        # Bridge goes FROM start, so handle continues backward:
+        # bridge P1 = pt_a - handle_len * tan_a
+        cp1 = pt_a - handle_len * tan_a
+
+    if endpoint_b == "start":
+        cp2 = pt_b - handle_len * tan_b
+    else:
+        cp2 = pt_b - handle_len * tan_b
+
+    control_points = np.array([pt_a, cp1, cp2, pt_b], dtype=np.float64)
+    return BezierSegment(control_points, source_type="bridge")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 3. Mirror (affine reflection)
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Close contour (G1-continuous)
+# ═══════════════════════════════════════════════════════════════════════
+
+def close_contour_g1(path: BezierPath) -> BezierSegment:
+    """Create a G1-continuous closing segment for an open path.
+
+    Connects path.end → path.start with a cubic Bézier whose handles
+    maintain tangent continuity at both joins.
+    """
+    return bridge_curves(path, path, endpoint_a="end", endpoint_b="start")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# EFD-based contour closure
+# ═══════════════════════════════════════════════════════════════════════
+
+def efd_close_contour(
+    contour_points: np.ndarray,
+    order: int = 20,
+    num_recon_points: int = 500,
+) -> Optional[np.ndarray]:
+    """Close a single-gap open contour using EFD reconstruction.
+
+    Steps
+    -----
+    1. Treat the open contour as if it were closed (append start to end).
+    2. Compute EFD coefficients on this "pseudo-closed" contour.
+    3. Reconstruct the full closed shape with high resolution.
+    4. Extract only the gap-filling arc (the part not covered by the
+       original contour).
+
+    Parameters
+    ----------
+    contour_points : np.ndarray
+        (N, 2) array of the existing contour points.
+    order : int
+        Number of EFD harmonics.
+    num_recon_points : int
+        Points in the reconstructed contour.
+
+    Returns
+    -------
+    np.ndarray or None
+        (M, 2) array of points forming the gap-filling arc, or None
+        if reconstruction fails.
+    """
+    try:
+        import pyefd
+    except ImportError:
+        return None
+
+    pts = np.squeeze(contour_points)
+    if pts.ndim != 2 or len(pts) < 5:
+        return None
+
+    # Close the contour by appending the start point
+    closed_pts = np.vstack([pts, pts[0:1]])
+
+    # Compute EFD coefficients
+    try:
+        coeffs = pyefd.elliptic_fourier_descriptors(
+            closed_pts, order=order, normalize=False
+        )
+        a0, c0 = pyefd.calculate_dc_coefficients(closed_pts)
+        reconstructed = pyefd.reconstruct_contour(
+            coeffs, locus=(a0, c0), num_points=num_recon_points
+        )
+    except Exception:
+        return None
+
+    if reconstructed is None or len(reconstructed) < 3:
+        return None
+
+    # Find the portions of the reconstruction that fill the gap.
+    # Strategy: find the reconstructed points nearest to the two
+    # endpoints of the original contour, then extract the arc between
+    # them that does NOT overlap the original contour.
+
+    start_pt = pts[0]
+    end_pt = pts[-1]
+
+    # Find nearest reconstructed point to each endpoint
+    dists_start = np.linalg.norm(reconstructed - start_pt, axis=1)
+    dists_end = np.linalg.norm(reconstructed - end_pt, axis=1)
+
+    idx_start = int(np.argmin(dists_start))
+    idx_end = int(np.argmin(dists_end))
+
+    if idx_start == idx_end:
+        return None
+
+    # Extract arc: from end_pt's nearest → start_pt's nearest
+    # (going the "short way" around — the gap side)
+    n = len(reconstructed)
+
+    # Two possible arcs
+    if idx_end < idx_start:
+        arc1 = reconstructed[idx_end:idx_start + 1]
+        arc2 = np.vstack([reconstructed[idx_start:], reconstructed[:idx_end + 1]])
+    else:
+        arc1 = reconstructed[idx_start:idx_end + 1]
+        arc2 = np.vstack([reconstructed[idx_end:], reconstructed[:idx_start + 1]])
+
+    # The gap-filling arc is the shorter one (it should be smaller than
+    # max_closure_gap_fraction of the total)
+    if len(arc1) <= len(arc2):
+        gap_arc = arc1
+    else:
+        gap_arc = arc2
+
+    # Ensure the arc goes from end_pt to start_pt
+    if np.linalg.norm(gap_arc[0] - end_pt) > np.linalg.norm(gap_arc[-1] - end_pt):
+        gap_arc = gap_arc[::-1]
+
+    return gap_arc
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Mirror / Replicate
+# ═══════════════════════════════════════════════════════════════════════
 
 def mirror_bezier_path(
-    path: BezierPath,
-    axis: str = "vertical",
-    origin: Optional[np.ndarray] = None,
+    path: BezierPath, axis: str = "vertical",
+    center: Optional[np.ndarray] = None,
 ) -> BezierPath:
-    """Reflect all control points across *axis* through *origin*.
+    """Reflect a Bézier path across a vertical or horizontal axis.
 
     Parameters
     ----------
     path : BezierPath
     axis : str
-        ``'vertical'`` (x-reflection), ``'horizontal'`` (y-reflection),
-        or a float angle in degrees.
-    origin : np.ndarray, optional
-        Reflection centre.  Defaults to the path centroid.
-
-    Returns
-    -------
-    BezierPath
-
-    Examples
-    --------
-    >>> cp = np.array([[0,0],[1,1],[2,1],[3,0]], dtype=np.float64)
-    >>> mirrored = mirror_bezier_path(BezierPath([BezierSegment(cp)]))
-    >>> mirrored.segments[0].control_points.shape
-    (4, 2)
+        "vertical" reflects across the Y axis (flips X).
+        "horizontal" reflects across the X axis (flips Y).
+    center : np.ndarray or None
+        Centre of reflection.  Defaults to the path's centroid.
     """
-    pts = path.sample(10)
-    if origin is None:
-        origin = pts.mean(axis=0) if len(pts) > 0 else np.zeros(2, dtype=np.float64)
-    origin = np.asarray(origin, dtype=np.float64)
+    if center is None:
+        all_pts = path.sample(pts_per_segment=20)
+        center = all_pts.mean(axis=0) if len(all_pts) > 0 else np.zeros(2)
 
-    # Build 2×2 reflection matrix
-    if axis == "vertical":
-        theta = np.pi / 2.0
-    elif axis == "horizontal":
-        theta = 0.0
-    else:
-        try:
-            theta = np.radians(float(axis))
-        except (ValueError, TypeError):
-            theta = np.pi / 2.0
-
-    cos2 = np.cos(2 * theta)
-    sin2 = np.sin(2 * theta)
-    R = np.array([[cos2, sin2], [sin2, -cos2]], dtype=np.float64)
-
-    new_segments: List[BezierSegment] = []
+    new_segments = []
     for seg in path.segments:
-        cp = seg.control_points.astype(np.float64)
-        centered = cp - origin
-        reflected = (R @ centered.T).T + origin
-        new_segments.append(
-            BezierSegment(
-                reflected.astype(np.float64),
-                source_type="mirror",
-            )
-        )
+        cp = seg.control_points.copy()
+        centred = cp - center
+        if axis == "vertical":
+            centred[:, 0] = -centred[:, 0]
+        else:
+            centred[:, 1] = -centred[:, 1]
+        new_cp = centred + center
+        new_segments.append(BezierSegment(new_cp, source_type=seg.source_type))
 
-    return BezierPath(
-        new_segments, is_closed=path.is_closed, source_type="mirror"
-    )
+    return BezierPath(new_segments, is_closed=path.is_closed,
+                      source_type=path.source_type)
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 4. Motif replication
-# ═══════════════════════════════════════════════════════════════════════════
 
 def replicate_motif(
-    source_path: BezierPath,
-    target_pos: np.ndarray,
-    scale: float = 1.0,
+    path: BezierPath,
+    target_centroid: np.ndarray,
 ) -> BezierPath:
-    """Clone a BezierPath, translate its centroid to *target_pos*, and scale.
+    """Translate a path so its centroid lands on ``target_centroid``."""
+    all_pts = path.sample(pts_per_segment=20)
+    if len(all_pts) == 0:
+        return path
+    current = all_pts.mean(axis=0)
+    delta = target_centroid - current
 
-    Parameters
-    ----------
-    source_path : BezierPath
-    target_pos : np.ndarray, shape (2,)
-    scale : float
+    new_segments = []
+    for seg in path.segments:
+        new_cp = seg.control_points.copy() + delta
+        new_segments.append(BezierSegment(new_cp, source_type=seg.source_type))
 
-    Returns
-    -------
-    BezierPath
-
-    Examples
-    --------
-    >>> cp = np.array([[0,0],[1,0],[2,0],[3,0]], dtype=np.float64)
-    >>> rep = replicate_motif(BezierPath([BezierSegment(cp)]), np.array([10,10]))
-    >>> rep.segments[0].control_points[0, 0] > 5
-    True
-    """
-    target_pos = np.asarray(target_pos, dtype=np.float64)
-    pts = source_path.sample(20)
-    centroid = pts.mean(axis=0) if len(pts) > 0 else np.zeros(2, dtype=np.float64)
-
-    new_segments: List[BezierSegment] = []
-    for seg in source_path.segments:
-        cp = seg.control_points.astype(np.float64)
-        centered = cp - centroid
-        scaled = centered * scale
-        translated = scaled + target_pos
-        new_segments.append(
-            BezierSegment(translated.astype(np.float64), source_type="replicate")
-        )
-
-    return BezierPath(
-        new_segments, is_closed=source_path.is_closed, source_type="replicate"
-    )
+    return BezierPath(new_segments, is_closed=path.is_closed,
+                      source_type=path.source_type)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 5. EFD coefficient blending
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# EFD coefficient blending
+# ═══════════════════════════════════════════════════════════════════════
 
 def blend_efd_completion(
-    partial_coeffs: np.ndarray,
-    vocab_coeffs: np.ndarray,
+    coeffs_partial: np.ndarray,
+    coeffs_template: np.ndarray,
     overlap_fraction: float = 0.5,
 ) -> np.ndarray:
-    """Lambda-blend partial and retrieved EFD coefficients.
-
-    ``C_restored = λ·C_partial + (1-λ)·C_retrieved``
-    where ``λ = overlap_fraction``.
+    """Weighted blend of two EFD coefficient matrices.
 
     Parameters
     ----------
-    partial_coeffs : np.ndarray, shape (order, 4)
-    vocab_coeffs : np.ndarray, shape (order, 4)
-    overlap_fraction : float
-        0 = full retrieval, 1 = full partial.
+    coeffs_partial  : (order, 4) — EFD of the partial contour
+    coeffs_template : (order, 4) — EFD of a complete template
+    overlap_fraction: 0→all template, 1→all partial
 
     Returns
     -------
-    np.ndarray, shape (order, 4)
-
-    Examples
-    --------
-    >>> a = np.ones((10, 4), dtype=np.float64)
-    >>> b = np.zeros((10, 4), dtype=np.float64)
-    >>> blended = blend_efd_completion(a, b, 0.5)
-    >>> np.allclose(blended, 0.5)
-    True
+    (order, 4) blended coefficients
     """
-    lam = float(np.clip(overlap_fraction, 0.0, 1.0))
-    p = np.asarray(partial_coeffs, dtype=np.float64)
-    v = np.asarray(vocab_coeffs, dtype=np.float64)
-
-    # Pad to same shape if needed
-    max_order = max(p.shape[0], v.shape[0])
-    if p.shape[0] < max_order:
-        p = np.vstack([p, np.zeros((max_order - p.shape[0], p.shape[1]), dtype=np.float64)])
-    if v.shape[0] < max_order:
-        v = np.vstack([v, np.zeros((max_order - v.shape[0], v.shape[1]), dtype=np.float64)])
-
-    return lam * p + (1.0 - lam) * v
+    alpha = np.clip(overlap_fraction, 0.0, 1.0)
+    return alpha * coeffs_partial + (1.0 - alpha) * coeffs_template
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 6. Shape vocabulary
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Restoration result container
+# ═══════════════════════════════════════════════════════════════════════
 
-def build_shape_vocabulary(
-    shapes_dir: str,
-    config: Optional[RestorationConfig] = None,
-) -> ShapeVocab:
-    """Pre-compute normalised EFD features for all images in *shapes_dir*.
-
-    Parameters
-    ----------
-    shapes_dir : str
-        Directory containing ``.jpg``/``.png`` reference shapes.
-    config : RestorationConfig, optional
-
-    Returns
-    -------
-    ShapeVocab
-
-    Examples
-    --------
-    >>> vocab = build_shape_vocabulary("/nonexistent")
-    >>> len(vocab.labels) == 0
-    True
-    """
-    cfg = config or RestorationConfig()
-    vocab = ShapeVocab()
-
-    if not os.path.isdir(shapes_dir):
-        logger.warning("Shapes directory not found: %s", shapes_dir)
-        return vocab
-
-    img_paths = sorted(
-        glob.glob(os.path.join(shapes_dir, "*.png"))
-        + glob.glob(os.path.join(shapes_dir, "*.jpg"))
-        + glob.glob(os.path.join(shapes_dir, "*.jpeg"))
-    )
-
-    feat_list: List[np.ndarray] = []
-    for img_path in img_paths:
-        try:
-            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                continue
-            _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                continue
-            # Use the largest contour
-            largest = max(contours, key=cv2.contourArea)
-            feat = compute_efd_features(largest, order=cfg.vocab_efd_order)
-            if feat is None:
-                continue
-
-            import pyefd
-            raw_coeffs = pyefd.elliptic_fourier_descriptors(
-                np.squeeze(largest), order=cfg.vocab_efd_order, normalize=False
-            )
-
-            vocab.labels.append(os.path.splitext(os.path.basename(img_path))[0])
-            feat_list.append(feat)
-            vocab.coeffs_list.append(raw_coeffs)
-        except Exception as exc:
-            logger.warning("Failed to process %s: %s", img_path, exc)
-
-    if not feat_list:
-        return vocab
-
-    features = np.vstack(feat_list).astype(np.float32)
-    vocab.features = features
-
-    if faiss is not None:
-        index = faiss.IndexFlatL2(features.shape[1])
-        index.add(features)
-        vocab._index = index
-    else:
-        from scipy.spatial import cKDTree
-
-        vocab._index = cKDTree(features)
-
-    logger.info("Shape vocabulary: %d entries, %d-dim features", len(vocab.labels), features.shape[1])
-    return vocab
+@dataclass
+class RestorationResult:
+    """Output of the restoration execution."""
+    original_paths: List[BezierPath]
+    new_segments: List[BezierSegment] = field(default_factory=list)
+    new_paths: List[BezierPath] = field(default_factory=list)
+    efd_arcs: List[np.ndarray] = field(default_factory=list)
+    actions_applied: List[dict] = field(default_factory=list)
 
 
-def query_shape_vocabulary(
-    partial_coeffs: np.ndarray,
-    vocab: ShapeVocab,
-    k: int = 3,
-) -> List[VocabMatch]:
-    """kNN query in EFD feature space.
-
-    Parameters
-    ----------
-    partial_coeffs : np.ndarray
-        Flat EFD feature vector.
-    vocab : ShapeVocab
-    k : int
-
-    Returns
-    -------
-    List[VocabMatch]
-
-    Examples
-    --------
-    >>> query_shape_vocabulary(np.zeros(37), ShapeVocab())
-    []
-    """
-    if vocab.features is None or vocab._index is None:
-        return []
-
-    query = np.asarray(partial_coeffs, dtype=np.float32).ravel()
-    if len(query) != vocab.features.shape[1]:
-        # Pad or truncate
-        target_dim = vocab.features.shape[1]
-        if len(query) < target_dim:
-            query = np.pad(query, (0, target_dim - len(query)))
-        else:
-            query = query[:target_dim]
-
-    k = min(k, len(vocab.labels))
-    if k == 0:
-        return []
-
-    matches: List[VocabMatch] = []
-
-    if faiss is not None and hasattr(vocab._index, "search"):
-        D, I = vocab._index.search(query.reshape(1, -1), k)
-        for dist, idx in zip(D[0], I[0]):
-            if idx < 0:
-                continue
-            matches.append(
-                VocabMatch(
-                    label=vocab.labels[idx],
-                    distance=float(dist),
-                    coeffs=vocab.coeffs_list[idx],
-                )
-            )
-    else:
-        # scipy KDTree
-        dists, idxs = vocab._index.query(query, k=k)
-        if np.isscalar(dists):
-            dists = [dists]
-            idxs = [idxs]
-        for dist, idx in zip(dists, idxs):
-            if idx >= len(vocab.labels):
-                continue
-            matches.append(
-                VocabMatch(
-                    label=vocab.labels[idx],
-                    distance=float(dist),
-                    coeffs=vocab.coeffs_list[idx],
-                )
-            )
-
-    return matches
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 7. Execute restoration (dispatch)
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Execute restoration (top-level dispatch)
+# ═══════════════════════════════════════════════════════════════════════
 
 def execute_restoration(
-    hypotheses: List[Any],
+    hypotheses: List[RankedHypothesis],
     paths: List[BezierPath],
-    efd_data: Optional[Dict[int, np.ndarray]] = None,
-    vocab: Optional[ShapeVocab] = None,
-    config: Optional[RestorationConfig] = None,
+    contour_points_map: Optional[Dict[int, np.ndarray]] = None,
 ) -> RestorationResult:
-    """Dispatch each ASP restoration atom to the correct synthesis function.
+    """Apply the best-ranked hypothesis to produce new geometry.
 
     Parameters
     ----------
     hypotheses : List[RankedHypothesis]
         Ranked ASP solutions.
     paths : List[BezierPath]
-    efd_data : dict, optional
-    vocab : ShapeVocab, optional
-    config : RestorationConfig, optional
+        Original Bézier paths.
+    contour_points_map : dict, optional
+        Mapping path_id → sampled (N, 2) contour points (for EFD closure).
 
     Returns
     -------
     RestorationResult
-
-    Examples
-    --------
-    >>> execute_restoration([], []).new_segments
-    []
     """
-    cfg = config or RestorationConfig()
-    result = RestorationResult(original_paths=list(paths))
+    result = RestorationResult(original_paths=paths)
 
     if not hypotheses:
         return result
 
-    # Use the top-ranked hypothesis
     best = hypotheses[0]
+    used_endpoints: set = set()
 
     for action in best.actions:
         try:
-            if action.action_type == "complete_contour":
-                cid = action.arguments.get("contour_id", 0)
-                if 0 <= cid < len(paths) and not paths[cid].is_closed:
-                    seg = close_contour_g1(paths[cid], cfg)
-                    result.new_segments.append(seg)
-                    result.actions_applied.append(
-                        {"type": "complete_contour", "contour_id": cid}
-                    )
-                    logger.info("Applied complete_contour for contour %d", cid)
-
-            elif action.action_type == "extend_curve":
-                pa = action.arguments.get("path_a", 0)
-                pb = action.arguments.get("path_b", 0)
-                ep_a = action.arguments.get("endpoint_a", "end")
-                ep_b = action.arguments.get("endpoint_b", "start")
-                if 0 <= pa < len(paths) and 0 <= pb < len(paths):
-                    seg = bridge_curves(
-                        paths[pa], paths[pb], cfg,
-                        endpoint_a=ep_a, endpoint_b=ep_b,
-                    )
-                    result.new_segments.append(seg)
-                    result.actions_applied.append(
-                        {"type": "extend_curve", "path_a": pa, "path_b": pb,
-                         "endpoint_a": ep_a, "endpoint_b": ep_b}
-                    )
-                    logger.info("Applied extend_curve %d(%s)→%d(%s)", pa, ep_a, pb, ep_b)
-
+            if action.action_type == "extend_curve":
+                _apply_extend(action, paths, result, used_endpoints)
+            elif action.action_type == "complete_contour":
+                _apply_complete(action, paths, result, used_endpoints,
+                                contour_points_map)
             elif action.action_type == "mirror_element":
-                eid = action.arguments.get("element_id", 0)
-                axis = action.arguments.get("axis", "vertical")
-                if 0 <= eid < len(paths):
-                    mirrored = mirror_bezier_path(paths[eid], axis=str(axis))
-                    result.new_paths.append(mirrored)
-                    result.actions_applied.append(
-                        {"type": "mirror_element", "element_id": eid, "axis": axis}
-                    )
-                    logger.info("Applied mirror_element %d across %s", eid, axis)
-
-            elif action.action_type == "replicate_motif":
-                mid = action.arguments.get("motif_id", 0)
-                pos = action.arguments.get("position", 0)
-                if 0 <= mid < len(paths):
-                    target = np.array([float(pos), 0.0], dtype=np.float64)
-                    rep = replicate_motif(paths[mid], target)
-                    result.new_paths.append(rep)
-                    result.actions_applied.append(
-                        {"type": "replicate_motif", "motif_id": mid, "position": pos}
-                    )
-                    logger.info("Applied replicate_motif %d → pos %s", mid, pos)
-
-            elif action.action_type == "flag_similar_missing":
-                pa = action.arguments.get("path_a", 0)
-                pb = action.arguments.get("path_b", 0)
-                if efd_data and vocab:
-                    feat = efd_data.get(pa)
-                    if feat is not None:
-                        matches = query_shape_vocabulary(feat, vocab, k=1)
-                        if matches:
-                            blended = blend_efd_completion(
-                                feat.reshape(-1, 4) if feat.ndim == 1 else feat,
-                                matches[0].coeffs,
-                                overlap_fraction=0.5,
-                            )
-                            result.blended_coeffs.append(blended)
-                            result.actions_applied.append(
-                                {"type": "efd_blend", "path_a": pa, "match": matches[0].label}
-                            )
-
+                _apply_mirror(action, paths, result)
         except Exception as exc:
-            logger.error("Action %s failed: %s", action.action_type, exc)
+            result.actions_applied.append({
+                "type": "action_failed",
+                "action_type": action.action_type,
+                "error": str(exc),
+            })
 
-    logger.info(
-        "Restoration complete: %d new segments, %d new paths, %d blended coeffs",
-        len(result.new_segments), len(result.new_paths), len(result.blended_coeffs),
-    )
     return result
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 8. Visualisation
-# ═══════════════════════════════════════════════════════════════════════════
-
-def visualise(
+def _apply_extend(
+    action: RestorationAction,
+    paths: List[BezierPath],
     result: RestorationResult,
-    image_path: Optional[str] = None,
-    output_path: Optional[str] = None,
-    config: Optional[RestorationConfig] = None,
+    used: set,
 ) -> None:
-    """Save an exact copy of the image and one with new paths overlaid."""
-    cfg = config or RestorationConfig()
+    """Apply an extend_curve action."""
+    pa = action.arguments.get("path_a")
+    pb = action.arguments.get("path_b")
+    ea = action.arguments.get("endpoint_a", "end")
+    eb = action.arguments.get("endpoint_b", "start")
 
-    img_bgr = None
-    if image_path and os.path.exists(image_path):
-        img_bgr = cv2.imread(image_path)
-    
-    if img_bgr is None:
-        logger.warning("No valid image_path provided to visualise, creating blank canvas.")
-        img_bgr = np.zeros((1000, 1000, 3), dtype=np.uint8)
+    if pa is None or pb is None:
+        return
 
-    # 1. Save original image unaltered
-    if output_path:
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        orig_path = output_path.replace("visualisation", "original") if "visualisation" in output_path else output_path.replace(".png", "_orig.png")
-        cv2.imwrite(orig_path, img_bgr)
-        logger.info("Saved original visualisation to %s", orig_path)
+    # Self-bridge check
+    if pa == pb:
+        result.actions_applied.append({
+            "type": "action_skipped",
+            "action_type": "extend_curve",
+            "reason": "self_bridge_blocked",
+        })
+        return
 
-    # 2. Draw restored overlays
-    overlaid = img_bgr.copy()
+    # Endpoint validity
+    if ea not in ("start", "end") or eb not in ("start", "end"):
+        result.actions_applied.append({
+            "type": "action_failed",
+            "action_type": "extend_curve",
+            "error": f"invalid endpoint: {ea}, {eb}",
+        })
+        return
 
-    # Vibrant native BGR colors for drawing new paths cleanly
-    vibrant_colors = [
-        (0, 255, 255),   # Yellow
-        (255, 0, 255),   # Magenta
-        (0, 255, 0),     # Lime Green
-        (255, 128, 0),   # Cyan
-        (0, 165, 255),   # Orange
-        (200, 100, 255), # Pink/Purple
-    ]
+    # Out-of-range check
+    if pa >= len(paths) or pb >= len(paths):
+        return
 
-    # Draw new segments
-    for idx, seg in enumerate(result.new_segments):
-        pts = seg.sample(200) # Heavy sampling for smooth curve
-        pts_int = np.round(pts).astype(np.int32).reshape((-1, 1, 2))
-        c = vibrant_colors[idx % len(vibrant_colors)]
-        cv2.polylines(overlaid, [pts_int], False, c, thickness=3, lineType=cv2.LINE_AA)
+    # One-use-per-endpoint
+    key_a = (pa, ea)
+    key_b = (pb, eb)
+    if key_a in used or key_b in used:
+        result.actions_applied.append({
+            "type": "action_skipped",
+            "action_type": "extend_curve",
+            "reason": "endpoint_already_used",
+        })
+        return
 
-    # Draw new paths (merged components)
-    for idx, path in enumerate(result.new_paths):
-        pts = path.sample(200)
-        if len(pts) == 0:
-            continue
-        c = vibrant_colors[(idx + len(result.new_segments)) % len(vibrant_colors)]
-        pts_int = np.round(pts).astype(np.int32).reshape((-1, 1, 2))
-        cv2.polylines(overlaid, [pts_int], False, c, thickness=3, lineType=cv2.LINE_AA)
+    bridge = bridge_curves(paths[pa], paths[pb], ea, eb)
+    result.new_segments.append(bridge)
+    used.add(key_a)
+    used.add(key_b)
 
-    if output_path:
-        cv2.imwrite(output_path, overlaid)
-        logger.info("Saved restored visualisation to %s", output_path)
+    result.actions_applied.append({
+        "type": "extend_curve",
+        "path_a": pa,
+        "path_b": pb,
+        "endpoint_a": ea,
+        "endpoint_b": eb,
+        "confidence": action.confidence,
+    })
+
+
+def _apply_complete(
+    action: RestorationAction,
+    paths: List[BezierPath],
+    result: RestorationResult,
+    used: set,
+    contour_points_map: Optional[Dict[int, np.ndarray]],
+) -> None:
+    """Apply a complete_contour action.
+
+    First tries EFD closure (smoother for curved shapes).
+    Falls back to G1 Bézier closure.
+    """
+    pid = action.arguments.get("contour_id")
+    if pid is None or pid >= len(paths):
+        return
+
+    path = paths[pid]
+    if path.is_closed:
+        return
+
+    # Check endpoints not already used
+    key_start = (pid, "start")
+    key_end = (pid, "end")
+    if key_start in used or key_end in used:
+        return
+
+    # Try EFD closure first
+    efd_arc = None
+    if contour_points_map and pid in contour_points_map:
+        efd_arc = efd_close_contour(contour_points_map[pid])
+
+    if efd_arc is None:
+        # EFD not available, sample the path for EFD
+        sampled = path.sample(pts_per_segment=50)
+        if len(sampled) >= 5:
+            efd_arc = efd_close_contour(sampled)
+
+    if efd_arc is not None and len(efd_arc) >= 2:
+        result.efd_arcs.append(efd_arc)
+        result.actions_applied.append({
+            "type": "complete_contour",
+            "path_id": pid,
+            "method": "efd",
+            "confidence": action.confidence,
+        })
     else:
-        logger.info("No output_path specified, visualisations not saved.")
+        # Fallback to G1 Bézier closure
+        closure_seg = close_contour_g1(path)
+        result.new_segments.append(closure_seg)
+        result.actions_applied.append({
+            "type": "complete_contour",
+            "path_id": pid,
+            "method": "bezier_g1",
+            "confidence": action.confidence,
+        })
+
+    used.add(key_start)
+    used.add(key_end)
+
+
+def _apply_mirror(
+    action: RestorationAction,
+    paths: List[BezierPath],
+    result: RestorationResult,
+) -> None:
+    """Apply a mirror_element action."""
+    pid = action.arguments.get("element_id")
+    axis = action.arguments.get("axis", "vertical")
+    if pid is None or pid >= len(paths):
+        return
+
+    mirrored = mirror_bezier_path(paths[pid], axis=str(axis))
+    result.new_paths.append(mirrored)
+    result.actions_applied.append({
+        "type": "mirror_element",
+        "path_id": pid,
+        "axis": axis,
+    })
