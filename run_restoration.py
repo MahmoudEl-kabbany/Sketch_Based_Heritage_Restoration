@@ -59,7 +59,12 @@ if __name__ == "__main__":
     # Example 3: Multiple Images / Mixed
     INPUTS = [
         "test_images/damaged_oval.png",
-        "test_images/restoration_test.png"
+        "test_images/restoration_test.png",
+        "test_images/damaged_bolt.png",
+        "test_images/damaged_shape.png",
+        "test_images/restoration_small_gaps.png",
+        "test_images/restoration_test_damaged.png",
+        "test_images/restoration_test_damaged_big.png"
     ]
     
     # Where you want the results saved

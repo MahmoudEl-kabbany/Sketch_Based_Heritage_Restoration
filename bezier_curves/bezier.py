@@ -508,6 +508,7 @@ def fit_from_image_skeleton(
     max_error: float = 5.0,
     tangent_lookahead: int = 5,
     merge_radius: float = 3.0,
+    min_spur_length: int = 10,
 ) -> Tuple[List[BezierPath], Dict[int, set]]:
     """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths.
 
@@ -538,11 +539,8 @@ def fit_from_image_skeleton(
     # Build graph from skeleton
     graph = sknw.build_sknw(skeleton)
 
-    # Track which skeleton node each edge connects so we can build adjacency
-    edge_to_path_idx: Dict[int, List[int]] = {}  # skeleton node → [path indices]
-
-    # Process edges
-    paths = []
+    # 1. Gather all edges and their points
+    edges_info = [] # list of (u, v, pts)
     for s, e in graph.edges():
         edge_data = graph[s][e]
         pts = edge_data.get('pts', [])
@@ -551,14 +549,145 @@ def fit_from_image_skeleton(
         else:
             pts = np.asarray(pts, dtype=np.float64)
 
-        # sknw returns points as (row, col) = (y, x); convert to (x, y).
+        # sknw convert (row, col) = (y, x) to (x, y)
         if pts.ndim == 2 and pts.shape[1] >= 2:
             pts = pts[:, ::-1]
 
+        if len(pts) >= 2:
+            edges_info.append((s, e, pts))
+
+    # 2. Extract node connectivity
+    node_edges = {}
+    for i, (u, v, pts) in enumerate(edges_info):
+        node_edges.setdefault(u, []).append((i, True))  # True if connected at start of pts
+        node_edges.setdefault(v, []).append((i, False)) # False if connected at end of pts
+        
+    def _get_tangent(points, is_start, lookahead=5):
+        idx = min(lookahead, len(points)-1)
+        if is_start:
+            vec = points[idx] - points[0]
+        else:
+            vec = points[-idx-1] - points[-1]
+        norm = np.linalg.norm(vec)
+        if norm < 1e-6: return np.array([0.0, 0.0])
+        return vec / norm
+
+    # 3. Pair collinear edges meeting at junctions
+    pairings = {}
+    for node, incident in node_edges.items():
+        if len(incident) == 2:
+            # Always merge 1-to-1 connections (degree 2 nodes)
+            e1, s1 = incident[0]
+            e2, s2 = incident[1]
+            pairings.setdefault(e1, {})[node] = (e2, s2)
+            pairings.setdefault(e2, {})[node] = (e1, s1)
+        elif len(incident) > 2:
+            # Find the smoothest pairs across the junction
+            vecs = []
+            for e, is_start in incident:
+                points = edges_info[e][2]
+                vec = _get_tangent(points, is_start)
+                vecs.append((e, is_start, vec))
+                
+            possible_pairs = []
+            for i in range(len(vecs)):
+                for j in range(i+1, len(vecs)):
+                    # dot close to -1 means straight line continuation
+                    dot = np.dot(vecs[i][2], vecs[j][2])
+                    possible_pairs.append((dot, vecs[i], vecs[j]))
+            
+            # Sort with most negative dot product first
+            possible_pairs.sort(key=lambda x: x[0])
+            used = set()
+            for dot, v1, v2 in possible_pairs:
+                e1, s1, _ = v1
+                e2, s2, _ = v2
+                if e1 not in used and e2 not in used:
+                    pairings.setdefault(e1, {})[node] = (e2, s2)
+                    pairings.setdefault(e2, {})[node] = (e1, s1)
+                    used.add(e1)
+                    used.add(e2)
+
+    # 4. Traverse groupings to extract contiguous macro paths
+    visited_edges = set()
+    macro_paths_pts = []
+    macro_path_endpoints = [] # (start_node, end_node)
+    
+    for i in range(len(edges_info)):
+        if i in visited_edges: continue
+        
+        curr = i
+        curr_dir = True 
+        start_node = -1
+        # Trace backwards to find the true start
+        while True:
+            node = edges_info[curr][0] if curr_dir else edges_info[curr][1]
+            if node in pairings.get(curr, {}):
+                next_e, next_s = pairings[curr][node]
+                curr = next_e
+                curr_dir = next_s
+                if curr == i:
+                    break # it's a closed loop
+            else:
+                start_node = node
+                break
+        
+        start_curr = curr
+        start_dir = curr_dir
+        
+        macro_pts = []
+        is_loop = False
+        end_node = -1
+        
+        # Trace forwards to extract
+        while True:
+            visited_edges.add(curr)
+            pts = edges_info[curr][2]
+            if not curr_dir: pts = pts[::-1]
+            
+            if len(macro_pts) > 0:
+                macro_pts.append(pts[1:]) # Skip duplicate point at junction
+            else:
+                macro_pts.append(pts)
+                
+            node = edges_info[curr][1] if curr_dir else edges_info[curr][0]
+            if node in pairings.get(curr, {}):
+                next_e, next_s = pairings[curr][node]
+                if next_e == start_curr:
+                    is_loop = True
+                    start_node = -1
+                    end_node = -1
+                    break
+                curr = next_e
+                curr_dir = not next_s 
+            else:
+                end_node = node
+                break
+                
+        macro_pts = np.vstack(macro_pts)
+        
+        # 5. Eliminate short isolated spurs
+        if not is_loop and len(macro_pts) < min_spur_length:
+            is_dead_end = False
+            if start_node != -1 and len(node_edges.get(start_node, [])) == 1:
+                is_dead_end = True
+            if end_node != -1 and len(node_edges.get(end_node, [])) == 1:
+                is_dead_end = True
+            
+            if is_dead_end:
+                continue
+
+        macro_paths_pts.append(macro_pts)
+        macro_path_endpoints.append((start_node, end_node))
+
+    # 6. Fit cubic beziers on the cohesive macro paths
+    edge_to_path_idx: Dict[int, List[int]] = {}
+    paths = []
+    
+    for pts, (sn, en) in zip(macro_paths_pts, macro_path_endpoints):
         if len(pts) < 2:
             continue
-
-        # Estimate tangents and fit cubic
+            
         lookahead = max(1, int(tangent_lookahead))
         left_tangent = _estimate_tangent(pts, "start", lookahead=lookahead)
         right_tangent = _estimate_tangent(pts, "end", lookahead=lookahead)
@@ -568,9 +697,10 @@ def fit_from_image_skeleton(
         if segments:
             path_idx = len(paths)
             paths.append(BezierPath(segments, is_closed=False, source_type="skeleton"))
-            # Record skeleton node connections
-            for node in (s, e):
-                edge_to_path_idx.setdefault(node, []).append(path_idx)
+            if sn != -1:
+                edge_to_path_idx.setdefault(sn, []).append(path_idx)
+            if en != -1:
+                edge_to_path_idx.setdefault(en, []).append(path_idx)
 
     # Build adjacency: paths sharing a skeleton node are connected
     adjacency: Dict[int, set] = {}
