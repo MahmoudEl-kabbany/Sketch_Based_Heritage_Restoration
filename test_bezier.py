@@ -49,7 +49,7 @@ def process_image(
 
     # Extract Bezier curves
     if use_skeleton:
-        paths = fit_from_image_skeleton(image_path, max_error=max_error)
+        paths, _adjacency = fit_from_image_skeleton(image_path, max_error=max_error)
         mode = "skeleton"
     else:
         paths = fit_from_image(

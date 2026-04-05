@@ -235,6 +235,7 @@ def visualise_result(
 
     vis_path = os.path.join(output_dir, "restoration_visualisation.png")
     visualise(result, image_path=image_path, output_path=vis_path)
+    original_copy_path = os.path.join(output_dir, "restoration_original.png")
 
     # Write text report
     report_path = os.path.join(output_dir, "restoration_report.txt")
@@ -255,6 +256,24 @@ def visualise_result(
             for rule in report.surrogate_rules:
                 f.write(rule + "\n")
             f.write("\n")
+
+        if result.additions:
+            f.write("ADDITIONS (Overlay Index Mapping)\n")
+            f.write("-" * 40 + "\n")
+            for add in result.additions:
+                f.write(
+                    f"#{add.segment_id}: method={add.method}, conf={add.confidence:.3f}, "
+                    f"paths=({add.path_a},{add.path_b}), "
+                    f"endpoints=(e{add.endpoint_a_id},e{add.endpoint_b_id}), "
+                    f"forced={add.is_forced}\n"
+                )
+            f.write("\n")
+
+        f.write("OUTPUT IMAGES\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"Original: {original_copy_path}\n")
+        f.write(f"Overlay : {vis_path}\n")
+        f.write("\n")
 
         f.write(f"\nActions applied: {len(result.actions_applied)}\n")
         for act in result.actions_applied:
@@ -279,7 +298,7 @@ def main() -> None:
         description="Sketch-Based Heritage Restoration Pipeline"
     )
     # Default image allows running `python pipeline.py` without arguments
-    default_img = os.path.join(_PROJECT_ROOT, "test_images", "restoration_test.png")
+    default_img = os.path.join(_PROJECT_ROOT, "test_images", "restoration_test_damaged_big.png")
     parser.add_argument("--image", default=default_img, help="Input sketch image path")
     parser.add_argument("--no-skeleton", action="store_false", dest="skeleton", help="Disable skeleton fitting")
     parser.add_argument("--vocab", default="", help="Shape vocabulary directory")

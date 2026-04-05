@@ -1,1 +1,1 @@
-"""ASP inference sub-package for Gestalt-based restoration reasoning."""
+"""ASP inference package for restoration decisions."""

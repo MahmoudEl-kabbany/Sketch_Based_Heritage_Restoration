@@ -1,1 +1,1 @@
-"""Restoration module for Sketch-Based Heritage Restoration."""
+"""Restoration package: feature bridge, ASP reasoning, synthesis, and XAI."""

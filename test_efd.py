@@ -9,7 +9,7 @@ CONTOUR_RETRIEVAL = "external"  # "tree" | "external"
 
 process_image(
 	IMAGE_PATH,
-	efd_orders=EFD_ORDERS,
+	order=max(EFD_ORDERS),
 	min_contour_area=MIN_CONTOUR_AREA,
 	use_skeleton=USE_SKELETON,
 	contour_retrieval=CONTOUR_RETRIEVAL,

@@ -1,891 +1,539 @@
-"""
-Feature Bridge  (R-1)
-=====================
-Translates BezierPath / EFD outputs into geometric features for the
-Gestalt engine.
-
-Every public function has full type hints and NumPy-style docstrings.
-Thresholds and hyperparameters come from a ``FeatureBridgeConfig``
-dataclass — nothing is hard-coded.
-"""
-
 from __future__ import annotations
 
-import logging
-import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-import cv2
-import networkx as nx
 import numpy as np
-from skimage.morphology import skeletonize
+from scipy.spatial.distance import cdist
 
-try:
-    import sknw
-except ImportError:  # pragma: no cover
-    sknw = None  # type: ignore[assignment]
+from bezier_curves.bezier import BezierPath
 
-# ── project imports ──────────────────────────────────────────────────────
-import sys, os
-
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-
-from bezier_curves.bezier import BezierPath, BezierSegment
-from eliptic_fourier_descriptors.efd import compute_efd_features
-
-logger = logging.getLogger(__name__)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Configuration
-# ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class FeatureBridgeConfig:
-    """All tuneable thresholds for *feature_bridge*."""
+    """Configuration for endpoint extraction and gap candidate scoring."""
 
-    # endpoint-gap detection
-    max_gap_distance: float = 500.0
-    """Maximum pixel distance between endpoints to consider a gap."""
-    min_gap_px: float = 2.0
-    """Minimum gap distance; pairs closer than this are already connected."""
-    min_closure_gap: float = 3.0
-    """Minimum self-gap (start↔end of same path) to emit a closure fact."""
+    max_gap_distance_ratio: float = 0.08
+    max_gap_distance_px: float = 140.0
+    max_direction_misalignment_deg: float = 72.0
+    max_corner_curvature_deg: float = 145.0
+    allow_same_endpoint_type_pairing: bool = False
+    enforce_endpoint_uniqueness: bool = True
+    force_connect_unmatched: bool = True
+    min_confidence: float = 0.20
+    efd_confidence_threshold: float = 0.68
+    symmetry_confidence_threshold: float = 0.60
 
-    # curvature classification
-    curvature_straight_threshold: float = 0.01
-    """Max mean |κ| for a segment to be classified as *straight*."""
-    curvature_arch_sign_ratio: float = 0.85
-    """Min fraction of same-sign samples to classify as *arch*."""
-
-    # symmetry axis detection
-    symmetry_tolerance: float = 5.0
-    """Upper bound on reflection residual (pixels) to accept an axis."""
-
-    # periodicity detection
-    periodicity_min_peaks: int = 3
-    """Minimum FFT peaks to declare periodic."""
-    periodicity_prominence: float = 0.3
-    """Min normalised prominence for a peak."""
-
-    # EFD
-    efd_order: int = 10
-    """Default harmonic order for EFD features."""
-
-    # skeleton graph
-    skeleton_min_edge_length: int = 5
-    """Ignore skeleton edges shorter than this (pixels)."""
-
-    # sampling
-    curvature_samples: int = 50
-    """Number of samples per segment for curvature profiling."""
-    sample_pts_per_segment: int = 50
-    """Number of points sampled per Bézier segment for point-clouds."""
+    # Score weights (must sum approximately to 1.0).
+    proximity_weight: float = 0.34
+    continuation_weight: float = 0.38
+    curvature_weight: float = 0.18
+    symmetry_weight: float = 0.10
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Data classes for feature records
-# ═══════════════════════════════════════════════════════════════════════════
+@dataclass
+class EndpointRecord:
+    """Terminal point descriptor for an open BezierPath."""
+
+    endpoint_id: int
+    path_index: int
+    endpoint_type: str  # "start" or "end"
+    point: np.ndarray
+    outward_tangent: np.ndarray
+    curvature_deg: float
+    source_type: str = "unknown"
+
 
 @dataclass
 class GapRecord:
-    """Record of an open-endpoint gap between two BezierPaths."""
+    """Candidate link between two endpoints."""
 
-    path_id_a: int
-    path_id_b: int
-    gap_dist: float
-    tangent_angle_deg: float
-    endpoint_a: str = "end"
-    """Which endpoint of path_a was used: 'start' or 'end'."""
-    endpoint_b: str = "start"
-    """Which endpoint of path_b was used: 'start' or 'end'."""
-
-
-@dataclass
-class Axis:
-    """A candidate symmetry axis."""
-
-    angle_deg: float
-    """Counter-clockwise angle of the axis from the +x direction."""
-    origin: np.ndarray
-    """A point on the axis (typically the centroid of input paths)."""
-    residual: float
-    """Mean unsigned reflection residual (lower = better symmetry)."""
-
-
-@dataclass
-class Period:
-    """Detected periodicity along a scan axis."""
-
-    period_px: float
-    """Period length in pixels."""
-    axis: str
-    """Scan axis label ('x' or 'y')."""
-    centroid_positions: np.ndarray
-    """Sorted centroid projections used for the detection."""
+    gap_id: int
+    endpoint_a_id: int
+    endpoint_b_id: int
+    path_a: int
+    path_b: int
+    distance: float
+    angle_a_deg: float
+    angle_b_deg: float
+    curvature_delta_deg: float
+    continuation_score: float
+    proximity_score: float
+    symmetry_score: float
+    geometric_score: float
+    confidence: float
+    gap_kind: str = "bridge"  # "bridge" | "single_contour_gap"
+    suggested_method: str = "bezier"  # "bezier" | "efd" | "symmetry"
+    is_forced: bool = False
+    reasons: List[str] = field(default_factory=list)
 
 
 @dataclass
 class FeatureBundle:
-    """Aggregated features produced by :func:`extract_all_features`."""
+    """Structured geometric features passed to ASP and restoration stages."""
 
+    endpoints: List[EndpointRecord] = field(default_factory=list)
     gaps: List[GapRecord] = field(default_factory=list)
-    curvature_profiles: Dict[int, Tuple[np.ndarray, np.ndarray]] = field(
-        default_factory=dict
-    )
-    segment_types: Dict[int, List[str]] = field(default_factory=dict)
-    symmetry_axis: Optional[Axis] = None
-    efd_features: Dict[int, Optional[np.ndarray]] = field(default_factory=dict)
-    periodicity: Optional[Period] = None
-    skeleton_graph: Optional[nx.Graph] = None
+    symmetry_axis: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    global_symmetry_confidence: float = 0.0
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Core feature extraction functions
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _unit_vector(v: np.ndarray) -> np.ndarray:
-    """Return unit vector; returns [1, 0] for zero-length input."""
-    n = np.linalg.norm(v)
+def _safe_normalize(vec: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(vec))
     if n < 1e-12:
         return np.array([1.0, 0.0], dtype=np.float64)
-    return v / n
+    return (vec / n).astype(np.float64)
 
 
-def extract_endpoint_gaps(
-    paths: List[BezierPath],
-    config: Optional[FeatureBridgeConfig] = None,
-    adjacency: Optional[Dict[int, set]] = None,
+def _angle_deg(u: np.ndarray, v: np.ndarray) -> float:
+    uu = _safe_normalize(u)
+    vv = _safe_normalize(v)
+    dot = float(np.clip(np.dot(uu, vv), -1.0, 1.0))
+    return float(np.degrees(np.arccos(dot)))
+
+
+def _estimate_endpoint_curvature(control_points: np.ndarray, endpoint_type: str) -> float:
+    """Approximate local curvature from control polygon turning angle."""
+    cp = control_points.astype(np.float64)
+    if endpoint_type == "start":
+        v1 = cp[1] - cp[0]
+        v2 = cp[2] - cp[1]
+    else:
+        v1 = cp[2] - cp[3]
+        v2 = cp[1] - cp[2]
+
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
+    if n1 < 1e-12 or n2 < 1e-12:
+        return 0.0
+    return _angle_deg(v1, v2)
+
+
+def _extract_endpoints(paths: List[BezierPath]) -> List[EndpointRecord]:
+    endpoints: List[EndpointRecord] = []
+    endpoint_id = 0
+
+    for path_index, path in enumerate(paths):
+        if path.is_closed or not path.segments:
+            continue
+
+        first_cp = path.segments[0].control_points
+        last_cp = path.segments[-1].control_points
+
+        p_start = first_cp[0].astype(np.float64)
+        t_start_in = _safe_normalize(first_cp[1] - first_cp[0])
+        start_endpoint = EndpointRecord(
+            endpoint_id=endpoint_id,
+            path_index=path_index,
+            endpoint_type="start",
+            point=p_start,
+            outward_tangent=-t_start_in,
+            curvature_deg=_estimate_endpoint_curvature(first_cp, "start"),
+            source_type=path.source_type,
+        )
+        endpoints.append(start_endpoint)
+        endpoint_id += 1
+
+        p_end = last_cp[3].astype(np.float64)
+        t_end_out = _safe_normalize(last_cp[3] - last_cp[2])
+        end_endpoint = EndpointRecord(
+            endpoint_id=endpoint_id,
+            path_index=path_index,
+            endpoint_type="end",
+            point=p_end,
+            outward_tangent=t_end_out,
+            curvature_deg=_estimate_endpoint_curvature(last_cp, "end"),
+            source_type=path.source_type,
+        )
+        endpoints.append(end_endpoint)
+        endpoint_id += 1
+
+    return endpoints
+
+
+def _estimate_global_symmetry(paths: List[BezierPath]) -> Tuple[Optional[Tuple[np.ndarray, np.ndarray]], float]:
+    sampled_parts: List[np.ndarray] = []
+    for path in paths:
+        if not path.segments:
+            continue
+        sampled_parts.append(path.sample(40))
+
+    if not sampled_parts:
+        return None, 0.0
+
+    points = np.vstack(sampled_parts)
+    if len(points) < 3:
+        return None, 0.0
+
+    centroid = points.mean(axis=0)
+    centered = points - centroid
+
+    cov = np.cov(centered.T)
+    eig_vals, eig_vecs = np.linalg.eigh(cov)
+    axis = _safe_normalize(eig_vecs[:, int(np.argmax(eig_vals))])
+
+    # Symmetry confidence from mirror reconstruction error.
+    normal = np.array([-axis[1], axis[0]], dtype=np.float64)
+    signed = np.dot(centered, normal)
+    reflected = points - 2.0 * signed[:, None] * normal[None, :]
+
+    dmat = cdist(reflected, points)
+    nearest = np.min(dmat, axis=1)
+    diag = float(np.linalg.norm(points.max(axis=0) - points.min(axis=0))) + 1e-6
+    err = float(np.mean(nearest))
+    conf = float(np.exp(-err / (0.06 * diag)))
+
+    return (centroid, axis), conf
+
+
+def _pair_allowed(a: EndpointRecord, b: EndpointRecord, cfg: FeatureBridgeConfig) -> bool:
+    if not cfg.allow_same_endpoint_type_pairing and a.endpoint_type == b.endpoint_type:
+        return False
+    if a.endpoint_type == b.endpoint_type and cfg.allow_same_endpoint_type_pairing:
+        return True
+
+    # Cross-endpoint pairing only by default.
+    return {a.endpoint_type, b.endpoint_type} == {"start", "end"}
+
+
+def _reflect_point_on_axis(point: np.ndarray, origin: np.ndarray, axis: np.ndarray) -> np.ndarray:
+    normal = np.array([-axis[1], axis[0]], dtype=np.float64)
+    rel = point - origin
+    signed = float(np.dot(rel, normal))
+    return point - 2.0 * signed * normal
+
+
+def _build_initial_candidates(
+    endpoints: List[EndpointRecord],
+    adjacency: Dict[int, set],
+    cfg: FeatureBridgeConfig,
+    symmetry_axis: Optional[Tuple[np.ndarray, np.ndarray]],
+    efd_data: Dict[int, np.ndarray],
+    image_diag: float,
 ) -> List[GapRecord]:
-    """Find all open-endpoint pairs whose gap is below threshold.
+    candidates: List[GapRecord] = []
+    max_dist = min(cfg.max_gap_distance_px, max(4.0, cfg.max_gap_distance_ratio * image_diag))
+    dir_cos_threshold = float(np.cos(np.radians(cfg.max_direction_misalignment_deg)))
 
-    Evaluates all four endpoint pairings (end→start, start→end,
-    end→end, start→start) and emits every qualifying gap rather
-    than only the best one per path-pair.
+    gap_id = 0
+    for i in range(len(endpoints)):
+        a = endpoints[i]
+        if a.curvature_deg > cfg.max_corner_curvature_deg:
+            continue
 
-    Parameters
-    ----------
-    paths : List[BezierPath]
-        Bézier paths extracted from the sketch.
-    config : FeatureBridgeConfig, optional
-        Threshold configuration.  Uses defaults when *None*.
-    adjacency : dict, optional
-        Mapping path_id → set of path_ids that share a skeleton node
-        (already connected).  These pairs are skipped.
-
-    Returns
-    -------
-    List[GapRecord]
-        One record per qualifying endpoint pair.
-
-    Examples
-    --------
-    >>> segs = [BezierSegment(np.array([[0,0],[1,0],[2,0],[3,0]], dtype=np.float64))]
-    >>> p = BezierPath(segs, is_closed=False)
-    >>> gaps = extract_endpoint_gaps([p, p])
-    >>> len(gaps) >= 0
-    True
-    """
-    cfg = config or FeatureBridgeConfig()
-    adj = adjacency or {}
-    records: List[GapRecord] = []
-
-    open_paths = [(i, p) for i, p in enumerate(paths) if not p.is_closed and p.segments]
-
-    for idx_a in range(len(open_paths)):
-        pid_a, pa = open_paths[idx_a]
-
-        start_a = pa.segments[0].control_points[0]
-        end_a = pa.segments[-1].control_points[3]
-        tan_start_a = _unit_vector(
-            pa.segments[0].control_points[0] - pa.segments[0].control_points[1]
-        )
-        tan_end_a = _unit_vector(
-            pa.segments[-1].control_points[3] - pa.segments[-1].control_points[2]
-        )
-
-        for idx_b in range(idx_a + 1, len(open_paths)):
-            pid_b, pb = open_paths[idx_b]
-
-            # Skip paths already connected via skeleton adjacency
-            if pid_b in adj.get(pid_a, set()):
+        for j in range(i + 1, len(endpoints)):
+            b = endpoints[j]
+            if b.curvature_deg > cfg.max_corner_curvature_deg:
                 continue
 
-            start_b = pb.segments[0].control_points[0]
-            end_b = pb.segments[-1].control_points[3]
-            tan_start_b = _unit_vector(
-                pb.segments[0].control_points[0] - pb.segments[0].control_points[1]
-            )
-            tan_end_b = _unit_vector(
-                pb.segments[-1].control_points[3] - pb.segments[-1].control_points[2]
-            )
+            if not _pair_allowed(a, b, cfg):
+                continue
 
-            # All four endpoint pairings
-            pairings = [
-                (end_a,   start_b, tan_end_a,   tan_start_b, pid_a, pid_b, "end",   "start"),
-                (end_a,   end_b,   tan_end_a,   tan_end_b,   pid_a, pid_b, "end",   "end"),
-                (start_a, start_b, tan_start_a, tan_start_b, pid_a, pid_b, "start", "start"),
-                (start_a, end_b,   tan_start_a, tan_end_b,   pid_a, pid_b, "start", "end"),
+            if b.path_index in adjacency.get(a.path_index, set()):
+                continue
+
+            vec = b.point - a.point
+            dist = float(np.linalg.norm(vec))
+            if dist < 1e-9 or dist > max_dist:
+                continue
+
+            unit = vec / dist
+            align_a = float(np.dot(a.outward_tangent, unit))
+            align_b = float(np.dot(b.outward_tangent, -unit))
+            if align_a < dir_cos_threshold or align_b < dir_cos_threshold:
+                continue
+
+            angle_a = _angle_deg(a.outward_tangent, unit)
+            angle_b = _angle_deg(b.outward_tangent, -unit)
+            continuation = float(np.clip((align_a + align_b) * 0.5, 0.0, 1.0))
+            proximity = float(np.clip(1.0 - dist / max_dist, 0.0, 1.0))
+
+            curvature_delta = abs(a.curvature_deg - b.curvature_deg)
+            curvature_score = float(np.clip(1.0 - curvature_delta / 180.0, 0.0, 1.0))
+
+            symmetry_score = 0.0
+            if symmetry_axis is not None:
+                center, axis = symmetry_axis
+                reflected_a = _reflect_point_on_axis(a.point, center, axis)
+                sym_err = float(np.linalg.norm(reflected_a - b.point))
+                symmetry_score = float(np.exp(-sym_err / (0.5 * max_dist + 1e-6)))
+
+            penalty = (
+                cfg.proximity_weight * (1.0 - proximity)
+                + cfg.continuation_weight * (1.0 - continuation)
+                + cfg.curvature_weight * (1.0 - curvature_score)
+                + cfg.symmetry_weight * (1.0 - symmetry_score)
+            )
+            confidence = float(np.clip(1.0 - penalty, 0.0, 1.0))
+            if confidence < cfg.min_confidence:
+                continue
+
+            same_path = a.path_index == b.path_index
+            gap_kind = "single_contour_gap" if same_path else "bridge"
+
+            efd_ready = same_path and (a.path_index in efd_data)
+            if gap_kind == "single_contour_gap" and efd_ready and confidence >= cfg.efd_confidence_threshold:
+                method = "efd"
+            elif gap_kind == "single_contour_gap" and symmetry_score >= cfg.symmetry_confidence_threshold:
+                method = "symmetry"
+            else:
+                method = "bezier"
+
+            reasons = [
+                f"distance={dist:.2f}",
+                f"align=({align_a:.2f},{align_b:.2f})",
+                f"curv_delta={curvature_delta:.1f}",
             ]
+            if method == "efd":
+                reasons.append("single_gap_with_efd_support")
+            elif method == "symmetry":
+                reasons.append("single_gap_symmetry_fallback")
 
-            for pt_a, pt_b, t_a, t_b, id_a, id_b, ep_a, ep_b in pairings:
-                d = float(np.linalg.norm(pt_a - pt_b))
-                # Skip already-connected endpoints and out-of-range gaps
-                if d < cfg.min_gap_px or d > cfg.max_gap_distance:
-                    continue
-                dot = float(np.clip(np.dot(t_a, t_b), -1.0, 1.0))
-                angle_deg = float(np.degrees(np.arccos(abs(dot))))
-                records.append(
-                    GapRecord(
-                        path_id_a=id_a,
-                        path_id_b=id_b,
-                        gap_dist=d,
-                        tangent_angle_deg=angle_deg,
-                        endpoint_a=ep_a,
-                        endpoint_b=ep_b,
-                    )
+            candidates.append(
+                GapRecord(
+                    gap_id=gap_id,
+                    endpoint_a_id=a.endpoint_id,
+                    endpoint_b_id=b.endpoint_id,
+                    path_a=a.path_index,
+                    path_b=b.path_index,
+                    distance=dist,
+                    angle_a_deg=angle_a,
+                    angle_b_deg=angle_b,
+                    curvature_delta_deg=curvature_delta,
+                    continuation_score=continuation,
+                    proximity_score=proximity,
+                    symmetry_score=symmetry_score,
+                    geometric_score=penalty,
+                    confidence=confidence,
+                    gap_kind=gap_kind,
+                    suggested_method=method,
+                    is_forced=False,
+                    reasons=reasons,
                 )
-
-    logger.debug("Extracted %d endpoint gaps from %d paths", len(records), len(paths))
-    return records
-
-
-def extract_curvature_profile(
-    segment: BezierSegment,
-    n: int = 50,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute the discrete curvature profile κ(t) of a cubic Bézier segment.
-
-    Uses the cross-product formula:
-        κ(t) = |r′(t) × r″(t)| / |r′(t)|³
-
-    Parameters
-    ----------
-    segment : BezierSegment
-        A single cubic Bézier segment.
-    n : int
-        Number of evaluation points.
-
-    Returns
-    -------
-    t_vals : np.ndarray, shape (n,)
-        Parameter values.
-    curvatures : np.ndarray, shape (n,)
-        Signed curvature at each *t*.
-
-    Examples
-    --------
-    >>> cp = np.array([[0,0],[1,0],[2,0],[3,0]], dtype=np.float64)
-    >>> seg = BezierSegment(cp)
-    >>> ts, ks = extract_curvature_profile(seg, n=10)
-    >>> ts.shape == (10,)
-    True
-    """
-    cp = segment.control_points.astype(np.float64)  # (4, 2)
-
-    # First derivative control points d1 = 3*(P_{i+1} - P_i)
-    d1_cp = 3.0 * np.diff(cp, axis=0)  # (3, 2)
-    # Second derivative control points d2 = 2*(d1_{i+1} - d1_i)  (quadratic → linear)
-    d2_cp = 2.0 * np.diff(d1_cp, axis=0)  # (2, 2)
-
-    t_vals = np.linspace(0.0, 1.0, n, dtype=np.float64)
-    u = 1.0 - t_vals
-
-    # Evaluate first derivative (quadratic Bézier on d1_cp)
-    r1 = (
-        (u ** 2)[:, None] * d1_cp[0]
-        + 2.0 * u[:, None] * t_vals[:, None] * d1_cp[1]
-        + (t_vals ** 2)[:, None] * d1_cp[2]
-    )  # (n, 2)
-
-    # Evaluate second derivative (linear on d2_cp)
-    r2 = u[:, None] * d2_cp[0] + t_vals[:, None] * d2_cp[1]  # (n, 2)
-
-    # 2-D cross product (scalar)
-    cross = r1[:, 0] * r2[:, 1] - r1[:, 1] * r2[:, 0]  # (n,)
-    speed = np.linalg.norm(r1, axis=1)  # (n,)
-    speed_cubed = speed ** 3
-
-    curvatures = np.zeros(n, dtype=np.float64)
-    valid = speed_cubed > 1e-12
-    curvatures[valid] = cross[valid] / speed_cubed[valid]
-
-    return t_vals, curvatures
-
-
-def classify_segment_type(
-    curvatures: np.ndarray,
-    config: Optional[FeatureBridgeConfig] = None,
-) -> str:
-    """Classify a curvature profile into a named segment type.
-
-    Parameters
-    ----------
-    curvatures : np.ndarray
-        1-D curvature samples (from :func:`extract_curvature_profile`).
-    config : FeatureBridgeConfig, optional
-
-    Returns
-    -------
-    str
-        One of ``'straight'``, ``'arch'``, ``'ogee'``, ``'s-curve'``.
-
-    Examples
-    --------
-    >>> classify_segment_type(np.zeros(50))
-    'straight'
-    """
-    cfg = config or FeatureBridgeConfig()
-    abs_k = np.abs(curvatures)
-    mean_k = float(np.mean(abs_k))
-
-    if mean_k < cfg.curvature_straight_threshold:
-        return "straight"
-
-    # Count sign changes
-    nonzero = curvatures[np.abs(curvatures) > 1e-9]
-    if len(nonzero) < 2:
-        return "arch"
-
-    signs = np.sign(nonzero)
-    sign_changes = int(np.sum(np.abs(np.diff(signs)) > 0))
-
-    # Fraction of dominant sign
-    positive_frac = float(np.mean(signs > 0))
-    dominant_frac = max(positive_frac, 1.0 - positive_frac)
-
-    if dominant_frac >= cfg.curvature_arch_sign_ratio and sign_changes <= 2:
-        return "arch"
-    elif sign_changes == 1:
-        return "ogee"
-    else:
-        return "s-curve"
-
-
-def detect_symmetry_axis(
-    paths: List[BezierPath],
-    config: Optional[FeatureBridgeConfig] = None,
-) -> Optional[Axis]:
-    """Test candidate axes and return the best reflection-symmetry axis.
-
-    Candidates: vertical (90°), horizontal (0°), ±45°, PCA major axis.
-
-    Parameters
-    ----------
-    paths : List[BezierPath]
-    config : FeatureBridgeConfig, optional
-
-    Returns
-    -------
-    Optional[Axis]
-        Best axis if its residual is below *symmetry_tolerance*, else *None*.
-
-    Examples
-    --------
-    >>> from bezier_curves.bezier import BezierSegment, BezierPath
-    >>> seg = BezierSegment(np.array([[0,0],[1,1],[2,1],[3,0]], dtype=np.float64))
-    >>> detect_symmetry_axis([BezierPath([seg])]) is not None or True
-    True
-    """
-    cfg = config or FeatureBridgeConfig()
-
-    # Build combined point cloud
-    all_pts: List[np.ndarray] = []
-    for p in paths:
-        if p.segments:
-            all_pts.append(p.sample(cfg.sample_pts_per_segment))
-    if not all_pts:
-        return None
-
-    cloud = np.vstack(all_pts).astype(np.float64)
-    centroid = cloud.mean(axis=0)
-
-    # PCA axis
-    centered = cloud - centroid
-    cov = np.cov(centered.T)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    pca_axis_vec = eigvecs[:, np.argmax(eigvals)]
-    pca_angle = float(np.degrees(np.arctan2(pca_axis_vec[1], pca_axis_vec[0])))
-
-    candidate_angles = [90.0, 0.0, 45.0, -45.0, pca_angle]
-    best: Optional[Axis] = None
-
-    from scipy.spatial import cKDTree  # local import for optional dep
-
-    for angle_deg in candidate_angles:
-        theta = np.radians(angle_deg)
-        cos2 = np.cos(2 * theta)
-        sin2 = np.sin(2 * theta)
-        reflection_matrix = np.array(
-            [[cos2, sin2], [sin2, -cos2]], dtype=np.float64
-        )
-        reflected = (reflection_matrix @ centered.T).T + centroid
-
-        tree = cKDTree(cloud)
-        dists, _ = tree.query(reflected, k=1)
-        residual = float(np.mean(dists))
-
-        if best is None or residual < best.residual:
-            best = Axis(angle_deg=angle_deg, origin=centroid.copy(), residual=residual)
-
-    if best is not None and best.residual > cfg.symmetry_tolerance:
-        logger.debug(
-            "Best symmetry axis residual %.2f exceeds tolerance %.2f",
-            best.residual,
-            cfg.symmetry_tolerance,
-        )
-        return None
-
-    return best
-
-
-def compute_efd_distance(
-    coeffs_a: np.ndarray,
-    coeffs_b: np.ndarray,
-) -> float:
-    """Compute L2 distance in normalised EFD coefficient space.
-
-    Parameters
-    ----------
-    coeffs_a, coeffs_b : np.ndarray
-        Flat 1-D normalised EFD feature vectors (from ``compute_efd_features``).
-
-    Returns
-    -------
-    float
-        Euclidean distance.
-
-    Examples
-    --------
-    >>> a = np.ones(37, dtype=np.float64)
-    >>> compute_efd_distance(a, a)
-    0.0
-    """
-    a = np.asarray(coeffs_a, dtype=np.float64).ravel()
-    b = np.asarray(coeffs_b, dtype=np.float64).ravel()
-    min_len = min(len(a), len(b))
-    return float(np.linalg.norm(a[:min_len] - b[:min_len]))
-
-
-def detect_periodicity(
-    paths: List[BezierPath],
-    scan_axis: str = "x",
-    config: Optional[FeatureBridgeConfig] = None,
-) -> Optional[Period]:
-    """Detect periodic repetition along a scan axis via FFT on centroid projections.
-
-    Parameters
-    ----------
-    paths : List[BezierPath]
-    scan_axis : str
-        ``'x'`` or ``'y'``.
-    config : FeatureBridgeConfig, optional
-
-    Returns
-    -------
-    Optional[Period]
-        Detected period if periodic structure is found, else *None*.
-
-    Examples
-    --------
-    >>> detect_periodicity([], scan_axis='x') is None
-    True
-    """
-    cfg = config or FeatureBridgeConfig()
-    if len(paths) < cfg.periodicity_min_peaks:
-        return None
-
-    axis_idx = 0 if scan_axis.lower() == "x" else 1
-    centroids: List[float] = []
-
-    for p in paths:
-        pts = p.sample(cfg.sample_pts_per_segment)
-        if len(pts) == 0:
-            continue
-        centroids.append(float(pts[:, axis_idx].mean()))
-
-    if len(centroids) < cfg.periodicity_min_peaks:
-        return None
-
-    positions = np.sort(np.array(centroids, dtype=np.float64))
-    spacings = np.diff(positions)
-    if len(spacings) < 2:
-        return None
-
-    # FFT on spacing signal
-    fft_vals = np.abs(np.fft.rfft(spacings - spacings.mean()))
-    if len(fft_vals) < 2:
-        return None
-
-    fft_vals[0] = 0.0  # ignore DC
-    max_val = fft_vals.max()
-    if max_val < 1e-12:
-        return None
-
-    fft_norm = fft_vals / max_val
-
-    from scipy.signal import find_peaks  # local import
-
-    peaks, properties = find_peaks(fft_norm, prominence=cfg.periodicity_prominence)
-
-    if len(peaks) == 0:
-        # Fallback: use median spacing
-        median_spacing = float(np.median(spacings))
-        std_spacing = float(np.std(spacings))
-        if std_spacing / (median_spacing + 1e-12) < 0.3:
-            return Period(
-                period_px=median_spacing,
-                axis=scan_axis,
-                centroid_positions=positions,
             )
-        return None
+            gap_id += 1
 
-    dominant_freq_idx = peaks[np.argmax(fft_norm[peaks])]
-    period_samples = len(spacings) / dominant_freq_idx
-    period_px = float(period_samples * np.mean(spacings))
-
-    return Period(period_px=period_px, axis=scan_axis, centroid_positions=positions)
+    return candidates
 
 
-def build_skeleton_graph(
-    binary_img: np.ndarray,
-    config: Optional[FeatureBridgeConfig] = None,
-) -> nx.Graph:
-    """Build a NetworkX graph from a binary skeleton image.
+def _select_non_conflicting(candidates: List[GapRecord], cfg: FeatureBridgeConfig) -> List[GapRecord]:
+    if not candidates:
+        return []
 
-    Parameters
-    ----------
-    binary_img : np.ndarray
-        Binary uint8 image (0 / 255).
-    config : FeatureBridgeConfig, optional
+    ranked = sorted(
+        candidates,
+        key=lambda c: (
+            -c.confidence,
+            c.geometric_score,
+            c.distance,
+            c.angle_a_deg + c.angle_b_deg,
+        ),
+    )
 
-    Returns
-    -------
-    nx.Graph
-        Nodes carry ``'o'`` (y, x) position; edges carry ``'pts'`` pixel paths.
+    if not cfg.enforce_endpoint_uniqueness:
+        return ranked
 
-    Examples
-    --------
-    >>> img = np.zeros((100, 100), dtype=np.uint8)
-    >>> g = build_skeleton_graph(img)
-    >>> isinstance(g, nx.Graph)
-    True
-    """
-    cfg = config or FeatureBridgeConfig()
-    if sknw is None:
-        logger.warning("sknw not installed — returning empty graph")
-        return nx.Graph()
+    selected: List[GapRecord] = []
+    used_endpoints: set = set()
+    for cand in ranked:
+        if cand.endpoint_a_id in used_endpoints or cand.endpoint_b_id in used_endpoints:
+            continue
+        selected.append(cand)
+        used_endpoints.add(cand.endpoint_a_id)
+        used_endpoints.add(cand.endpoint_b_id)
 
-    # Ensure binary 0/1
-    binary_01 = (binary_img > 0).astype(np.uint8)
-    skeleton = skeletonize(binary_01).astype(np.uint8)
+    return selected
 
-    graph = sknw.build_sknw(skeleton)
 
-    # Filter short edges, supporting both Graph and MultiGraph-like outputs.
-    edges_to_remove = []
-    if graph.is_multigraph():
-        for s, e, key, data in graph.edges(keys=True, data=True):
-            pts = data.get("pts", np.empty((0, 2)))
-            if len(pts) < cfg.skeleton_min_edge_length:
-                edges_to_remove.append((s, e, key))
-        for s, e, key in edges_to_remove:
-            graph.remove_edge(s, e, key=key)
-    else:
-        for s, e, data in graph.edges(data=True):
-            pts = data.get("pts", np.empty((0, 2)))
-            if len(pts) < cfg.skeleton_min_edge_length:
-                edges_to_remove.append((s, e))
-        for s, e in edges_to_remove:
-            graph.remove_edge(s, e)
+def _build_forced_candidates(
+    endpoints: List[EndpointRecord],
+    selected: List[GapRecord],
+    adjacency: Dict[int, set],
+    image_diag: float,
+) -> List[GapRecord]:
+    used: set = set()
+    for cand in selected:
+        used.add(cand.endpoint_a_id)
+        used.add(cand.endpoint_b_id)
 
-    # Remove isolated nodes left behind
-    isolated = [n for n in graph.nodes() if graph.degree(n) == 0]
-    graph.remove_nodes_from(isolated)
+    id_to_endpoint = {ep.endpoint_id: ep for ep in endpoints}
+    unmatched = [ep for ep in endpoints if ep.endpoint_id not in used]
+    if len(unmatched) < 2:
+        return []
 
-    return nx.Graph(graph)  # collapse MultiGraph → Graph
+    max_dist = max(6.0, 0.16 * image_diag)
+    forced: List[GapRecord] = []
+    next_id = max((c.gap_id for c in selected), default=-1) + 1
+
+    # Greedy relaxed pairing among remaining endpoints.
+    while len(unmatched) >= 2:
+        best = None
+        best_score = float("inf")
+
+        for i in range(len(unmatched)):
+            a = unmatched[i]
+            for j in range(i + 1, len(unmatched)):
+                b = unmatched[j]
+                if b.path_index in adjacency.get(a.path_index, set()):
+                    continue
+
+                vec = b.point - a.point
+                dist = float(np.linalg.norm(vec))
+                if dist < 1e-9 or dist > max_dist:
+                    continue
+
+                unit = vec / dist
+                angle_a = _angle_deg(a.outward_tangent, unit)
+                angle_b = _angle_deg(b.outward_tangent, -unit)
+                score = dist + 0.35 * (angle_a + angle_b)
+                if score < best_score:
+                    best_score = score
+                    best = (i, j, dist, angle_a, angle_b)
+
+        if best is None:
+            break
+
+        i, j, dist, angle_a, angle_b = best
+        a = unmatched[i]
+        b = unmatched[j]
+
+        # Remove larger index first to avoid index shift.
+        unmatched.pop(j)
+        unmatched.pop(i)
+
+        curvature_delta = abs(a.curvature_deg - b.curvature_deg)
+        confidence = float(np.clip(0.25 - dist / (2.0 * max_dist), 0.05, 0.25))
+        forced.append(
+            GapRecord(
+                gap_id=next_id,
+                endpoint_a_id=a.endpoint_id,
+                endpoint_b_id=b.endpoint_id,
+                path_a=a.path_index,
+                path_b=b.path_index,
+                distance=dist,
+                angle_a_deg=angle_a,
+                angle_b_deg=angle_b,
+                curvature_delta_deg=curvature_delta,
+                continuation_score=0.0,
+                proximity_score=float(np.clip(1.0 - dist / max_dist, 0.0, 1.0)),
+                symmetry_score=0.0,
+                geometric_score=1.0 - confidence,
+                confidence=confidence,
+                gap_kind="bridge" if a.path_index != b.path_index else "single_contour_gap",
+                suggested_method="bezier",
+                is_forced=True,
+                reasons=["forced_best_effort", f"distance={dist:.2f}"],
+            )
+        )
+        next_id += 1
+
+    # Keep deterministic ordering.
+    return sorted(forced, key=lambda g: g.gap_id)
 
 
 def extract_all_features(
     paths: List[BezierPath],
-    efd_data: Optional[Dict[int, np.ndarray]] = None,
-    binary_img: Optional[np.ndarray] = None,
+    efd_data: Dict[int, np.ndarray],
     config: Optional[FeatureBridgeConfig] = None,
     adjacency: Optional[Dict[int, set]] = None,
 ) -> FeatureBundle:
-    """Orchestrate all feature extraction routines.
+    """Extract endpoints and scored gap candidates.
 
-    Parameters
-    ----------
-    paths : List[BezierPath]
-    efd_data : dict, optional
-        Mapping path-index → raw (order×4) EFD coefficient array.
-    binary_img : np.ndarray, optional
-        Skeleton source image.
-    config : FeatureBridgeConfig, optional
-    adjacency : dict, optional
-        Mapping path_id → set of connected path_ids (from skeleton).
-
-    Returns
-    -------
-    FeatureBundle
-        All features aggregated.
-
-    Examples
-    --------
-    >>> fb = extract_all_features([])
-    >>> isinstance(fb, FeatureBundle)
-    True
+    This stage enforces strict directional validity for primary candidates,
+    then optionally adds low-confidence forced connections so no endpoint is
+    left unconsidered.
     """
     cfg = config or FeatureBridgeConfig()
-    bundle = FeatureBundle()
+    adj = adjacency or {}
 
-    # 1. Endpoint gaps
-    try:
-        bundle.gaps = extract_endpoint_gaps(paths, cfg, adjacency=adjacency)
-    except Exception as exc:
-        logger.error("Gap extraction failed: %s", exc)
+    endpoints = _extract_endpoints(paths)
+    if not endpoints:
+        return FeatureBundle(endpoints=[], gaps=[], symmetry_axis=None, global_symmetry_confidence=0.0)
 
-    # 2. Curvature profiles & segment classification
-    for pid, path in enumerate(paths):
-        seg_types: List[str] = []
-        profiles: List[Tuple[np.ndarray, np.ndarray]] = []
-        for seg_idx, seg in enumerate(path.segments):
-            try:
-                ts, ks = extract_curvature_profile(seg, cfg.curvature_samples)
-                profiles.append((ts, ks))
-                seg_types.append(classify_segment_type(ks, cfg))
-            except Exception as exc:
-                logger.error("Curvature extraction failed for path %d seg %d: %s", pid, seg_idx, exc)
-                seg_types.append("unknown")
-        # Store the last profile under pid for backward compat,
-        # but also expose all profiles
-        if profiles:
-            bundle.curvature_profiles[pid] = profiles[-1]
-        bundle.segment_types[pid] = seg_types
+    all_pts = np.vstack([ep.point for ep in endpoints])
+    image_diag = float(np.linalg.norm(all_pts.max(axis=0) - all_pts.min(axis=0))) + 1e-6
 
-    # 3. Symmetry axis
-    try:
-        bundle.symmetry_axis = detect_symmetry_axis(paths, cfg)
-    except Exception as exc:
-        logger.error("Symmetry detection failed: %s", exc)
-
-    # 4. EFD features
-    if efd_data:
-        for pid, coeffs in efd_data.items():
-            try:
-                flat = coeffs.flatten()
-                bundle.efd_features[pid] = flat
-            except Exception as exc:
-                logger.error("EFD feature extraction failed for %d: %s", pid, exc)
-
-    # 5. Periodicity
-    try:
-        per_x = detect_periodicity(paths, scan_axis="x", config=cfg)
-        per_y = detect_periodicity(paths, scan_axis="y", config=cfg)
-        if per_x is not None and per_y is not None:
-            bundle.periodicity = per_x if per_x.period_px > 0 else per_y
-        else:
-            bundle.periodicity = per_x or per_y
-    except Exception as exc:
-        logger.error("Periodicity detection failed: %s", exc)
-
-    # 6. Skeleton graph
-    if binary_img is not None:
-        try:
-            bundle.skeleton_graph = build_skeleton_graph(binary_img, cfg)
-        except Exception as exc:
-            logger.error("Skeleton graph construction failed: %s", exc)
-
-    logger.info(
-        "Feature extraction complete: %d gaps, %d curvature profiles, symmetry=%s, periodicity=%s",
-        len(bundle.gaps),
-        len(bundle.curvature_profiles),
-        bundle.symmetry_axis is not None,
-        bundle.periodicity is not None,
+    symmetry_axis, symmetry_conf = _estimate_global_symmetry(paths)
+    candidates = _build_initial_candidates(
+        endpoints=endpoints,
+        adjacency=adj,
+        cfg=cfg,
+        symmetry_axis=symmetry_axis,
+        efd_data=efd_data,
+        image_diag=image_diag,
     )
-    return bundle
+
+    selected = _select_non_conflicting(candidates, cfg)
+
+    if cfg.force_connect_unmatched:
+        forced = _build_forced_candidates(endpoints, selected, adj, image_diag)
+        selected.extend(forced)
+
+    selected = sorted(selected, key=lambda g: (-g.confidence, g.gap_id))
+    for idx, gap in enumerate(selected):
+        gap.gap_id = idx
+
+    return FeatureBundle(
+        endpoints=endpoints,
+        gaps=selected,
+        symmetry_axis=symmetry_axis,
+        global_symmetry_confidence=symmetry_conf,
+    )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ASP fact serialisation (replaces the former Gestalt Engine R-2)
-# ═══════════════════════════════════════════════════════════════════════════
+def serialize_features_to_asp(features: FeatureBundle, paths: List[BezierPath]) -> str:
+    """Serialize extracted geometry features as ASP facts."""
+    lines: List[str] = []
 
-def _asp_int(v: float) -> int:
-    """Scale a float to integer (×100) for ASP predicates."""
-    return int(round(v * 100))
+    lines.append(f"num_paths({len(paths)}).")
+    lines.append(f"num_endpoints({len(features.endpoints)}).")
 
-
-def serialize_features_to_asp(
-    bundle: FeatureBundle,
-    paths: Optional[List[BezierPath]] = None,
-    config: Optional[FeatureBridgeConfig] = None,
-) -> str:
-    """Convert a :class:`FeatureBundle` directly into ASP fact strings.
-
-    This lightweight serialisation replaces the former Gestalt Engine
-    (R-2), mapping R-1 geometric features straight to Clingo-compatible
-    predicates without expensive persistent-homology computations.
-
-    Mapping
-    -------
-    * ``gaps``          → ``continues(A,B,Gap,Angle,Conf).``
-    * open paths        → ``closure(C,Conf,Persistence).``
-    * ``symmetry_axis`` → ``symmetric(0,Axis,Residual,Conf).`` + ``member(E,0).``
-    * ``efd_features``  → ``similar_shape(A,B,Dist,Conf).``  (pairwise)
-    * ``periodicity``   → ``periodic_pattern(...)`` + ``expected_position(...)``
-
-    Parameters
-    ----------
-    bundle : FeatureBundle
-        Pre-computed features from :func:`extract_all_features`.
-    paths : List[BezierPath], optional
-        Original paths — used to emit ``closure()`` for open contours and
-        ``member()`` predicates.
-
-    Returns
-    -------
-    str
-        Multi-line ASP facts ready for Clingo.
-
-    Examples
-    --------
-    >>> s = serialize_features_to_asp(FeatureBundle())
-    >>> isinstance(s, str)
-    True
-    """
-    cfg = config or FeatureBridgeConfig()
-    _paths: List[BezierPath] = paths or []
-    lines: List[str] = ["%% Auto-generated feature facts"]
-
-    # ── Closure: open contours with nearby endpoints ─────────────────────
-    # Every open path is a candidate; confidence from gap distance if a
-    # matching gap exists, else a baseline 0.60.
-    gap_lookup: Dict[int, float] = {}
-    for g in bundle.gaps:
-        # Track best (smallest) gap per path as a closure clue
-        cur = gap_lookup.get(g.path_id_a, float("inf"))
-        if g.gap_dist < cur:
-            gap_lookup[g.path_id_a] = g.gap_dist
-        cur_b = gap_lookup.get(g.path_id_b, float("inf"))
-        if g.gap_dist < cur_b:
-            gap_lookup[g.path_id_b] = g.gap_dist
-
-    for pid, path in enumerate(_paths):
-        if not path.is_closed and path.segments:
-            start = path.segments[0].control_points[0]
-            end = path.segments[-1].control_points[3]
-            self_gap = float(np.linalg.norm(end - start))
-            # Skip paths whose endpoints are already effectively closed
-            if self_gap < cfg.min_closure_gap:
-                continue
-            # Confidence: closer endpoints → higher confidence
-            max_gap = cfg.max_gap_distance
-            conf = max(0.0, 1.0 - self_gap / max_gap)
-            if conf >= 0.20:
-                persistence = _asp_int(self_gap)
-                lines.append(
-                    f"closure({pid},{_asp_int(conf)},{persistence})."
-                )
-
-    # ── Good continuation: from endpoint gaps ────────────────────────────
-    for g in bundle.gaps:
-        max_gap = cfg.max_gap_distance * 0.4
-        max_angle = 30.0
-        dist_score = max(0.0, 1.0 - g.gap_dist / max_gap)
-        angle_score = max(0.0, 1.0 - g.tangent_angle_deg / max_angle)
-        conf = dist_score * angle_score
-        # Encode endpoint labels: start=0, end=1
-        ep_a_int = 0 if g.endpoint_a == "start" else 1
-        ep_b_int = 0 if g.endpoint_b == "start" else 1
-        if conf >= 0.20:
-            lines.append(
-                f"continues({g.path_id_a},{g.path_id_b},"
-                f"{ep_a_int},{ep_b_int},"
-                f"{_asp_int(g.gap_dist)},{_asp_int(g.tangent_angle_deg)},"
-                f"{_asp_int(conf)})."
-            )
-
-    # ── Symmetry ─────────────────────────────────────────────────────────
-    if bundle.symmetry_axis is not None:
-        ax = bundle.symmetry_axis
-        conf = max(0.0, 1.0 - ax.residual / 10.0)
+    for ep in features.endpoints:
+        eid = f"e{ep.endpoint_id}"
+        etype = "start" if ep.endpoint_type == "start" else "end"
+        x_i = int(round(float(ep.point[0])))
+        y_i = int(round(float(ep.point[1])))
+        tx_i = int(round(float(ep.outward_tangent[0]) * 1000.0))
+        ty_i = int(round(float(ep.outward_tangent[1]) * 1000.0))
+        curv_i = int(round(float(ep.curvature_deg) * 1000.0))
         lines.append(
-            f"symmetric(0,{_asp_int(ax.angle_deg)},"
-            f"{_asp_int(ax.residual)},{_asp_int(conf)})."
+            f"endpoint({eid},{ep.path_index},{etype},{x_i},{y_i})."
         )
-        for pid in range(len(_paths)):
-            lines.append(f"member({pid},0).")
+        lines.append(f"endpoint_tangent({eid},{tx_i},{ty_i}).")
+        lines.append(f"endpoint_curvature({eid},{curv_i}).")
 
-    # ── Proximity: emit member predicates grouped by a simple threshold ──
-    if len(_paths) >= 2:
-        centroids = []
-        for p in _paths:
-            pts = p.sample(20)
-            if len(pts) > 0:
-                centroids.append(pts.mean(axis=0))
-            else:
-                centroids.append(np.zeros(2, dtype=np.float64))
-
-        # Single group containing all paths (simplest proximity)
+    if features.symmetry_axis is not None:
+        center, axis = features.symmetry_axis
+        cx_i = int(round(float(center[0]) * 1000.0))
+        cy_i = int(round(float(center[1]) * 1000.0))
+        ax_i = int(round(float(axis[0]) * 1000000.0))
+        ay_i = int(round(float(axis[1]) * 1000000.0))
+        sym_i = int(round(float(features.global_symmetry_confidence) * 1000.0))
         lines.append(
-            f"proximity_group(0,0,{len(_paths)})."
+            f"symmetry_axis({cx_i},{cy_i},{ax_i},{ay_i})."
         )
-        # member predicates already emitted under symmetry if present;
-        # only emit if not already done
-        if bundle.symmetry_axis is None:
-            for pid in range(len(_paths)):
-                lines.append(f"member({pid},0).")
+        lines.append(f"symmetry_confidence({sym_i}).")
 
-    # ── Similarity: pairwise EFD distance ────────────────────────────────
-    if bundle.efd_features:
-        ids = sorted(bundle.efd_features.keys())
-        feats = {k: np.asarray(v, dtype=np.float64).ravel()
-                 for k, v in bundle.efd_features.items()
-                 if v is not None}
-        for i in range(len(ids)):
-            for j in range(i + 1, len(ids)):
-                a_id, b_id = ids[i], ids[j]
-                if a_id not in feats or b_id not in feats:
-                    continue
-                d = compute_efd_distance(feats[a_id], feats[b_id])
-                max_d = max(
-                    np.linalg.norm(feats[a_id]),
-                    np.linalg.norm(feats[b_id]),
-                    1e-12,
-                )
-                conf = max(0.0, 1.0 - d / max_d)
-                if conf > 0.50:
-                    lines.append(
-                        f"similar_shape({a_id},{b_id},"
-                        f"{_asp_int(d)},{_asp_int(conf)})."
-                    )
+    for gap in features.gaps:
+        gid = f"g{gap.gap_id}"
+        e1 = f"e{gap.endpoint_a_id}"
+        e2 = f"e{gap.endpoint_b_id}"
+        kind_atom = "single_gap" if gap.gap_kind == "single_contour_gap" else "bridge"
+        method_atom = gap.suggested_method
+        conf1000 = int(round(gap.confidence * 1000.0))
+        dist1000 = int(round(gap.distance * 1000.0))
+        angle_a1000 = int(round(gap.angle_a_deg * 1000.0))
+        angle_b1000 = int(round(gap.angle_b_deg * 1000.0))
 
-    # ── Periodicity ──────────────────────────────────────────────────────
-    if bundle.periodicity is not None:
-        per = bundle.periodicity
-        # Emit periodic_pattern and expected_position for each gap
-        positions = per.centroid_positions
-        for idx in range(len(positions)):
-            lines.append(
-                f"frieze_element({idx})."
-            )
-            lines.append(
-                f"periodic_pattern({idx},identity,{per.axis})."
-            )
-            expected_next = float(positions[idx]) + per.period_px
-            lines.append(
-                f"expected_position({idx},identity,{_asp_int(expected_next)})."
-            )
+        lines.append(f"candidate({gid},{e1},{e2}).")
+        lines.append(f"candidate_paths({gid},{gap.path_a},{gap.path_b}).")
+        lines.append(f"candidate_kind({gid},{kind_atom}).")
+        lines.append(f"candidate_method_hint({gid},{method_atom}).")
+        lines.append(f"candidate_confidence({gid},{conf1000}).")
+        lines.append(f"candidate_weight({gid},{conf1000}).")
+        lines.append(f"candidate_distance({gid},{dist1000}).")
+        lines.append(f"candidate_angle({gid},{angle_a1000},{angle_b1000}).")
+        if gap.is_forced:
+            lines.append(f"candidate_forced({gid}).")
 
-    # ── Pragnanz facts: simple interpretation triggers ───────────────────
-    for pid, stypes in bundle.segment_types.items():
-        if any(t in ("arch", "loop") for t in stypes):
-            lines.append(f"pragnanz({pid},arch,75).")
-        elif all(t == "straight" for t in stypes) and stypes:
-            lines.append(f"pragnanz({pid},line,80).")
-
-    logger.info("Serialised %d ASP fact lines from features", len(lines) - 1)
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n"
