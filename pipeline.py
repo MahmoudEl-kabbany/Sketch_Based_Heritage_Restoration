@@ -27,7 +27,12 @@ _PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from bezier_curves.bezier import BezierPath, fit_from_image, fit_from_image_skeleton
+from bezier_curves.bezier import (
+    BezierPath,
+    fit_from_image,
+    fit_from_image_skeleton,
+    merge_nearby_paths,
+)
 from eliptic_fourier_descriptors.efd import (
     compute_efd_features,
     extract_efd_from_image,
@@ -72,6 +77,11 @@ class PipelineConfig:
     use_skeleton: bool = True
     min_contour_area: float = 100.0
     max_bezier_error: float = 5.0
+    bezier_tangent_lookahead: int = 8
+    skeleton_merge_radius: float = 12.0
+    enable_skeleton_path_merge: bool = True
+    skeleton_gap_threshold: float = 30.0
+    skeleton_angle_threshold_deg: float = 48.0
     efd_order: int = 10
 
     # Feature bridge
@@ -141,12 +151,32 @@ def restore(
 
     adjacency: Dict[int, set] = {}
     if cfg.use_skeleton:
-        paths, adjacency = fit_from_image_skeleton(image_path, max_error=cfg.max_bezier_error)
+        paths, adjacency = fit_from_image_skeleton(
+            image_path,
+            max_error=cfg.max_bezier_error,
+            tangent_lookahead=cfg.bezier_tangent_lookahead,
+            merge_radius=cfg.skeleton_merge_radius,
+        )
+        if cfg.enable_skeleton_path_merge and len(paths) > 1:
+            before_merge = len(paths)
+            paths = merge_nearby_paths(
+                paths,
+                gap_threshold=cfg.skeleton_gap_threshold,
+                angle_threshold_deg=cfg.skeleton_angle_threshold_deg,
+            )
+            logger.info(
+                "  -> merged skeleton paths: %d -> %d",
+                before_merge,
+                len(paths),
+            )
+            # Path indices change after merging, so downstream gets fresh adjacency.
+            adjacency = {}
     else:
         paths = fit_from_image(
             image_path,
             min_contour_area=cfg.min_contour_area,
             max_error=cfg.max_bezier_error,
+            tangent_lookahead=cfg.bezier_tangent_lookahead,
         )
     logger.info("  -> %d Bézier paths extracted", len(paths))
 
@@ -304,11 +334,22 @@ def main() -> None:
     parser.add_argument("--vocab", default="", help="Shape vocabulary directory")
     parser.add_argument("--output", default="restoration_output", help="Output directory")
     parser.add_argument("--efd-order", type=int, default=40, help="EFD harmonic order")
+    parser.add_argument("--tangent-lookahead", type=int, default=8, help="Bezier tangent lookahead")
+    parser.add_argument("--skeleton-merge-radius", type=float, default=12.0, help="Endpoint snap radius in skeleton mode")
+    parser.add_argument("--skeleton-gap-threshold", type=float, default=30.0, help="Gap threshold for post-merge")
+    parser.add_argument("--skeleton-angle-threshold", type=float, default=48.0, help="Angle threshold (deg) for post-merge")
+    parser.add_argument("--no-path-merge", action="store_false", dest="path_merge", help="Disable merge_nearby_paths post-processing")
     parser.set_defaults(skeleton=True)
+    parser.set_defaults(path_merge=True)
     args = parser.parse_args()
 
     cfg = PipelineConfig(
         use_skeleton=args.skeleton,
+        bezier_tangent_lookahead=args.tangent_lookahead,
+        skeleton_merge_radius=args.skeleton_merge_radius,
+        enable_skeleton_path_merge=args.path_merge,
+        skeleton_gap_threshold=args.skeleton_gap_threshold,
+        skeleton_angle_threshold_deg=args.skeleton_angle_threshold,
         efd_order=args.efd_order,
         shape_vocab_dir=args.vocab,
         output_dir=args.output,
