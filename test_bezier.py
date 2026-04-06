@@ -25,13 +25,6 @@ def process_image(
     max_error: float = 5.0,
     follow_junction_continuation: bool = True,
     junction_min_alignment: float = -0.30,
-    junction_min_score_margin: float = 0.04,
-    enable_path_merging: bool = True,
-    path_merge_gap_threshold: float = 18.0,
-    path_merge_min_alignment: float = -0.20,
-    path_merge_min_consistency: float = -0.25,
-    path_merge_max_score: float = 20.0,
-    path_merge_create_bridge: bool = True,
     save_visualization: bool = True,
 ) -> List[BezierPath]:
     """
@@ -44,13 +37,6 @@ def process_image(
         max_error: Maximum fitting error threshold for Bezier approximation
         follow_junction_continuation: Continue through junction using best direction
         junction_min_alignment: Minimum dot-product alignment for junction continuation
-        junction_min_score_margin: Minimum score margin to accept junction continuation
-        enable_path_merging: Enable post-fit path concatenation
-        path_merge_gap_threshold: Maximum endpoint distance allowed for path merging
-        path_merge_min_alignment: Minimum endpoint-vs-gap alignment for merge candidate
-        path_merge_min_consistency: Minimum directional continuity between connected paths
-        path_merge_max_score: Maximum allowed merge score (lower is stricter)
-        path_merge_create_bridge: Insert short cubic bridge for small residual endpoint gaps
         save_visualization: If True, save a visualization PNG to outputs folder
 
     Returns:
@@ -72,13 +58,6 @@ def process_image(
             max_error=max_error,
             follow_junction_continuation=follow_junction_continuation,
             junction_min_alignment=junction_min_alignment,
-            junction_min_score_margin=junction_min_score_margin,
-            enable_path_merging=enable_path_merging,
-            path_merge_gap_threshold=path_merge_gap_threshold,
-            path_merge_min_alignment=path_merge_min_alignment,
-            path_merge_min_consistency=path_merge_min_consistency,
-            path_merge_max_score=path_merge_max_score,
-            path_merge_create_bridge=path_merge_create_bridge,
         )
         mode = "skeleton"
     else:
@@ -120,7 +99,7 @@ if __name__ == "__main__":
     print("Running bezier extraction tests...\n")
 
     # Test 1: Contour mode
-    test_image = "test_images/restoration_test.png"
+    test_image = "test_images/damaged_bolt.png"
     # if os.path.exists(test_image):
     #     print("▶ Test 1: Contour mode fitting")
     #     paths = process_image(test_image, use_skeleton=False)

@@ -74,13 +74,6 @@ class PipelineConfig:
     max_bezier_error: float = 5.0
     skeleton_follow_junction_continuation: bool = True
     skeleton_junction_min_alignment: float = -0.30
-    skeleton_junction_min_score_margin: float = 0.04
-    skeleton_enable_path_merging: bool = True
-    skeleton_path_merge_gap_threshold: float = 18.0
-    skeleton_path_merge_min_alignment: float = -0.20
-    skeleton_path_merge_min_consistency: float = -0.25
-    skeleton_path_merge_max_score: float = 20.0
-    skeleton_path_merge_create_bridge: bool = True
     efd_order: int = 10
 
     # Feature bridge
@@ -155,13 +148,6 @@ def restore(
             max_error=cfg.max_bezier_error,
             follow_junction_continuation=cfg.skeleton_follow_junction_continuation,
             junction_min_alignment=cfg.skeleton_junction_min_alignment,
-            junction_min_score_margin=cfg.skeleton_junction_min_score_margin,
-            enable_path_merging=cfg.skeleton_enable_path_merging,
-            path_merge_gap_threshold=cfg.skeleton_path_merge_gap_threshold,
-            path_merge_min_alignment=cfg.skeleton_path_merge_min_alignment,
-            path_merge_min_consistency=cfg.skeleton_path_merge_min_consistency,
-            path_merge_max_score=cfg.skeleton_path_merge_max_score,
-            path_merge_create_bridge=cfg.skeleton_path_merge_create_bridge,
         )
     else:
         paths = fit_from_image(
@@ -319,7 +305,7 @@ def main() -> None:
         description="Sketch-Based Heritage Restoration Pipeline"
     )
     # Default image allows running `python pipeline.py` without arguments
-    default_img = os.path.join(_PROJECT_ROOT, "test_images", "restoration_test.png")
+    default_img = os.path.join(_PROJECT_ROOT, "test_images", "restoration_small_gaps.png")
     parser.add_argument("--image", default=default_img, help="Input sketch image path")
     parser.add_argument("--no-skeleton", action="store_false", dest="skeleton", help="Disable skeleton fitting")
     parser.add_argument("--vocab", default="", help="Shape vocabulary directory")
