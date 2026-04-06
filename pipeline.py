@@ -305,7 +305,7 @@ def main() -> None:
         description="Sketch-Based Heritage Restoration Pipeline"
     )
     # Default image allows running `python pipeline.py` without arguments
-    default_img = os.path.join(_PROJECT_ROOT, "test_images", "restoration_test_damaged.png")
+    default_img = os.path.join(_PROJECT_ROOT, "test_images", "restoration_small_gaps.png")
     parser.add_argument("--image", default=default_img, help="Input sketch image path")
     parser.add_argument("--no-skeleton", action="store_false", dest="skeleton", help="Disable skeleton fitting")
     parser.add_argument("--vocab", default="", help="Shape vocabulary directory")

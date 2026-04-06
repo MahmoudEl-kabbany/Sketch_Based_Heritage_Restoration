@@ -1068,10 +1068,10 @@ def fit_from_image_skeleton(
     image_path: str,
     max_error: float = 5.0,
     tangent_lookahead: int = 5,
-    merge_radius: float = 15.0,
+    merge_radius: float = 5.0,
     follow_junction_continuation: bool = True,
     junction_min_alignment: float = -0.30,
-    spur_threshold: float = 15.0,
+    spur_threshold: float = 8.0,
 ) -> Tuple[List[BezierPath], Dict[int, set]]:
     """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths."""
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
@@ -1434,6 +1434,18 @@ if __name__ == "__main__":
         default=5,
         help="Lookahead window used for tangent estimation",
     )
+    parser.add_argument(
+        "--merge-radius",
+        type=float,
+        default=5.0,
+        help="Maximum pixel distance to merge endpoints",
+    )
+    parser.add_argument(
+        "--spur-threshold",
+        type=float,
+        default=8.0,
+        help="Maximum length of branches to prune",
+    )
     parser.set_defaults(skeleton=True)
     args = parser.parse_args()
 
@@ -1441,6 +1453,8 @@ if __name__ == "__main__":
         paths, _adjacency = fit_from_image_skeleton(
             args.image_path,
             tangent_lookahead=args.tangent_lookahead,
+            merge_radius=args.merge_radius,
+            spur_threshold=args.spur_threshold,
         )
         label = f"Skeleton fitting: {args.image_path}"
     else:
