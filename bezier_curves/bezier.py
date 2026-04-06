@@ -1071,7 +1071,7 @@ def fit_from_image_skeleton(
     merge_radius: float = 5.0,
     follow_junction_continuation: bool = True,
     junction_min_alignment: float = -0.30,
-    spur_threshold: float = 8.0,
+    spur_threshold: float = 12.0,
 ) -> Tuple[List[BezierPath], Dict[int, set]]:
     """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths."""
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
