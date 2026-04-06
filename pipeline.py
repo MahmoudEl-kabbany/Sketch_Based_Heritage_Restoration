@@ -72,6 +72,8 @@ class PipelineConfig:
     use_skeleton: bool = True
     min_contour_area: float = 100.0
     max_bezier_error: float = 5.0
+    skeleton_follow_junction_continuation: bool = True
+    skeleton_junction_min_alignment: float = -0.30
     efd_order: int = 10
 
     # Feature bridge
@@ -141,7 +143,12 @@ def restore(
 
     adjacency: Dict[int, set] = {}
     if cfg.use_skeleton:
-        paths, adjacency = fit_from_image_skeleton(image_path, max_error=cfg.max_bezier_error)
+        paths, adjacency = fit_from_image_skeleton(
+            image_path,
+            max_error=cfg.max_bezier_error,
+            follow_junction_continuation=cfg.skeleton_follow_junction_continuation,
+            junction_min_alignment=cfg.skeleton_junction_min_alignment,
+        )
     else:
         paths = fit_from_image(
             image_path,
@@ -298,7 +305,7 @@ def main() -> None:
         description="Sketch-Based Heritage Restoration Pipeline"
     )
     # Default image allows running `python pipeline.py` without arguments
-    default_img = os.path.join(_PROJECT_ROOT, "test_images", "restoration_test_damaged_big.png")
+    default_img = os.path.join(_PROJECT_ROOT, "test_images", "restoration_small_gaps.png")
     parser.add_argument("--image", default=default_img, help="Input sketch image path")
     parser.add_argument("--no-skeleton", action="store_false", dest="skeleton", help="Disable skeleton fitting")
     parser.add_argument("--vocab", default="", help="Shape vocabulary directory")

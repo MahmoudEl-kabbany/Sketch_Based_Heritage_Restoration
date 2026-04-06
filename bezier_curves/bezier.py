@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import cv2
 import matplotlib.pyplot as plt
@@ -268,12 +268,127 @@ def _max_error(
     return max_err, split_idx
 
 
+def _fit_error_stats(
+    points: np.ndarray, cp: np.ndarray, params: np.ndarray
+) -> Tuple[float, float, int]:
+    """Return (max squared error, mean squared error, worst index)."""
+    u = 1.0 - params
+    t = params
+    bezier_pts = (
+        (u**3)[:, np.newaxis] * cp[0]
+        + 3 * (u**2)[:, np.newaxis] * t[:, np.newaxis] * cp[1]
+        + 3 * u[:, np.newaxis] * (t**2)[:, np.newaxis] * cp[2]
+        + (t**3)[:, np.newaxis] * cp[3]
+    )
+    errors = np.sum((bezier_pts - points) ** 2, axis=1)
+    split_idx = int(np.argmax(errors))
+    return float(errors[split_idx]), float(np.mean(errors)), split_idx
+
+
+def _point_line_distances_sq(points: np.ndarray, p0: np.ndarray, p1: np.ndarray) -> np.ndarray:
+    """Squared perpendicular distances of points to the line through p0-p1."""
+    direction = p1 - p0
+    denom = float(np.dot(direction, direction))
+    if denom < 1e-12:
+        diffs = points - p0
+        return np.sum(diffs * diffs, axis=1)
+
+    rel = points - p0
+    t = np.sum(rel * direction, axis=1) / denom
+    proj = p0 + t[:, np.newaxis] * direction
+    diffs = points - proj
+    return np.sum(diffs * diffs, axis=1)
+
+
+def _max_turning_angle_deg(points: np.ndarray) -> float:
+    """Maximum local turning angle in degrees for a polyline."""
+    if len(points) < 3:
+        return 0.0
+
+    diffs = np.diff(points, axis=0)
+    angles: List[float] = []
+    for i in range(len(diffs) - 1):
+        a = diffs[i]
+        b = diffs[i + 1]
+        na = np.linalg.norm(a)
+        nb = np.linalg.norm(b)
+        if na < 1e-12 or nb < 1e-12:
+            continue
+        dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
+        angles.append(float(np.degrees(np.arccos(dot))))
+
+    if not angles:
+        return 0.0
+    return max(angles)
+
+
+def _dominant_turn_index(points: np.ndarray, angle_threshold_deg: float = 70.0) -> Optional[int]:
+    """Best split index for a sharp corner, or None if no dominant turn exists."""
+    if len(points) < 5:
+        return None
+
+    diffs = np.diff(points, axis=0)
+    best_angle = angle_threshold_deg
+    best_idx: Optional[int] = None
+    for i in range(1, len(diffs) - 1):
+        a = diffs[i - 1]
+        b = diffs[i]
+        na = np.linalg.norm(a)
+        nb = np.linalg.norm(b)
+        if na < 1e-12 or nb < 1e-12:
+            continue
+        dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
+        angle = float(np.degrees(np.arccos(dot)))
+        if angle > best_angle:
+            best_angle = angle
+            best_idx = i
+
+    if best_idx is None:
+        return None
+
+    # Convert from diff-index space to point-index space.
+    return max(1, min(best_idx, len(points) - 2))
+
+
+def _fit_straight_cubic(p0: np.ndarray, p3: np.ndarray) -> np.ndarray:
+    """Create an exactly straight cubic Bezier between endpoints."""
+    direction = p3 - p0
+    norm = np.linalg.norm(direction)
+    if norm < 1e-12:
+        direction = np.array([1.0, 0.0])
+        norm = 1.0
+    unit = direction / norm
+    step = norm / 3.0
+    p1 = p0 + unit * step
+    p2 = p3 - unit * step
+    return np.vstack([p0, p1, p2, p3])
+
+
+def _is_near_straight(points: np.ndarray, linear_tolerance: float) -> bool:
+    """Detect near-linearity from endpoint support line and local turning."""
+    if len(points) < 3:
+        return True
+
+    d2 = _point_line_distances_sq(points, points[0], points[-1])
+    max_dev = math.sqrt(float(np.max(d2)))
+    mean_dev = math.sqrt(float(np.mean(d2)))
+    turn = _max_turning_angle_deg(points)
+
+    return (
+        max_dev <= linear_tolerance
+        and mean_dev <= linear_tolerance * 0.55
+        and turn <= 24.0
+    )
+
+
 def _fit_cubic_single(
     points: np.ndarray,
     left_tangent: np.ndarray,
     right_tangent: np.ndarray,
     max_error: float,
     max_iterations: int = 4,
+    straightness_scale: float = 0.35,
+    corner_split_angle_deg: float = 72.0,
 ) -> List[np.ndarray]:
     """Fit a set of points with one or more cubic Bezier curves (recursive).
 
@@ -289,20 +404,55 @@ def _fit_cubic_single(
         ])
         return [cp]
 
+    linear_tol = max(0.5, math.sqrt(max_error) * straightness_scale)
+    if _is_near_straight(points, linear_tol):
+        return [_fit_straight_cubic(points[0], points[-1])]
+
+    corner_idx = _dominant_turn_index(points, angle_threshold_deg=corner_split_angle_deg)
+    if corner_idx is not None:
+        center_tangent = points[corner_idx + 1] - points[corner_idx - 1]
+        norm = np.linalg.norm(center_tangent)
+        if norm < 1e-12:
+            center_tangent = np.array([1.0, 0.0])
+        else:
+            center_tangent = center_tangent / norm
+
+        left_curves = _fit_cubic_single(
+            points[: corner_idx + 1],
+            left_tangent,
+            center_tangent,
+            max_error,
+            max_iterations=max_iterations,
+            straightness_scale=straightness_scale,
+            corner_split_angle_deg=corner_split_angle_deg,
+        )
+        right_curves = _fit_cubic_single(
+            points[corner_idx:],
+            -center_tangent,
+            right_tangent,
+            max_error,
+            max_iterations=max_iterations,
+            straightness_scale=straightness_scale,
+            corner_split_angle_deg=corner_split_angle_deg,
+        )
+        return left_curves + right_curves
+
     params = _chord_length_parameterize(points)
     cp = _generate_bezier(points, params, left_tangent, right_tangent)
-    err, split_idx = _max_error(points, cp, params)
+    err, mean_err, split_idx = _fit_error_stats(points, cp, params)
 
-    if err < max_error:
+    mean_limit = max_error * 0.38
+
+    if err < max_error and mean_err < mean_limit:
         return [cp]
 
     # Try iterative reparameterization
-    if err < max_error * 4.0:
+    if err < max_error * 4.0 or mean_err < mean_limit * 4.0:
         for _ in range(max_iterations):
             params = _reparameterize(points, params, cp)
             cp = _generate_bezier(points, params, left_tangent, right_tangent)
-            err, split_idx = _max_error(points, cp, params)
-            if err < max_error:
+            err, mean_err, split_idx = _fit_error_stats(points, cp, params)
+            if err < max_error and mean_err < mean_limit:
                 return [cp]
 
     # Split at the point of maximum error and recurse
@@ -315,10 +465,22 @@ def _fit_cubic_single(
         center_tangent = center_tangent / norm
 
     left_curves = _fit_cubic_single(
-        points[: split_idx + 1], left_tangent, center_tangent, max_error
+        points[: split_idx + 1],
+        left_tangent,
+        center_tangent,
+        max_error,
+        max_iterations=max_iterations,
+        straightness_scale=straightness_scale,
+        corner_split_angle_deg=corner_split_angle_deg,
     )
     right_curves = _fit_cubic_single(
-        points[split_idx:], -center_tangent, right_tangent, max_error
+        points[split_idx:],
+        -center_tangent,
+        right_tangent,
+        max_error,
+        max_iterations=max_iterations,
+        straightness_scale=straightness_scale,
+        corner_split_angle_deg=corner_split_angle_deg,
     )
     return left_curves + right_curves
 
@@ -503,11 +665,296 @@ def fit_from_image(
     return fit_from_contours(contours, corner_threshold, max_error, tangent_lookahead)
 
 
+@dataclass
+class _SkeletonEdge:
+    """Internal skeleton graph edge with polyline oriented from u to v."""
+
+    edge_id: int
+    u: int
+    v: int
+    points_uv: np.ndarray
+
+
+@dataclass
+class _SkeletonChain:
+    """Internal chain traversed over one or more skeleton edges."""
+
+    points: np.ndarray
+    node_sequence: List[int]
+    is_closed: bool
+
+
+def _safe_normalize_vector(vec: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(vec)
+    if norm < 1e-12:
+        return np.array([1.0, 0.0], dtype=np.float64)
+    return (vec / norm).astype(np.float64)
+
+
+def _node_xy(graph: Any, node_id: int) -> np.ndarray:
+    """Best-effort conversion of sknw node position to (x, y)."""
+    data = graph.nodes[node_id]
+    origin = data.get("o")
+    if origin is not None:
+        origin_arr = np.asarray(origin, dtype=np.float64)
+        if origin_arr.size >= 2:
+            return origin_arr[:2][::-1]
+
+    pts = data.get("pts")
+    if pts is not None:
+        pts_arr = np.asarray(pts, dtype=np.float64)
+        if pts_arr.ndim == 2 and pts_arr.shape[1] >= 2 and len(pts_arr) > 0:
+            return np.mean(pts_arr[:, :2], axis=0)[::-1]
+
+    return np.array([0.0, 0.0], dtype=np.float64)
+
+
+def _orient_points_between_nodes(pts_xy: np.ndarray, u_xy: np.ndarray, v_xy: np.ndarray) -> np.ndarray:
+    """Ensure the first point is nearest u and the last point is nearest v."""
+    if len(pts_xy) < 2:
+        return pts_xy
+
+    score_forward = np.linalg.norm(pts_xy[0] - u_xy) + np.linalg.norm(pts_xy[-1] - v_xy)
+    score_reverse = np.linalg.norm(pts_xy[-1] - u_xy) + np.linalg.norm(pts_xy[0] - v_xy)
+    if score_reverse + 1e-9 < score_forward:
+        return pts_xy[::-1].copy()
+    return pts_xy
+
+
+def _extract_skeleton_edges(graph: Any) -> Tuple[Dict[int, _SkeletonEdge], Dict[int, List[int]]]:
+    """Build canonical edge objects and node->edge incidence map from sknw graph."""
+    edges: Dict[int, _SkeletonEdge] = {}
+    node_to_edges: Dict[int, List[int]] = {}
+    eid = 0
+
+    if hasattr(graph, "is_multigraph") and graph.is_multigraph():
+        iter_edges = graph.edges(keys=True, data=True)
+        for u, v, _k, data in iter_edges:
+            pts = data.get("pts", [])
+            pts_arr = np.asarray(pts, dtype=np.float64)
+            if pts_arr.ndim != 2 or pts_arr.shape[1] < 2 or len(pts_arr) < 2:
+                continue
+            pts_xy = pts_arr[:, :2][:, ::-1]
+            oriented = _orient_points_between_nodes(pts_xy, _node_xy(graph, u), _node_xy(graph, v))
+
+            edges[eid] = _SkeletonEdge(edge_id=eid, u=int(u), v=int(v), points_uv=oriented)
+            node_to_edges.setdefault(int(u), []).append(eid)
+            node_to_edges.setdefault(int(v), []).append(eid)
+            eid += 1
+    else:
+        iter_edges = graph.edges(data=True)
+        for u, v, data in iter_edges:
+            pts = data.get("pts", [])
+            pts_arr = np.asarray(pts, dtype=np.float64)
+            if pts_arr.ndim != 2 or pts_arr.shape[1] < 2 or len(pts_arr) < 2:
+                continue
+            pts_xy = pts_arr[:, :2][:, ::-1]
+            oriented = _orient_points_between_nodes(pts_xy, _node_xy(graph, u), _node_xy(graph, v))
+
+            edges[eid] = _SkeletonEdge(edge_id=eid, u=int(u), v=int(v), points_uv=oriented)
+            node_to_edges.setdefault(int(u), []).append(eid)
+            node_to_edges.setdefault(int(v), []).append(eid)
+            eid += 1
+
+    return edges, node_to_edges
+
+
+def _edge_other_node(edge: _SkeletonEdge, node: int) -> int:
+    return edge.v if node == edge.u else edge.u
+
+
+def _edge_points_from_node(edge: _SkeletonEdge, start_node: int) -> np.ndarray:
+    return edge.points_uv if start_node == edge.u else edge.points_uv[::-1]
+
+
+def _edge_direction_from_node(edge: _SkeletonEdge, start_node: int, steps: int = 4) -> np.ndarray:
+    pts = _edge_points_from_node(edge, start_node)
+    if len(pts) < 2:
+        return np.array([1.0, 0.0], dtype=np.float64)
+    k = min(steps, len(pts) - 1)
+    direction = pts[k] - pts[0]
+    return _safe_normalize_vector(direction)
+
+
+def _select_continuation_edge(
+    node: int,
+    incoming_direction: np.ndarray,
+    candidate_edge_ids: List[int],
+    edges: Dict[int, _SkeletonEdge],
+) -> Tuple[Optional[int], float]:
+    """Choose edge with best directional continuation score at a junction."""
+    best_edge: Optional[int] = None
+    best_score = -2.0
+    for eid in candidate_edge_ids:
+        out_dir = _edge_direction_from_node(edges[eid], node)
+        score = float(np.dot(incoming_direction, out_dir))
+        if score > best_score:
+            best_score = score
+            best_edge = eid
+    return best_edge, best_score
+
+
+def _walk_skeleton_chain(
+    start_node: int,
+    start_edge_id: int,
+    edges: Dict[int, _SkeletonEdge],
+    node_to_edges: Dict[int, List[int]],
+    degree_map: Dict[int, int],
+    used_edges: Set[int],
+    follow_junction_continuation: bool,
+    junction_min_alignment: float,
+) -> Optional[_SkeletonChain]:
+    """Traverse a chain from a starting node/edge, reusing continuation at junctions."""
+    if start_edge_id in used_edges:
+        return None
+
+    node_sequence: List[int] = [start_node]
+    chain_points: List[np.ndarray] = []
+
+    current_node = start_node
+    current_edge_id = start_edge_id
+    closed = False
+
+    while True:
+        if current_edge_id in used_edges:
+            break
+
+        edge = edges[current_edge_id]
+        edge_pts = _edge_points_from_node(edge, current_node)
+        if len(edge_pts) < 2:
+            used_edges.add(current_edge_id)
+            break
+
+        used_edges.add(current_edge_id)
+        if not chain_points:
+            chain_points.extend(edge_pts)
+        else:
+            chain_points.extend(edge_pts[1:])
+
+        next_node = _edge_other_node(edge, current_node)
+        node_sequence.append(next_node)
+
+        k = min(4, len(edge_pts) - 1)
+        incoming_direction = _safe_normalize_vector(edge_pts[-1] - edge_pts[-1 - k])
+
+        candidate_edges = [eid for eid in node_to_edges.get(next_node, []) if eid not in used_edges]
+        if not candidate_edges:
+            if next_node == start_node and len(node_sequence) > 2:
+                closed = True
+            break
+
+        deg = degree_map.get(next_node, len(node_to_edges.get(next_node, [])))
+        if deg == 2:
+            current_edge_id = candidate_edges[0]
+            current_node = next_node
+            continue
+
+        if not follow_junction_continuation:
+            break
+
+        chosen_edge, alignment = _select_continuation_edge(
+            next_node,
+            incoming_direction,
+            candidate_edges,
+            edges,
+        )
+        if chosen_edge is None or alignment < junction_min_alignment:
+            break
+
+        current_edge_id = chosen_edge
+        current_node = next_node
+
+    if len(chain_points) < 2:
+        return None
+
+    return _SkeletonChain(
+        points=np.asarray(chain_points, dtype=np.float64),
+        node_sequence=node_sequence,
+        is_closed=closed,
+    )
+
+
+def _build_skeleton_chains(
+    graph: Any,
+    follow_junction_continuation: bool,
+    junction_min_alignment: float,
+) -> List[_SkeletonChain]:
+    """Convert skeleton graph edges into continuity chains."""
+    edges, node_to_edges = _extract_skeleton_edges(graph)
+    if not edges:
+        return []
+
+    degree_map: Dict[int, int] = {
+        node: len(edge_ids) for node, edge_ids in node_to_edges.items()
+    }
+    used_edges: Set[int] = set()
+    chains: List[_SkeletonChain] = []
+
+    # Prefer starting at endpoints / branch nodes, then consume any cycles.
+    for node, edge_ids in node_to_edges.items():
+        if degree_map.get(node, 0) == 2:
+            continue
+        for eid in edge_ids:
+            if eid in used_edges:
+                continue
+            chain = _walk_skeleton_chain(
+                start_node=node,
+                start_edge_id=eid,
+                edges=edges,
+                node_to_edges=node_to_edges,
+                degree_map=degree_map,
+                used_edges=used_edges,
+                follow_junction_continuation=follow_junction_continuation,
+                junction_min_alignment=junction_min_alignment,
+            )
+            if chain is not None:
+                chains.append(chain)
+
+    for eid, edge in edges.items():
+        if eid in used_edges:
+            continue
+        chain = _walk_skeleton_chain(
+            start_node=edge.u,
+            start_edge_id=eid,
+            edges=edges,
+            node_to_edges=node_to_edges,
+            degree_map=degree_map,
+            used_edges=used_edges,
+            follow_junction_continuation=True,
+            junction_min_alignment=-1.0,
+        )
+        if chain is not None:
+            chains.append(chain)
+
+    return chains
+
+
+def _build_path_adjacency_from_chains(chains: List[_SkeletonChain]) -> Dict[int, set]:
+    """Paths are adjacent if they touch the same skeleton node."""
+    node_to_path_indices: Dict[int, Set[int]] = {}
+    for path_idx, chain in enumerate(chains):
+        for node in set(chain.node_sequence):
+            node_to_path_indices.setdefault(int(node), set()).add(path_idx)
+
+    adjacency: Dict[int, set] = {}
+    for path_indices in node_to_path_indices.values():
+        idx_list = sorted(path_indices)
+        for i in range(len(idx_list)):
+            for j in range(i + 1, len(idx_list)):
+                pi, pj = idx_list[i], idx_list[j]
+                adjacency.setdefault(pi, set()).add(pj)
+                adjacency.setdefault(pj, set()).add(pi)
+
+    return adjacency
+
+
 def fit_from_image_skeleton(
     image_path: str,
     max_error: float = 5.0,
     tangent_lookahead: int = 5,
     merge_radius: float = 3.0,
+    follow_junction_continuation: bool = True,
+    junction_min_alignment: float = -0.30,
 ) -> Tuple[List[BezierPath], Dict[int, set]]:
     """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths.
 
@@ -538,48 +985,38 @@ def fit_from_image_skeleton(
     # Build graph from skeleton
     graph = sknw.build_sknw(skeleton)
 
-    # Track which skeleton node each edge connects so we can build adjacency
-    edge_to_path_idx: Dict[int, List[int]] = {}  # skeleton node → [path indices]
+    chains = _build_skeleton_chains(
+        graph,
+        follow_junction_continuation=follow_junction_continuation,
+        junction_min_alignment=junction_min_alignment,
+    )
 
-    # Process edges
-    paths = []
-    for s, e in graph.edges():
-        edge_data = graph[s][e]
-        pts = edge_data.get('pts', [])
-        if isinstance(pts, list):
-            pts = np.array(pts, dtype=np.float64)
-        else:
-            pts = np.asarray(pts, dtype=np.float64)
-
-        # sknw returns points as (row, col) = (y, x); convert to (x, y).
-        if pts.ndim == 2 and pts.shape[1] >= 2:
-            pts = pts[:, ::-1]
-
+    paths: List[BezierPath] = []
+    kept_chains: List[_SkeletonChain] = []
+    lookahead = max(1, int(tangent_lookahead))
+    for chain in chains:
+        pts = chain.points
         if len(pts) < 2:
             continue
 
-        # Estimate tangents and fit cubic
-        lookahead = max(1, int(tangent_lookahead))
         left_tangent = _estimate_tangent(pts, "start", lookahead=lookahead)
         right_tangent = _estimate_tangent(pts, "end", lookahead=lookahead)
         cps_list = _fit_cubic_single(pts, left_tangent, right_tangent, max_error ** 2)
 
         segments = [BezierSegment(cps, source_type="skeleton") for cps in cps_list]
-        if segments:
-            path_idx = len(paths)
-            paths.append(BezierPath(segments, is_closed=False, source_type="skeleton"))
-            # Record skeleton node connections
-            for node in (s, e):
-                edge_to_path_idx.setdefault(node, []).append(path_idx)
+        if not segments:
+            continue
 
-    # Build adjacency: paths sharing a skeleton node are connected
-    adjacency: Dict[int, set] = {}
-    for node, path_indices in edge_to_path_idx.items():
-        for i in range(len(path_indices)):
-            for j in range(i + 1, len(path_indices)):
-                pi, pj = path_indices[i], path_indices[j]
-                adjacency.setdefault(pi, set()).add(pj)
-                adjacency.setdefault(pj, set()).add(pi)
+        paths.append(
+            BezierPath(
+                segments=segments,
+                is_closed=chain.is_closed,
+                source_type="skeleton",
+            )
+        )
+        kept_chains.append(chain)
+
+    adjacency = _build_path_adjacency_from_chains(kept_chains)
 
     # Endpoint merging: snap endpoints of adjacent paths to exact same point
     if merge_radius > 0:
@@ -927,7 +1364,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.skeleton:
-        paths = fit_from_image_skeleton(
+        paths, _adjacency = fit_from_image_skeleton(
             args.image_path,
             tangent_lookahead=args.tangent_lookahead,
         )

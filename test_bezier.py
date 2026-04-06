@@ -23,6 +23,8 @@ def process_image(
     use_skeleton: bool = False,
     min_contour_area: float = 100.0,
     max_error: float = 5.0,
+    follow_junction_continuation: bool = True,
+    junction_min_alignment: float = -0.30,
     save_visualization: bool = True,
 ) -> List[BezierPath]:
     """
@@ -33,6 +35,8 @@ def process_image(
         use_skeleton: If True, use skeleton fitting; else use contour fitting
         min_contour_area: Minimum contour area to process (contour mode only)
         max_error: Maximum fitting error threshold for Bezier approximation
+        follow_junction_continuation: Continue through junction using best direction
+        junction_min_alignment: Minimum dot-product alignment for junction continuation
         save_visualization: If True, save a visualization PNG to outputs folder
 
     Returns:
@@ -49,7 +53,12 @@ def process_image(
 
     # Extract Bezier curves
     if use_skeleton:
-        paths, _adjacency = fit_from_image_skeleton(image_path, max_error=max_error)
+        paths, _adjacency = fit_from_image_skeleton(
+            image_path,
+            max_error=max_error,
+            follow_junction_continuation=follow_junction_continuation,
+            junction_min_alignment=junction_min_alignment,
+        )
         mode = "skeleton"
     else:
         paths = fit_from_image(
@@ -90,16 +99,16 @@ if __name__ == "__main__":
     print("Running bezier extraction tests...\n")
 
     # Test 1: Contour mode
-    test_image = "test_images/bolt.png"
-    if os.path.exists(test_image):
-        print("▶ Test 1: Contour mode fitting")
-        paths = process_image(test_image, use_skeleton=False)
-    else:
-        print(f"⚠ Test image not found: {test_image}")
+    test_image = "test_images/damaged_bolt.png"
+    # if os.path.exists(test_image):
+    #     print("▶ Test 1: Contour mode fitting")
+    #     paths = process_image(test_image, use_skeleton=False)
+    # else:
+    #     print(f"⚠ Test image not found: {test_image}")
 
     # Test 2: Skeleton mode
-    # if os.path.exists(test_image):
-    #     print("\n▶ Test 2: Skeleton mode fitting")
-    #     paths = process_image(test_image, use_skeleton=True)
-    # else:
-    #     print(f"⚠ Test image not found for skeleton test: {test_image}")
+    if os.path.exists(test_image):
+        print("\n▶ Test 2: Skeleton mode fitting")
+        paths = process_image(test_image, use_skeleton=True)
+    else:
+        print(f"⚠ Test image not found for skeleton test: {test_image}")
