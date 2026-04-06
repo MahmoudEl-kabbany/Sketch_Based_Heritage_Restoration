@@ -776,22 +776,70 @@ def _edge_direction_from_node(edge: _SkeletonEdge, start_node: int, steps: int =
     return _safe_normalize_vector(direction)
 
 
+def _polyline_length(points: np.ndarray) -> float:
+    if len(points) < 2:
+        return 0.0
+    diffs = np.diff(points, axis=0)
+    return float(np.sum(np.linalg.norm(diffs, axis=1)))
+
+
 def _select_continuation_edge(
     node: int,
     incoming_direction: np.ndarray,
     candidate_edge_ids: List[int],
     edges: Dict[int, _SkeletonEdge],
-) -> Tuple[Optional[int], float]:
-    """Choose edge with best directional continuation score at a junction."""
+    degree_map: Dict[int, int],
+) -> Tuple[Optional[int], float, float, float]:
+    """Choose edge with strongest continuation confidence at a junction.
+
+    Returns
+    -------
+    chosen_edge : Optional[int]
+    chosen_alignment : float
+        Raw directional alignment (dot product) in [-1, 1].
+    chosen_score : float
+        Composite continuation score.
+    score_margin : float
+        Gap between best and second-best composite score.
+    """
     best_edge: Optional[int] = None
+    best_alignment = -2.0
     best_score = -2.0
+    second_score = -2.0
+
     for eid in candidate_edge_ids:
+        edge = edges[eid]
         out_dir = _edge_direction_from_node(edges[eid], node)
-        score = float(np.dot(incoming_direction, out_dir))
+        alignment = float(np.dot(incoming_direction, out_dir))
+
+        edge_pts = _edge_points_from_node(edge, node)
+        support_length = _polyline_length(edge_pts)
+        length_score = float(np.tanh(support_length / 12.0))
+
+        opposite_node = _edge_other_node(edge, node)
+        opposite_degree = degree_map.get(opposite_node, 1)
+        if opposite_degree == 2:
+            opposite_support = 1.0
+        elif opposite_degree >= 3:
+            opposite_support = 0.80
+        else:
+            opposite_support = 0.64
+
+        score = 0.68 * alignment + 0.22 * length_score + 0.10 * opposite_support
+
+        if score > second_score:
+            second_score = score
         if score > best_score:
+            second_score = best_score
             best_score = score
+            best_alignment = alignment
             best_edge = eid
-    return best_edge, best_score
+
+    if best_edge is None:
+        return None, -2.0, -2.0, 0.0
+
+    margin = best_score - max(second_score, -2.0)
+    return best_edge, best_alignment, best_score, margin
 
 
 def _walk_skeleton_chain(
@@ -803,6 +851,7 @@ def _walk_skeleton_chain(
     used_edges: Set[int],
     follow_junction_continuation: bool,
     junction_min_alignment: float,
+    junction_min_score_margin: float,
 ) -> Optional[_SkeletonChain]:
     """Traverse a chain from a starting node/edge, reusing continuation at junctions."""
     if start_edge_id in used_edges:
@@ -852,13 +901,18 @@ def _walk_skeleton_chain(
         if not follow_junction_continuation:
             break
 
-        chosen_edge, alignment = _select_continuation_edge(
+        chosen_edge, alignment, _score, margin = _select_continuation_edge(
             next_node,
             incoming_direction,
             candidate_edges,
             edges,
+            degree_map,
         )
-        if chosen_edge is None or alignment < junction_min_alignment:
+        if (
+            chosen_edge is None
+            or alignment < junction_min_alignment
+            or margin < junction_min_score_margin
+        ):
             break
 
         current_edge_id = chosen_edge
@@ -878,6 +932,7 @@ def _build_skeleton_chains(
     graph: Any,
     follow_junction_continuation: bool,
     junction_min_alignment: float,
+    junction_min_score_margin: float,
 ) -> List[_SkeletonChain]:
     """Convert skeleton graph edges into continuity chains."""
     edges, node_to_edges = _extract_skeleton_edges(graph)
@@ -906,6 +961,7 @@ def _build_skeleton_chains(
                 used_edges=used_edges,
                 follow_junction_continuation=follow_junction_continuation,
                 junction_min_alignment=junction_min_alignment,
+                junction_min_score_margin=junction_min_score_margin,
             )
             if chain is not None:
                 chains.append(chain)
@@ -922,6 +978,7 @@ def _build_skeleton_chains(
             used_edges=used_edges,
             follow_junction_continuation=True,
             junction_min_alignment=-1.0,
+            junction_min_score_margin=0.0,
         )
         if chain is not None:
             chains.append(chain)
@@ -948,6 +1005,279 @@ def _build_path_adjacency_from_chains(chains: List[_SkeletonChain]) -> Dict[int,
     return adjacency
 
 
+@dataclass
+class _PathUnit:
+    """Path and originating skeleton-chain metadata kept together for merges."""
+
+    path: BezierPath
+    chain: _SkeletonChain
+
+
+@dataclass
+class _PathMergeCandidate:
+    """Candidate connection between two path endpoints."""
+
+    i: int
+    j: int
+    endpoint_i: str
+    endpoint_j: str
+    score: float
+    gap_distance: float
+
+
+def _reverse_segment(seg: BezierSegment) -> BezierSegment:
+    cp = seg.control_points
+    rev = np.vstack([cp[3], cp[2], cp[1], cp[0]])
+    return BezierSegment(rev, source_type=seg.source_type)
+
+
+def _reverse_path(path: BezierPath) -> BezierPath:
+    reversed_segments = [_reverse_segment(s) for s in reversed(path.segments)]
+    return BezierPath(
+        segments=reversed_segments,
+        is_closed=path.is_closed,
+        source_type=path.source_type,
+    )
+
+
+def _reverse_chain(chain: _SkeletonChain) -> _SkeletonChain:
+    return _SkeletonChain(
+        points=chain.points[::-1].copy(),
+        node_sequence=list(reversed(chain.node_sequence)),
+        is_closed=chain.is_closed,
+    )
+
+
+def _path_endpoint_point(path: BezierPath, endpoint: str) -> np.ndarray:
+    if endpoint == "start":
+        return path.segments[0].control_points[0]
+    return path.segments[-1].control_points[3]
+
+
+def _endpoint_out_direction(path: BezierPath, endpoint: str) -> np.ndarray:
+    """Direction leaving the path when attached at this endpoint as the left side."""
+    if endpoint == "end":
+        cp = path.segments[-1].control_points
+        return _safe_normalize_vector(cp[3] - cp[2])
+    cp = path.segments[0].control_points
+    return _safe_normalize_vector(cp[0] - cp[1])
+
+
+def _endpoint_in_direction(path: BezierPath, endpoint: str) -> np.ndarray:
+    """Direction entering the path when attached at this endpoint as the right side."""
+    if endpoint == "start":
+        cp = path.segments[0].control_points
+        return _safe_normalize_vector(cp[1] - cp[0])
+    cp = path.segments[-1].control_points
+    return _safe_normalize_vector(cp[2] - cp[3])
+
+
+def _orient_unit_for_left(unit: _PathUnit, endpoint: str) -> _PathUnit:
+    if endpoint == "end":
+        return unit
+    return _PathUnit(path=_reverse_path(unit.path), chain=_reverse_chain(unit.chain))
+
+
+def _orient_unit_for_right(unit: _PathUnit, endpoint: str) -> _PathUnit:
+    if endpoint == "start":
+        return unit
+    return _PathUnit(path=_reverse_path(unit.path), chain=_reverse_chain(unit.chain))
+
+
+def _build_bridge_segment(
+    left_end: np.ndarray,
+    right_start: np.ndarray,
+    left_out_dir: np.ndarray,
+    right_in_dir: np.ndarray,
+) -> Optional[BezierSegment]:
+    """Create a short cubic bridge between path endpoints when needed."""
+    delta = right_start - left_end
+    gap = float(np.linalg.norm(delta))
+    if gap <= 1e-6:
+        return None
+
+    handle_len = min(max(gap * 0.38, 1.2), 14.0)
+    p0 = left_end
+    p3 = right_start
+    p1 = p0 + left_out_dir * handle_len
+    p2 = p3 - right_in_dir * handle_len
+    cp = np.vstack([p0, p1, p2, p3])
+    return BezierSegment(cp, source_type="skeleton_merge_bridge")
+
+
+def _merge_units(
+    left_unit: _PathUnit,
+    right_unit: _PathUnit,
+    connect_left_endpoint: str,
+    connect_right_endpoint: str,
+    create_bridge: bool,
+) -> _PathUnit:
+    """Merge two path units into one, respecting chosen connection endpoints."""
+    left = _orient_unit_for_left(left_unit, connect_left_endpoint)
+    right = _orient_unit_for_right(right_unit, connect_right_endpoint)
+
+    merged_segments: List[BezierSegment] = list(left.path.segments)
+
+    left_end_cp = left.path.segments[-1].control_points
+    right_start_cp = right.path.segments[0].control_points
+    left_end = left_end_cp[3]
+    right_start = right_start_cp[0]
+
+    if create_bridge:
+        left_out = _safe_normalize_vector(left_end_cp[3] - left_end_cp[2])
+        right_in = _safe_normalize_vector(right_start_cp[1] - right_start_cp[0])
+        bridge = _build_bridge_segment(left_end, right_start, left_out, right_in)
+        if bridge is not None:
+            merged_segments.append(bridge)
+
+    merged_segments.extend(right.path.segments)
+
+    chain_points: List[np.ndarray] = []
+    chain_points.extend(left.chain.points)
+    if len(right.chain.points) > 0:
+        if len(chain_points) > 0 and np.linalg.norm(chain_points[-1] - right.chain.points[0]) <= 1e-6:
+            chain_points.extend(right.chain.points[1:])
+        else:
+            chain_points.extend(right.chain.points)
+
+    merged_nodes = list(left.chain.node_sequence)
+    if right.chain.node_sequence:
+        if merged_nodes and merged_nodes[-1] == right.chain.node_sequence[0]:
+            merged_nodes.extend(right.chain.node_sequence[1:])
+        else:
+            merged_nodes.extend(right.chain.node_sequence)
+
+    merged_chain = _SkeletonChain(
+        points=np.asarray(chain_points, dtype=np.float64),
+        node_sequence=merged_nodes,
+        is_closed=False,
+    )
+
+    return _PathUnit(
+        path=BezierPath(
+            segments=merged_segments,
+            is_closed=False,
+            source_type="skeleton_merged",
+        ),
+        chain=merged_chain,
+    )
+
+
+def _best_merge_candidate(
+    units: List[_PathUnit],
+    max_gap: float,
+    min_alignment: float,
+    min_consistency: float,
+    max_score: float,
+) -> Optional[_PathMergeCandidate]:
+    best: Optional[_PathMergeCandidate] = None
+
+    endpoint_types = ("start", "end")
+    for i in range(len(units)):
+        if units[i].path.is_closed or not units[i].path.segments:
+            continue
+        for j in range(i + 1, len(units)):
+            if units[j].path.is_closed or not units[j].path.segments:
+                continue
+
+            shared_node = bool(set(units[i].chain.node_sequence) & set(units[j].chain.node_sequence))
+            for endpoint_i in endpoint_types:
+                for endpoint_j in endpoint_types:
+                    p_i = _path_endpoint_point(units[i].path, endpoint_i)
+                    p_j = _path_endpoint_point(units[j].path, endpoint_j)
+                    delta = p_j - p_i
+                    gap = float(np.linalg.norm(delta))
+                    if gap > max_gap:
+                        continue
+
+                    d_out = _endpoint_out_direction(units[i].path, endpoint_i)
+                    d_in = _endpoint_in_direction(units[j].path, endpoint_j)
+
+                    if gap <= 1e-6:
+                        guide = _safe_normalize_vector(d_out + d_in)
+                    else:
+                        guide = delta / gap
+
+                    align_i = float(np.dot(d_out, guide))
+                    align_j = float(np.dot(d_in, guide))
+                    consistency = float(np.dot(d_out, d_in))
+
+                    if (
+                        align_i < min_alignment
+                        or align_j < min_alignment
+                        or consistency < min_consistency
+                    ):
+                        continue
+
+                    score = (
+                        gap
+                        + 1.8 * (1.0 - align_i)
+                        + 1.8 * (1.0 - align_j)
+                        + 1.2 * (1.0 - consistency)
+                    )
+                    if shared_node:
+                        score -= 0.9
+
+                    if score > max_score:
+                        continue
+
+                    if best is None or score < best.score:
+                        best = _PathMergeCandidate(
+                            i=i,
+                            j=j,
+                            endpoint_i=endpoint_i,
+                            endpoint_j=endpoint_j,
+                            score=float(score),
+                            gap_distance=gap,
+                        )
+
+    return best
+
+
+def _merge_path_units_iterative(
+    units: List[_PathUnit],
+    max_gap: float,
+    min_alignment: float,
+    min_consistency: float,
+    max_score: float,
+    create_bridge: bool,
+    max_iterations: int = 128,
+) -> List[_PathUnit]:
+    """Repeatedly merge the best pair until no valid candidate remains."""
+    merged_units = list(units)
+    iterations = 0
+    while iterations < max_iterations and len(merged_units) > 1:
+        cand = _best_merge_candidate(
+            merged_units,
+            max_gap=max_gap,
+            min_alignment=min_alignment,
+            min_consistency=min_consistency,
+            max_score=max_score,
+        )
+        if cand is None:
+            break
+
+        a = cand.i
+        b = cand.j
+        if a > b:
+            a, b = b, a
+
+        merged = _merge_units(
+            merged_units[a],
+            merged_units[b],
+            connect_left_endpoint=cand.endpoint_i if cand.i == a else cand.endpoint_j,
+            connect_right_endpoint=cand.endpoint_j if cand.i == a else cand.endpoint_i,
+            create_bridge=create_bridge,
+        )
+
+        next_units = [u for idx, u in enumerate(merged_units) if idx not in {a, b}]
+        next_units.append(merged)
+        merged_units = next_units
+        iterations += 1
+
+    return merged_units
+
+
 def fit_from_image_skeleton(
     image_path: str,
     max_error: float = 5.0,
@@ -955,6 +1285,13 @@ def fit_from_image_skeleton(
     merge_radius: float = 3.0,
     follow_junction_continuation: bool = True,
     junction_min_alignment: float = -0.30,
+    junction_min_score_margin: float = 0.04,
+    enable_path_merging: bool = True,
+    path_merge_gap_threshold: float = 18.0,
+    path_merge_min_alignment: float = -0.20,
+    path_merge_min_consistency: float = -0.25,
+    path_merge_max_score: float = 20.0,
+    path_merge_create_bridge: bool = True,
 ) -> Tuple[List[BezierPath], Dict[int, set]]:
     """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths.
 
@@ -989,10 +1326,10 @@ def fit_from_image_skeleton(
         graph,
         follow_junction_continuation=follow_junction_continuation,
         junction_min_alignment=junction_min_alignment,
+        junction_min_score_margin=junction_min_score_margin,
     )
 
-    paths: List[BezierPath] = []
-    kept_chains: List[_SkeletonChain] = []
+    path_units: List[_PathUnit] = []
     lookahead = max(1, int(tangent_lookahead))
     for chain in chains:
         pts = chain.points
@@ -1007,14 +1344,29 @@ def fit_from_image_skeleton(
         if not segments:
             continue
 
-        paths.append(
-            BezierPath(
-                segments=segments,
-                is_closed=chain.is_closed,
-                source_type="skeleton",
+        path_units.append(
+            _PathUnit(
+                path=BezierPath(
+                    segments=segments,
+                    is_closed=chain.is_closed,
+                    source_type="skeleton",
+                ),
+                chain=chain,
             )
         )
-        kept_chains.append(chain)
+
+    if enable_path_merging and len(path_units) > 1:
+        path_units = _merge_path_units_iterative(
+            path_units,
+            max_gap=path_merge_gap_threshold,
+            min_alignment=path_merge_min_alignment,
+            min_consistency=path_merge_min_consistency,
+            max_score=path_merge_max_score,
+            create_bridge=path_merge_create_bridge,
+        )
+
+    paths = [u.path for u in path_units]
+    kept_chains = [u.chain for u in path_units]
 
     adjacency = _build_path_adjacency_from_chains(kept_chains)
 
