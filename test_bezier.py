@@ -7,7 +7,6 @@ Main function: process_image(image_path, use_skeleton=False)
 from bezier_curves.bezier import (
     fit_from_image,
     fit_from_image_skeleton,
-    merge_nearby_paths,
     visualize_paths,
     BezierPath,
 )
@@ -24,10 +23,6 @@ def process_image(
     use_skeleton: bool = False,
     min_contour_area: float = 100.0,
     max_error: float = 5.0,
-    tangent_lookahead: int = 8,
-    merge_radius: float = 12.0,
-    gap_threshold: float = 30.0,
-    angle_threshold_deg: float = 48.0,
     save_visualization: bool = True,
 ) -> List[BezierPath]:
     """
@@ -38,10 +33,6 @@ def process_image(
         use_skeleton: If True, use skeleton fitting; else use contour fitting
         min_contour_area: Minimum contour area to process (contour mode only)
         max_error: Maximum fitting error threshold for Bezier approximation
-        tangent_lookahead: Tangent estimation window for fitting
-        merge_radius: Endpoint snap radius in skeleton mode
-        gap_threshold: merge_nearby_paths distance threshold
-        angle_threshold_deg: merge_nearby_paths angle threshold
         save_visualization: If True, save a visualization PNG to outputs folder
 
     Returns:
@@ -58,28 +49,13 @@ def process_image(
 
     # Extract Bezier curves
     if use_skeleton:
-        paths, _adjacency = fit_from_image_skeleton(
-            image_path,
-            max_error=max_error,
-            tangent_lookahead=tangent_lookahead,
-            merge_radius=merge_radius,
-        )
-        before_merge = len(paths)
-        if gap_threshold > 0:
-            paths = merge_nearby_paths(
-                paths,
-                gap_threshold=gap_threshold,
-                angle_threshold_deg=angle_threshold_deg,
-            )
-        if len(paths) != before_merge:
-            print(f"  Post-merge path count: {before_merge} -> {len(paths)}")
+        paths, _adjacency = fit_from_image_skeleton(image_path, max_error=max_error)
         mode = "skeleton"
     else:
         paths = fit_from_image(
             image_path,
             min_contour_area=min_contour_area,
             max_error=max_error,
-            tangent_lookahead=tangent_lookahead,
         )
         mode = "contour"
 
@@ -114,16 +90,16 @@ if __name__ == "__main__":
     print("Running bezier extraction tests...\n")
 
     # Test 1: Contour mode
-    test_image = "test_images/restoration_test_damaged_big.png"
-    # if os.path.exists(test_image):
-    #     print("▶ Test 1: Contour mode fitting")
-    #     paths = process_image(test_image, use_skeleton=False)
-    # else:
-    #     print(f"⚠ Test image not found: {test_image}")
+    test_image = "test_images/bolt.png"
+    if os.path.exists(test_image):
+        print("▶ Test 1: Contour mode fitting")
+        paths = process_image(test_image, use_skeleton=False)
+    else:
+        print(f"⚠ Test image not found: {test_image}")
 
     # Test 2: Skeleton mode
-    if os.path.exists(test_image):
-        print("\n▶ Test 2: Skeleton mode fitting")
-        paths = process_image(test_image, use_skeleton=True)
-    else:
-        print(f"⚠ Test image not found for skeleton test: {test_image}")
+    # if os.path.exists(test_image):
+    #     print("\n▶ Test 2: Skeleton mode fitting")
+    #     paths = process_image(test_image, use_skeleton=True)
+    # else:
+    #     print(f"⚠ Test image not found for skeleton test: {test_image}")

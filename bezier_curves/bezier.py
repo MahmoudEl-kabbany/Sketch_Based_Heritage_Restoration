@@ -327,48 +327,6 @@ def _fit_cubic_single(
 # Contour → Bezier  (Phase 2)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _find_corners_angle(
-    points: np.ndarray,
-    angle_threshold_deg: float = 45.0,
-    smoothing_window: int = 3,
-) -> List[int]:
-    """Detect corner indices using turning-angle analysis.
-
-    Returns indices where the local direction changes by more than
-    `angle_threshold_deg`. Inflection points (curvature sign-flip without
-    a sharp turn) are NOT flagged as corners.
-    """
-    if smoothing_window > 1 and len(points) > smoothing_window * 2:
-        from scipy.ndimage import uniform_filter1d
-        pts = uniform_filter1d(points.astype(np.float64), size=smoothing_window, axis=0)
-    else:
-        pts = points.astype(np.float64)
-
-    corners = [0]
-    for i in range(1, len(pts) - 1):
-        v1 = pts[i] - pts[i - 1]
-        v2 = pts[i + 1] - pts[i]
-        n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
-        if n1 < 1e-9 or n2 < 1e-9:
-            continue
-        cos_a = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
-        angle = np.degrees(np.arccos(cos_a))
-
-        # Skip inflection points: curvature sign flips but no sharp turn
-        w = max(1, smoothing_window)
-        if i >= w and i < len(pts) - w:
-            def _cross(a, b): return a[0] * b[1] - a[1] * b[0]
-            before = _cross(pts[i] - pts[i - w], pts[i + 1] - pts[i])
-            after  = _cross(pts[i] - pts[i - 1], pts[i + w] - pts[i])
-            if (before * after) < 0:   # inflection, not a corner
-                continue
-
-        if angle > angle_threshold_deg:
-            corners.append(i)
-
-    corners.append(len(points) - 1)
-    return corners
-
 class ContourBezierFitter:
     """Fit cubic Bezier curves to OpenCV contours.
 
@@ -446,25 +404,20 @@ class ContourBezierFitter:
         return BezierPath(segments, is_closed=is_closed, source_type="contour")
 
     def _find_corners(self, points: np.ndarray, is_closed: bool) -> List[int]:
-        """Detect corners using both RDP simplification and turning-angle analysis.
-
-        RDP gives scale-sensitive corners; angle analysis catches sharp bends
-        that RDP may miss. The union of both sets is returned, sorted and
-        deduplicated. Inflection points are excluded by _find_corners_angle.
-        """
-        # --- RDP-based corners (existing approach) ---
+        """Use RDP to find corner indices in the contour."""
+        # approxPolyDP needs (N, 1, 2)
         contour_cv = points.reshape(-1, 1, 2).astype(np.float32)
         approx = cv2.approxPolyDP(contour_cv, self.corner_threshold, is_closed)
         approx_pts = np.squeeze(approx).astype(np.float64)
         if approx_pts.ndim == 1:
             approx_pts = approx_pts.reshape(1, -1)
-        D = cdist(approx_pts, points, metric='euclidean')
-        rdp_indices = set(np.argmin(D, axis=1).tolist())
 
-        # --- Angle-based corners ---
-        angle_indices = set(_find_corners_angle(points, angle_threshold_deg=45.0))
+        # Compute all distances at once using cdist
+        D = cdist(approx_pts, points, metric='euclidean')  # shape (K, N)
+        corner_indices = list(np.argmin(D, axis=1))  # shape (K,)
 
-        corner_indices = sorted(rdp_indices | angle_indices)
+        # Sort and deduplicate
+        corner_indices = sorted(set(corner_indices))
         return corner_indices
 
     def _fit_segment(
@@ -550,146 +503,6 @@ def fit_from_image(
     return fit_from_contours(contours, corner_threshold, max_error, tangent_lookahead)
 
 
-def _chain_skeleton_edges(graph) -> List[np.ndarray]:
-    """Walk the skeleton graph and merge edges through degree-2 nodes.
-
-    A degree-2 node is an interior pass-through point of a stroke, not a
-    junction. Chaining through these collapses each physical stroke into a
-    single point array regardless of how many corners it has.
-
-    Traversal starts only at degree-1 (tip) or degree-3+ (junction/branch)
-    nodes. Isolated loops (all degree-2) are handled separately.
-
-    Returns
-    -------
-    List of (N, 2) float64 arrays in (x, y) order, one per logical stroke.
-    """
-    visited_edges: set = set()
-    chains: List[np.ndarray] = []
-
-    def _edge_key(a, b):
-        return (min(a, b), max(a, b))
-
-    def _pts_for_edge(u, v):
-        """Return edge point array oriented from u toward v, in (x, y)."""
-        raw = graph[u][v].get('pts', np.array([]))
-        if isinstance(raw, list):
-            raw = np.array(raw, dtype=np.float64)
-        else:
-            raw = np.asarray(raw, dtype=np.float64)
-        if raw.ndim != 2 or raw.shape[0] < 1:
-            # Fall back to node positions
-            nu = np.array(graph.nodes[u]['o'], dtype=np.float64)
-            nv = np.array(graph.nodes[v]['o'], dtype=np.float64)
-            raw = np.vstack([nu, nv])
-        # sknw stores (row, col) = (y, x); flip to (x, y)
-        raw = raw[:, ::-1]
-        # Orient: ensure raw[0] is closer to node u than raw[-1]
-        nu = np.array(graph.nodes[u]['o'][::-1], dtype=np.float64)  # (x,y)
-        if np.linalg.norm(raw[0] - nu) > np.linalg.norm(raw[-1] - nu):
-            raw = raw[::-1]
-        return raw
-
-    def _unit(vec: np.ndarray) -> np.ndarray:
-        n = np.linalg.norm(vec)
-        if n < 1e-9:
-            return np.array([1.0, 0.0])
-        return vec / n
-
-    def _concat_parts(parts: List[np.ndarray]) -> np.ndarray:
-        chain = parts[0].copy()
-        for part in parts[1:]:
-            if len(part) == 0:
-                continue
-            if np.linalg.norm(chain[-1] - part[0]) <= 1.5:
-                chain = np.vstack([chain, part[1:]])
-            elif np.linalg.norm(chain[-1] - part[-1]) <= 1.5:
-                part = part[::-1]
-                chain = np.vstack([chain, part[1:]])
-            else:
-                chain = np.vstack([chain, part])
-        return chain
-
-    def _choose_next_neighbor(cur: int, prev: int, nexts: List[int], incoming_vec: np.ndarray) -> int:
-        """Select continuation edge with best directional coherence."""
-        incoming = _unit(incoming_vec)
-        best_score = -np.inf
-        best_neighbor = nexts[0]
-        for n in nexts:
-            cand = _pts_for_edge(cur, n)
-            if len(cand) >= 2:
-                out_vec = cand[1] - cand[0]
-            else:
-                out_vec = (
-                    np.array(graph.nodes[n]['o'][::-1], dtype=np.float64)
-                    - np.array(graph.nodes[cur]['o'][::-1], dtype=np.float64)
-                )
-            score = float(np.dot(incoming, _unit(out_vec)))
-            if score > best_score:
-                best_score = score
-                best_neighbor = n
-        return best_neighbor
-
-    def _walk_chain(start: int, neighbor: int) -> Optional[np.ndarray]:
-        key = _edge_key(start, neighbor)
-        if key in visited_edges:
-            return None
-
-        chain_parts: List[np.ndarray] = []
-        prev, cur = start, neighbor
-        while True:
-            k = _edge_key(prev, cur)
-            if k in visited_edges:
-                break
-
-            visited_edges.add(k)
-            cur_part = _pts_for_edge(prev, cur)
-            chain_parts.append(cur_part)
-
-            if graph.degree(cur) != 2:
-                break  # stop at tip or junction
-
-            nexts = [n for n in graph.neighbors(cur) if _edge_key(cur, n) not in visited_edges]
-            if not nexts:
-                break
-
-            if len(cur_part) >= 2:
-                incoming_vec = cur_part[-1] - cur_part[-2]
-            else:
-                incoming_vec = (
-                    np.array(graph.nodes[cur]['o'][::-1], dtype=np.float64)
-                    - np.array(graph.nodes[prev]['o'][::-1], dtype=np.float64)
-                )
-
-            nxt = _choose_next_neighbor(cur, prev, nexts, incoming_vec)
-            prev, cur = cur, nxt
-
-        if not chain_parts:
-            return None
-        return _concat_parts(chain_parts)
-
-    # Walk from every non-degree-2 node
-    start_nodes = [n for n in graph.nodes() if graph.degree(n) != 2]
-    if not start_nodes:
-        start_nodes = list(graph.nodes())  # isolated loops fallback
-
-    for start in start_nodes:
-        for neighbor in list(graph.neighbors(start)):
-            chain = _walk_chain(start, neighbor)
-            if chain is not None and len(chain) >= 2:
-                chains.append(chain)
-
-    # Catch any unvisited edges (e.g. isolated loops)
-    for s, e in graph.edges():
-        if _edge_key(s, e) in visited_edges:
-            continue
-        chain = _walk_chain(s, e)
-        if chain is not None and len(chain) >= 2:
-            chains.append(chain)
-
-    return chains
-
-
 def fit_from_image_skeleton(
     image_path: str,
     max_error: float = 5.0,
@@ -725,196 +538,73 @@ def fit_from_image_skeleton(
     # Build graph from skeleton
     graph = sknw.build_sknw(skeleton)
 
-    # Process edges — use chained strokes instead of raw graph edges so that
-    # corners within a stroke don't fragment it into multiple BezierPaths.
-    chains = _chain_skeleton_edges(graph)
+    # Track which skeleton node each edge connects so we can build adjacency
+    edge_to_path_idx: Dict[int, List[int]] = {}  # skeleton node → [path indices]
 
+    # Process edges
     paths = []
-    for pts in chains:
+    for s, e in graph.edges():
+        edge_data = graph[s][e]
+        pts = edge_data.get('pts', [])
+        if isinstance(pts, list):
+            pts = np.array(pts, dtype=np.float64)
+        else:
+            pts = np.asarray(pts, dtype=np.float64)
+
+        # sknw returns points as (row, col) = (y, x); convert to (x, y).
+        if pts.ndim == 2 and pts.shape[1] >= 2:
+            pts = pts[:, ::-1]
+
         if len(pts) < 2:
             continue
+
+        # Estimate tangents and fit cubic
         lookahead = max(1, int(tangent_lookahead))
-        left_tangent  = _estimate_tangent(pts, "start", lookahead=lookahead)
-        right_tangent = _estimate_tangent(pts, "end",   lookahead=lookahead)
+        left_tangent = _estimate_tangent(pts, "start", lookahead=lookahead)
+        right_tangent = _estimate_tangent(pts, "end", lookahead=lookahead)
         cps_list = _fit_cubic_single(pts, left_tangent, right_tangent, max_error ** 2)
+
         segments = [BezierSegment(cps, source_type="skeleton") for cps in cps_list]
         if segments:
+            path_idx = len(paths)
             paths.append(BezierPath(segments, is_closed=False, source_type="skeleton"))
+            # Record skeleton node connections
+            for node in (s, e):
+                edge_to_path_idx.setdefault(node, []).append(path_idx)
 
-    # Endpoint snapping: pull close endpoints to a shared midpoint
+    # Build adjacency: paths sharing a skeleton node are connected
+    adjacency: Dict[int, set] = {}
+    for node, path_indices in edge_to_path_idx.items():
+        for i in range(len(path_indices)):
+            for j in range(i + 1, len(path_indices)):
+                pi, pj = path_indices[i], path_indices[j]
+                adjacency.setdefault(pi, set()).add(pj)
+                adjacency.setdefault(pj, set()).add(pi)
+
+    # Endpoint merging: snap endpoints of adjacent paths to exact same point
     if merge_radius > 0:
-        ends = []  # (path_idx, seg_end: 'start'|'end', cp_array, cp_index)
-        for i, p in enumerate(paths):
-            ends.append((i, 'start', p.segments[0].control_points,  0))
-            ends.append((i, 'end',   p.segments[-1].control_points, 3))
-        for a in range(len(ends)):
-            for b in range(a + 1, len(ends)):
-                ia, _, cp_a, idx_a = ends[a]
-                ib, _, cp_b, idx_b = ends[b]
-                if ia == ib:
+        for pi, neighbours in adjacency.items():
+            if pi >= len(paths):
+                continue
+            for pj in neighbours:
+                if pj >= len(paths) or pj <= pi:
                     continue
-                d = np.linalg.norm(cp_a[idx_a] - cp_b[idx_b])
-                if 0 < d <= merge_radius:
-                    mid = (cp_a[idx_a] + cp_b[idx_b]) / 2.0
-                    cp_a[idx_a] = mid
-                    cp_b[idx_b] = mid
+                pa, pb = paths[pi], paths[pj]
+                # Check all four endpoint combinations
+                endpoints = [
+                    (pa.segments[-1].control_points, 3, pb.segments[0].control_points, 0),
+                    (pa.segments[-1].control_points, 3, pb.segments[-1].control_points, 3),
+                    (pa.segments[0].control_points, 0, pb.segments[0].control_points, 0),
+                    (pa.segments[0].control_points, 0, pb.segments[-1].control_points, 3),
+                ]
+                for cp_a, idx_a, cp_b, idx_b in endpoints:
+                    d = np.linalg.norm(cp_a[idx_a] - cp_b[idx_b])
+                    if 0 < d <= merge_radius:
+                        midpoint = (cp_a[idx_a] + cp_b[idx_b]) / 2.0
+                        cp_a[idx_a] = midpoint
+                        cp_b[idx_b] = midpoint
 
-    adjacency: Dict[int, set] = {}   # no longer skeleton-node-based; kept for API compat
     return paths, adjacency
-
-
-def merge_nearby_paths(
-    paths: List[BezierPath],
-    gap_threshold: float = 20.0,
-    angle_threshold_deg: float = 60.0,
-    small_fragment_max_segments: int = 2,
-) -> List[BezierPath]:
-    """Chain BezierPaths whose endpoints are spatially close and directionally compatible.
-
-    Two paths are merged when:
-      - An endpoint of path A is within `gap_threshold` pixels of an endpoint of path B.
-      - The outgoing tangent directions at those endpoints point roughly toward each other
-        (their dot product < -(cos of angle_threshold_deg)), meaning the angle between
-        their outgoing tangents is > (180 - angle_threshold_deg).
-
-    Merging uses union-find so transitive chains (A→B→C) are handled in one pass.
-
-    Parameters
-    ----------
-    paths              : list of BezierPath objects to consider.
-    gap_threshold      : max endpoint distance (pixels) to consider merging.
-    angle_threshold_deg: directional compatibility gate (degrees). Tighter values
-                         prevent merging strokes that are parallel-but-close.
-
-    Returns
-    -------
-    A new list of BezierPath objects with compatible neighbours merged.
-    """
-    n = len(paths)
-    if n == 0:
-        return paths
-
-    parent = list(range(n))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a, b):
-        parent[find(a)] = find(b)
-
-    def _reverse_path(path: BezierPath) -> BezierPath:
-        """Reverse path direction while preserving cubic geometry."""
-        reversed_segments = [
-            BezierSegment(seg.control_points[[3, 2, 1, 0]].copy(), source_type=seg.source_type)
-            for seg in reversed(path.segments)
-        ]
-        return BezierPath(
-            segments=reversed_segments,
-            is_closed=path.is_closed,
-            source_type=path.source_type,
-        )
-
-    def _clone_path(path: BezierPath) -> BezierPath:
-        cloned_segments = [
-            BezierSegment(seg.control_points.copy(), source_type=seg.source_type)
-            for seg in path.segments
-        ]
-        return BezierPath(
-            segments=cloned_segments,
-            is_closed=path.is_closed,
-            source_type=path.source_type,
-        )
-
-    # Build endpoint table: (path_idx, side, point, outward_tangent)
-    def _outward_tangent(seg_cp: np.ndarray, side: str) -> np.ndarray:
-        if side == 'start':
-            t = seg_cp[0] - seg_cp[3]
-        else:
-            t = seg_cp[3] - seg_cp[0]
-        n_ = np.linalg.norm(t)
-        return t / n_ if n_ > 1e-9 else np.array([1.0, 0.0])
-
-    endpoints = []
-    for i, p in enumerate(paths):
-        endpoints.append((i, 'start', p.segments[0].control_points[0],
-                          _outward_tangent(p.segments[0].control_points,  'start')))
-        endpoints.append((i, 'end',   p.segments[-1].control_points[3],
-                          _outward_tangent(p.segments[-1].control_points, 'end')))
-
-    cos_gate = -np.cos(np.radians(angle_threshold_deg))  # negative = facing each other
-
-    for a in range(len(endpoints)):
-        for b in range(a + 1, len(endpoints)):
-            ia, side_a, pa, ta = endpoints[a]
-            ib, side_b, pb, tb = endpoints[b]
-            if find(ia) == find(ib):
-                continue
-            gap = pb - pa
-            gap_norm = np.linalg.norm(gap)
-            if gap_norm > gap_threshold:
-                continue
-
-            facing_each_other = np.dot(ta, tb) <= cos_gate
-            if not facing_each_other:
-                # Aggressive fallback for tiny orphan fragments.
-                small_fragment = min(paths[ia].num_segments, paths[ib].num_segments) <= small_fragment_max_segments
-                if not small_fragment:
-                    continue
-                if gap_norm < 1e-9:
-                    union(ia, ib)
-                    continue
-                gap_dir = gap / gap_norm
-                aligns_with_gap = np.dot(ta, gap_dir) > 0.0 and np.dot(tb, -gap_dir) > 0.0
-                if not aligns_with_gap:
-                    continue
-
-            union(ia, ib)
-
-    from collections import defaultdict
-    groups: dict = defaultdict(list)
-    for i in range(n):
-        groups[find(i)].append(i)
-
-    def _chain_group(group_indices: List[int]) -> BezierPath:
-        """Greedily order paths in a group by chaining nearest endpoints."""
-        if len(group_indices) == 1:
-            return _clone_path(paths[group_indices[0]])
-        remaining = [_clone_path(paths[i]) for i in group_indices]
-        ordered = [remaining.pop(0)]
-        while remaining:
-            tail = ordered[-1].segments[-1].control_points[3]
-            best_dist, best_idx, flip = float('inf'), 0, False
-            for j, cand in enumerate(remaining):
-                d_start = np.linalg.norm(tail - cand.segments[0].control_points[0])
-                d_end   = np.linalg.norm(tail - cand.segments[-1].control_points[3])
-                if d_start < best_dist:
-                    best_dist, best_idx, flip = d_start, j, False
-                if d_end < best_dist:
-                    best_dist, best_idx, flip = d_end,   j, True
-            chosen = remaining.pop(best_idx)
-            if flip:
-                chosen = _reverse_path(chosen)
-
-            # Snap adjoining endpoints for continuity in the merged chain.
-            tail_cp = ordered[-1].segments[-1].control_points
-            head_cp = chosen.segments[0].control_points
-            d = np.linalg.norm(tail_cp[3] - head_cp[0])
-            if 0 < d <= gap_threshold:
-                mid = (tail_cp[3] + head_cp[0]) / 2.0
-                tail_cp[3] = mid
-                head_cp[0] = mid
-
-            ordered.append(chosen)
-        all_segs = []
-        for p in ordered:
-            all_segs.extend(p.segments)
-        return BezierPath(all_segs, is_closed=False,
-                          source_type=paths[group_indices[0]].source_type)
-
-    return [_chain_group(list(idxs)) for idxs in groups.values()]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1233,39 +923,14 @@ if __name__ == "__main__":
         default=5,
         help="Lookahead window used for tangent estimation",
     )
-    parser.add_argument(
-        "--merge-radius",
-        type=float,
-        default=12.0,
-        help="Endpoint snapping radius for skeleton paths",
-    )
-    parser.add_argument(
-        "--gap-threshold",
-        type=float,
-        default=30.0,
-        help="Gap threshold for merge_nearby_paths",
-    )
-    parser.add_argument(
-        "--angle-threshold",
-        type=float,
-        default=48.0,
-        help="Directional threshold for merge_nearby_paths (degrees)",
-    )
     parser.set_defaults(skeleton=True)
     args = parser.parse_args()
 
     if args.skeleton:
-        paths, _adjacency = fit_from_image_skeleton(
+        paths = fit_from_image_skeleton(
             args.image_path,
             tangent_lookahead=args.tangent_lookahead,
-            merge_radius=args.merge_radius,
         )
-        if args.gap_threshold > 0:
-            paths = merge_nearby_paths(
-                paths,
-                gap_threshold=args.gap_threshold,
-                angle_threshold_deg=args.angle_threshold,
-            )
         label = f"Skeleton fitting: {args.image_path}"
     else:
         paths = fit_from_image(
