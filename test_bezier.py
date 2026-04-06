@@ -99,7 +99,7 @@ if __name__ == "__main__":
     print("Running bezier extraction tests...\n")
 
     # Test 1: Contour mode
-    test_image = "test_images/damaged_bolt.png"
+    test_image = "test_images/restoration_test_damaged.png"
     # if os.path.exists(test_image):
     #     print("▶ Test 1: Contour mode fitting")
     #     paths = process_image(test_image, use_skeleton=False)

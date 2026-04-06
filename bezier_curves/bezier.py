@@ -65,6 +65,10 @@ class BezierSegment:
         )  # shape (n, 2)
         return pts
 
+    def reverse(self) -> None:
+        """Reverse the direction of the control points."""
+        self.control_points = self.control_points[::-1].copy()
+
 
 @dataclass
 class BezierPath:
@@ -91,6 +95,12 @@ class BezierPath:
             return np.empty((0, 2))
         parts = [s.sample(pts_per_segment) for s in self.segments]
         return np.vstack(parts)
+
+    def reverse(self) -> None:
+        """Reverse the entire path sequence and direction."""
+        for seg in self.segments:
+            seg.reverse()
+        self.segments = self.segments[::-1]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -948,42 +958,131 @@ def _build_path_adjacency_from_chains(chains: List[_SkeletonChain]) -> Dict[int,
     return adjacency
 
 
+def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
+    """Remove short terminal branches (spurs) often created by corners."""
+    changed = True
+    while changed:
+        changed = False
+        degrees = dict(graph.degree())
+        edges_to_remove = []
+
+        is_multi = hasattr(graph, "is_multigraph") and graph.is_multigraph()
+        edges = graph.edges(keys=True, data=True) if is_multi else graph.edges(data=True)
+
+        for edge in edges:
+            u, v = edge[0], edge[1]
+            deg_u, deg_v = degrees.get(u, 0), degrees.get(v, 0)
+
+            if (deg_u == 1 and deg_v > 1) or (deg_v == 1 and deg_u > 1):
+                data = edge[3] if is_multi else edge[2]
+                pts = data.get("pts", [])
+
+                if len(pts) <= threshold_length:
+                    edges_to_remove.append(edge)
+
+        for edge in edges_to_remove:
+            if is_multi:
+                graph.remove_edge(edge[0], edge[1], key=edge[2])
+            else:
+                graph.remove_edge(edge[0], edge[1])
+            changed = True
+
+
+def _merge_connected_paths(paths: List[BezierPath], merge_radius: float) -> List[BezierPath]:
+    """Merge separate paths that connect end-to-end into single BezierPath objects."""
+    if not paths:
+        return []
+
+    merged = list(paths)
+    changed = True
+
+    while changed:
+        changed = False
+        best_pair = None
+        best_dist = float('inf')
+        best_config = None
+
+        n = len(merged)
+        for i in range(n):
+            for j in range(i + 1, n):
+                p_i = merged[i]
+                p_j = merged[j]
+
+                if not p_i.segments or not p_j.segments:
+                    continue
+                if p_i.is_closed or p_j.is_closed:
+                    continue
+
+                i_start = p_i.segments[0].control_points[0]
+                i_end = p_i.segments[-1].control_points[3]
+                j_start = p_j.segments[0].control_points[0]
+                j_end = p_j.segments[-1].control_points[3]
+
+                configs = [
+                    (np.linalg.norm(i_end - j_start), False, False),
+                    (np.linalg.norm(i_end - j_end), False, True),
+                    (np.linalg.norm(i_start - j_start), True, False),
+                    (np.linalg.norm(i_start - j_end), True, True)
+                ]
+
+                for dist, rev_i, rev_j in configs:
+                    if dist <= merge_radius and dist < best_dist:
+                        best_dist = dist
+                        best_pair = (i, j)
+                        best_config = (rev_i, rev_j)
+
+        if best_pair is not None:
+            i, j = best_pair
+            rev_i, rev_j = best_config
+            p_i, p_j = merged[i], merged[j]
+
+            if rev_i: p_i.reverse()
+            if rev_j: p_j.reverse()
+
+            midpoint = (p_i.segments[-1].control_points[3] + p_j.segments[0].control_points[0]) / 2.0
+            p_i.segments[-1].control_points[3] = midpoint
+            p_j.segments[0].control_points[0] = midpoint
+
+            new_path = BezierPath(
+                segments=p_i.segments + p_j.segments,
+                is_closed=False,
+                source_type=p_i.source_type
+            )
+
+            d_close = np.linalg.norm(new_path.segments[0].control_points[0] - new_path.segments[-1].control_points[3])
+            if d_close <= merge_radius:
+                new_path.is_closed = True
+                midpoint = (new_path.segments[0].control_points[0] + new_path.segments[-1].control_points[3]) / 2.0
+                new_path.segments[0].control_points[0] = midpoint
+                new_path.segments[-1].control_points[3] = midpoint
+
+            merged.pop(j)
+            merged.pop(i)
+            merged.append(new_path)
+            changed = True
+
+    return merged
+
+
 def fit_from_image_skeleton(
     image_path: str,
     max_error: float = 5.0,
     tangent_lookahead: int = 5,
-    merge_radius: float = 3.0,
+    merge_radius: float = 15.0,
     follow_junction_continuation: bool = True,
     junction_min_alignment: float = -0.30,
+    spur_threshold: float = 15.0,
 ) -> Tuple[List[BezierPath], Dict[int, set]]:
-    """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths.
-
-    Preferred over fit_from_image for line drawings, diagrams, and strokes,
-    where findContours would produce two parallel outlines instead of a
-    single centreline.
-
-    Returns
-    -------
-    paths : List[BezierPath]
-        Fitted B\u00e9zier paths.
-    adjacency : Dict[int, set]
-        Mapping path_index → set of path_indices that share a skeleton
-        node (i.e. paths that are already connected and should not be
-        bridged by the gap detector).
-    """
-    # Read image as grayscale
+    """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths."""
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise FileNotFoundError(f"Cannot read image: {image_path}")
 
-    # Binarize with Otsu threshold
     _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    # Skeletonize
     skeleton = skeletonize(binary / 255.0).astype(np.uint8)
-
-    # Build graph from skeleton
     graph = sknw.build_sknw(skeleton)
+
+    _prune_skeleton_spurs(graph, threshold_length=spur_threshold)
 
     chains = _build_skeleton_chains(
         graph,
@@ -992,7 +1091,6 @@ def fit_from_image_skeleton(
     )
 
     paths: List[BezierPath] = []
-    kept_chains: List[_SkeletonChain] = []
     lookahead = max(1, int(tangent_lookahead))
     for chain in chains:
         pts = chain.points
@@ -1014,34 +1112,10 @@ def fit_from_image_skeleton(
                 source_type="skeleton",
             )
         )
-        kept_chains.append(chain)
 
-    adjacency = _build_path_adjacency_from_chains(kept_chains)
+    merged_paths = _merge_connected_paths(paths, merge_radius=merge_radius)
 
-    # Endpoint merging: snap endpoints of adjacent paths to exact same point
-    if merge_radius > 0:
-        for pi, neighbours in adjacency.items():
-            if pi >= len(paths):
-                continue
-            for pj in neighbours:
-                if pj >= len(paths) or pj <= pi:
-                    continue
-                pa, pb = paths[pi], paths[pj]
-                # Check all four endpoint combinations
-                endpoints = [
-                    (pa.segments[-1].control_points, 3, pb.segments[0].control_points, 0),
-                    (pa.segments[-1].control_points, 3, pb.segments[-1].control_points, 3),
-                    (pa.segments[0].control_points, 0, pb.segments[0].control_points, 0),
-                    (pa.segments[0].control_points, 0, pb.segments[-1].control_points, 3),
-                ]
-                for cp_a, idx_a, cp_b, idx_b in endpoints:
-                    d = np.linalg.norm(cp_a[idx_a] - cp_b[idx_b])
-                    if 0 < d <= merge_radius:
-                        midpoint = (cp_a[idx_a] + cp_b[idx_b]) / 2.0
-                        cp_a[idx_a] = midpoint
-                        cp_b[idx_b] = midpoint
-
-    return paths, adjacency
+    return merged_paths, {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
