@@ -100,6 +100,15 @@ if __name__ == "__main__":
 
     # Test 1: Contour mode
     test_image = "test_images/restoration_test_damaged.png"
+    test_images = [
+        "test_images/restoration_small_gaps.png",
+        "test_images/restoration_test.png",
+        "test_images/restoration_test_damaged.png",
+        "test_images/restoration_test_damaged_big.png",
+        "test_images/damaged_shape.png",
+        "test_images/damaged_oval.png",
+        "test_images/damaged_bolt.png" 
+                   ]
     # if os.path.exists(test_image):
     #     print("▶ Test 1: Contour mode fitting")
     #     paths = process_image(test_image, use_skeleton=False)
@@ -109,6 +118,9 @@ if __name__ == "__main__":
     # Test 2: Skeleton mode
     if os.path.exists(test_image):
         print("\n▶ Test 2: Skeleton mode fitting")
-        paths = process_image(test_image, use_skeleton=True)
+        # paths = process_image(test_image, use_skeleton=True)
+        for img in test_images:
+            print(f"\nProcessing {img} with skeleton fitting...")
+            paths = process_image(img, use_skeleton=True)
     else:
         print(f"⚠ Test image not found for skeleton test: {test_image}")
