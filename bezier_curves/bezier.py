@@ -419,14 +419,6 @@ def _fit_cubic_single(
     if _is_near_straight(points, linear_tol):
         return [_fit_straight_cubic(points[0], points[-1])]
 
-    # Tighten the fit tolerance proportionally to how curved the segment is.
-    # Straight segments are already handled above, so this only affects curved ones.
-    # turn=30° → ×0.92,  turn=60° → ×0.83,  turn=90° → ×0.75,  turn≥180° → ×0.50 (floor).
-    turn = _max_turning_angle_deg(points)
-    if turn > 10.0:
-        curvature_scale = max(0.35, 1.0 - (turn / 180.0) * 0.7)
-        max_error = max_error * curvature_scale
-
     corner_idx = _dominant_turn_index(points, angle_threshold_deg=corner_split_angle_deg)
     if corner_idx is not None:
         center_tangent = points[corner_idx + 1] - points[corner_idx - 1]
