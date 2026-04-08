@@ -386,8 +386,8 @@ def _is_near_straight(points: np.ndarray, linear_tolerance: float) -> bool:
 
     return (
         max_dev <= linear_tolerance
-        and mean_dev <= linear_tolerance * 0.55
-        and turn <= 24.0
+        and mean_dev <= linear_tolerance * 0.70
+        and turn <= 32.0
     )
 
 
@@ -397,8 +397,9 @@ def _fit_cubic_single(
     right_tangent: np.ndarray,
     max_error: float,
     max_iterations: int = 4,
-    straightness_scale: float = 0.35,
+    straightness_scale: float = 0.75,
     corner_split_angle_deg: float = 72.0,
+    line_preference_improvement: float = 0.15,
 ) -> List[np.ndarray]:
     """Fit a set of points with one or more cubic Bezier curves (recursive).
 
@@ -435,6 +436,7 @@ def _fit_cubic_single(
             max_iterations=max_iterations,
             straightness_scale=straightness_scale,
             corner_split_angle_deg=corner_split_angle_deg,
+            line_preference_improvement=line_preference_improvement,
         )
         right_curves = _fit_cubic_single(
             points[corner_idx:],
@@ -444,12 +446,22 @@ def _fit_cubic_single(
             max_iterations=max_iterations,
             straightness_scale=straightness_scale,
             corner_split_angle_deg=corner_split_angle_deg,
+            line_preference_improvement=line_preference_improvement,
         )
         return left_curves + right_curves
 
     params = _chord_length_parameterize(points)
+    straight_cp = _fit_straight_cubic(points[0], points[-1])
+    straight_err, straight_mean_err, _ = _fit_error_stats(points, straight_cp, params)
+
     cp = _generate_bezier(points, params, left_tangent, right_tangent)
     err, mean_err, split_idx = _fit_error_stats(points, cp, params)
+
+    # Prefer an exact straight cubic unless the flexible cubic significantly improves fit.
+    if straight_err <= max_error * 1.35:
+        improvement = (straight_mean_err - mean_err) / max(straight_mean_err, 1e-12)
+        if improvement < line_preference_improvement:
+            return [straight_cp]
 
     mean_limit = max_error * 0.38
 
@@ -482,6 +494,7 @@ def _fit_cubic_single(
         max_iterations=max_iterations,
         straightness_scale=straightness_scale,
         corner_split_angle_deg=corner_split_angle_deg,
+        line_preference_improvement=line_preference_improvement,
     )
     right_curves = _fit_cubic_single(
         points[split_idx:],
@@ -491,6 +504,7 @@ def _fit_cubic_single(
         max_iterations=max_iterations,
         straightness_scale=straightness_scale,
         corner_split_angle_deg=corner_split_angle_deg,
+        line_preference_improvement=line_preference_improvement,
     )
     return left_curves + right_curves
 
@@ -512,12 +526,14 @@ class ContourBezierFitter:
     def __init__(
         self,
         corner_threshold: float = 2.0,
-        max_error: float = 5.0,
+        max_error: float = 2.0,
         tangent_lookahead: int = 5,
+        straightness_scale: float = 0.75,
     ):
         self.corner_threshold = corner_threshold
         self.max_error_sq = max_error ** 2  # Schneider uses squared error
         self.tangent_lookahead = max(1, int(tangent_lookahead))
+        self.straightness_scale = float(straightness_scale)
 
     def fit(self, contours: list) -> List[BezierPath]:
         """Fit Bezier paths to a list of OpenCV contours (Nx1x2 arrays)."""
@@ -612,7 +628,11 @@ class ContourBezierFitter:
                 right_tangent = -wrap_tangent
 
         return _fit_cubic_single(
-            points, left_tangent, right_tangent, self.max_error_sq
+            points,
+            left_tangent,
+            right_tangent,
+            self.max_error_sq,
+            straightness_scale=self.straightness_scale,
         )
 
 
@@ -651,14 +671,16 @@ def _extract_raster_contours(
 def fit_from_contours(
     contours: list,
     corner_threshold: float = 2.0,
-    max_error: float = 5.0,
+    max_error: float = 2.0,
     tangent_lookahead: int = 5,
+    straightness_scale: float = 0.75,
 ) -> List[BezierPath]:
     """Fit cubic Bezier paths to a list of OpenCV contours."""
     fitter = ContourBezierFitter(
         corner_threshold=corner_threshold,
         max_error=max_error,
         tangent_lookahead=tangent_lookahead,
+        straightness_scale=straightness_scale,
     )
     return fitter.fit(contours)
 
@@ -667,12 +689,19 @@ def fit_from_image(
     image_path: str,
     min_contour_area: float = 100.0,
     corner_threshold: float = 2.0,
-    max_error: float = 5.0,
+    max_error: float = 2.0,
     tangent_lookahead: int = 5,
+    straightness_scale: float = 0.75,
 ) -> List[BezierPath]:
     """End-to-end: raster image → contours → fitted cubic Bezier paths."""
     contours, _ = _extract_raster_contours(image_path, min_contour_area)
-    return fit_from_contours(contours, corner_threshold, max_error, tangent_lookahead)
+    return fit_from_contours(
+        contours,
+        corner_threshold,
+        max_error,
+        tangent_lookahead,
+        straightness_scale,
+    )
 
 
 @dataclass
@@ -1066,8 +1095,9 @@ def _merge_connected_paths(paths: List[BezierPath], merge_radius: float) -> List
 
 def fit_from_image_skeleton(
     image_path: str,
-    max_error: float = 5.0,
+    max_error: float = 2.0,
     tangent_lookahead: int = 5,
+    straightness_scale: float = 0.75,
     merge_radius: float = 5.0,
     follow_junction_continuation: bool = True,
     junction_min_alignment: float = -0.30,
@@ -1099,7 +1129,13 @@ def fit_from_image_skeleton(
 
         left_tangent = _estimate_tangent(pts, "start", lookahead=lookahead)
         right_tangent = _estimate_tangent(pts, "end", lookahead=lookahead)
-        cps_list = _fit_cubic_single(pts, left_tangent, right_tangent, max_error ** 2)
+        cps_list = _fit_cubic_single(
+            pts,
+            left_tangent,
+            right_tangent,
+            max_error ** 2,
+            straightness_scale=straightness_scale,
+        )
 
         segments = [BezierSegment(cps, source_type="skeleton") for cps in cps_list]
         if not segments:
@@ -1435,6 +1471,18 @@ if __name__ == "__main__":
         help="Lookahead window used for tangent estimation",
     )
     parser.add_argument(
+        "--max-error",
+        type=float,
+        default=2.0,
+        help="Maximum geometric error (pixels) before splitting",
+    )
+    parser.add_argument(
+        "--straightness-scale",
+        type=float,
+        default=0.75,
+        help="Near-straight tolerance scale (higher favors straight cubics)",
+    )
+    parser.add_argument(
         "--merge-radius",
         type=float,
         default=5.0,
@@ -1452,7 +1500,9 @@ if __name__ == "__main__":
     if args.skeleton:
         paths, _adjacency = fit_from_image_skeleton(
             args.image_path,
+            max_error=args.max_error,
             tangent_lookahead=args.tangent_lookahead,
+            straightness_scale=args.straightness_scale,
             merge_radius=args.merge_radius,
             spur_threshold=args.spur_threshold,
         )
@@ -1461,7 +1511,9 @@ if __name__ == "__main__":
         paths = fit_from_image(
             args.image_path,
             min_contour_area=args.min_area,
+            max_error=args.max_error,
             tangent_lookahead=args.tangent_lookahead,
+            straightness_scale=args.straightness_scale,
         )
         label = f"Contour fitting: {args.image_path}"
 
