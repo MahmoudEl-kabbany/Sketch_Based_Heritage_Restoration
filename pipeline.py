@@ -91,7 +91,6 @@ class PipelineConfig:
     # Paths
     shape_vocab_dir: str = ""
     output_dir: str = "restoration_output"
-    disable_single_gap_guard: bool = False
 
     def __post_init__(self) -> None:
         if self.feature_bridge is None:
@@ -197,13 +196,7 @@ def restore(
         vocab = build_shape_vocabulary(cfg.shape_vocab_dir, cfg.restoration)
 
     result = execute_restoration(
-        hypotheses,
-        paths,
-        efd_data,
-        vocab,
-        cfg.restoration,
-        features=features,
-        disable_single_gap_guard=cfg.disable_single_gap_guard,
+        hypotheses, paths, efd_data, vocab, cfg.restoration
     )
     logger.info(
         "  -> %d new segments, %d new paths",
@@ -312,17 +305,12 @@ def main() -> None:
         description="Sketch-Based Heritage Restoration Pipeline"
     )
     # Default image allows running `python pipeline.py` without arguments
-    default_img = os.path.join(_PROJECT_ROOT, "test_images", "restoration_test_damaged_big.png")
+    default_img = os.path.join(_PROJECT_ROOT, "test_images", "restoration_small_gaps.png")
     parser.add_argument("--image", default=default_img, help="Input sketch image path")
     parser.add_argument("--no-skeleton", action="store_false", dest="skeleton", help="Disable skeleton fitting")
     parser.add_argument("--vocab", default="", help="Shape vocabulary directory")
     parser.add_argument("--output", default="restoration_output", help="Output directory")
     parser.add_argument("--efd-order", type=int, default=40, help="EFD harmonic order")
-    parser.add_argument(
-        "--disable-single-gap-guard",
-        action="store_true",
-        help="Disable restoration fallback that force-closes unresolved single-contour gaps",
-    )
     parser.set_defaults(skeleton=True)
     args = parser.parse_args()
 
@@ -331,7 +319,6 @@ def main() -> None:
         efd_order=args.efd_order,
         shape_vocab_dir=args.vocab,
         output_dir=args.output,
-        disable_single_gap_guard=args.disable_single_gap_guard,
     )
 
     result, report = restore(args.image, cfg)
