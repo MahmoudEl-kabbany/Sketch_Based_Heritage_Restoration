@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import os
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -12,6 +12,9 @@ import pyefd
 
 from bezier_curves.bezier import BezierPath, BezierSegment, _fit_cubic_single
 from restoration.asp.asp_inference import RankedHypothesis
+
+if TYPE_CHECKING:
+    from restoration.feature_bridge import FeatureBundle
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +323,199 @@ def _choose_method(
     return "bezier"
 
 
+def _guard_method_for_single_gap(
+    symmetry_score: float,
+    path_idx: int,
+    efd_data: Dict[int, np.ndarray],
+    cfg: RestorationConfig,
+) -> str:
+    if symmetry_score >= cfg.symmetry_method_min_confidence:
+        return "symmetry"
+    if path_idx in efd_data:
+        return "efd"
+    return "bezier"
+
+
+def _inject_single_gap_guard_hypotheses(
+    hypotheses: Sequence[RankedHypothesis],
+    features: Optional["FeatureBundle"],
+    efd_data: Dict[int, np.ndarray],
+    cfg: RestorationConfig,
+) -> List[RankedHypothesis]:
+    if features is None:
+        return []
+
+    existing_pairs: set = set()
+    occupied: set = set()
+    for hyp in hypotheses:
+        pair = tuple(sorted((int(hyp.endpoint_a_id), int(hyp.endpoint_b_id))))
+        existing_pairs.add(pair)
+        occupied.add(int(hyp.endpoint_a_id))
+        occupied.add(int(hyp.endpoint_b_id))
+
+    next_rank = max((h.rank for h in hypotheses), default=0) + 1
+    next_gap = max((h.gap_id for h in hypotheses), default=-1) + 1
+    forced: List[RankedHypothesis] = []
+
+    for gap in features.gaps:
+        if gap.gap_kind != "single_contour_gap":
+            continue
+
+        a = int(gap.endpoint_a_id)
+        b = int(gap.endpoint_b_id)
+        if a == b:
+            continue
+
+        pair = tuple(sorted((a, b)))
+        if pair in existing_pairs:
+            continue
+
+        # Endpoint occupancy precedence: never override accepted assignments.
+        if a in occupied or b in occupied:
+            continue
+
+        method = _guard_method_for_single_gap(
+            symmetry_score=float(gap.symmetry_score),
+            path_idx=int(gap.path_a),
+            efd_data=efd_data,
+            cfg=cfg,
+        )
+        conf = float(np.clip(max(float(gap.confidence), 0.01), 0.0, 1.0))
+        forced.append(
+            RankedHypothesis(
+                rank=next_rank,
+                hypothesis_id=f"h_guard_{len(forced) + 1}",
+                gap_id=next_gap,
+                endpoint_a_id=a,
+                endpoint_b_id=b,
+                path_a=int(gap.path_a),
+                path_b=int(gap.path_b),
+                action="connect_endpoints",
+                method=method,
+                confidence=conf,
+                score=1.0 - conf,
+                is_forced=True,
+                metadata={
+                    "is_single_gap": 1.0,
+                    "guard_injected": 1.0,
+                    "symmetry_score": float(gap.symmetry_score),
+                },
+            )
+        )
+        existing_pairs.add(pair)
+        occupied.add(a)
+        occupied.add(b)
+        next_rank += 1
+        next_gap += 1
+
+    return forced
+
+
+def _inject_open_path_single_gap_hypotheses(
+    hypotheses: Sequence[RankedHypothesis],
+    paths: List[BezierPath],
+    endpoint_map: Dict[int, Dict[str, np.ndarray]],
+    efd_data: Dict[int, np.ndarray],
+    symmetry_axis: Optional[Tuple[np.ndarray, np.ndarray]],
+    cfg: RestorationConfig,
+) -> List[RankedHypothesis]:
+    existing_pairs: set = set()
+    occupied: set = set()
+    for hyp in hypotheses:
+        pair = tuple(sorted((int(hyp.endpoint_a_id), int(hyp.endpoint_b_id))))
+        existing_pairs.add(pair)
+        occupied.add(int(hyp.endpoint_a_id))
+        occupied.add(int(hyp.endpoint_b_id))
+
+    next_rank = max((h.rank for h in hypotheses), default=0) + 1
+    next_gap = max((h.gap_id for h in hypotheses), default=-1) + 1
+    injected: List[RankedHypothesis] = []
+
+    path_to_endpoints: Dict[int, List[int]] = {}
+    for endpoint_id, ep in endpoint_map.items():
+        pidx = int(ep["path_idx"][0])
+        path_to_endpoints.setdefault(pidx, []).append(int(endpoint_id))
+
+    for pidx, endpoint_ids in sorted(path_to_endpoints.items()):
+        if len(endpoint_ids) != 2:
+            continue
+        if pidx < 0 or pidx >= len(paths):
+            continue
+
+        path = paths[pidx]
+        if path.is_closed or not path.segments:
+            continue
+
+        a, b = sorted(endpoint_ids)
+        pair = (a, b)
+        if pair in existing_pairs:
+            continue
+        if a in occupied or b in occupied:
+            continue
+
+        p0 = endpoint_map[a]["point"].astype(np.float64)
+        p3 = endpoint_map[b]["point"].astype(np.float64)
+        gap_dist = float(np.linalg.norm(p3 - p0))
+        if gap_dist < 1e-9:
+            continue
+
+        sampled = path.sample(55)
+        if len(sampled) < 3:
+            continue
+        path_len = float(np.sum(np.linalg.norm(np.diff(sampled, axis=0), axis=1))) + 1e-9
+        closure_ratio = gap_dist / path_len
+
+        # Conservative guard: only near-closed open contours are auto-closed.
+        if closure_ratio > 0.35:
+            continue
+
+        symmetry_score = 0.0
+        if symmetry_axis is not None:
+            center, axis = symmetry_axis
+            reflected_start = _reflect_point(p0, center, axis)
+            bbox_diag = float(np.linalg.norm(sampled.max(axis=0) - sampled.min(axis=0))) + 1e-6
+            symmetry_score = float(np.exp(-np.linalg.norm(reflected_start - p3) / (0.25 * bbox_diag + 1e-6)))
+
+        method = _guard_method_for_single_gap(
+            symmetry_score=symmetry_score,
+            path_idx=pidx,
+            efd_data=efd_data,
+            cfg=cfg,
+        )
+        conf = float(np.clip(1.0 - closure_ratio, 0.05, 0.95))
+
+        injected.append(
+            RankedHypothesis(
+                rank=next_rank,
+                hypothesis_id=f"h_guard_path_{len(injected) + 1}",
+                gap_id=next_gap,
+                endpoint_a_id=a,
+                endpoint_b_id=b,
+                path_a=pidx,
+                path_b=pidx,
+                action="connect_endpoints",
+                method=method,
+                confidence=conf,
+                score=1.0 - conf,
+                is_forced=True,
+                metadata={
+                    "is_single_gap": 1.0,
+                    "guard_injected": 1.0,
+                    "guard_source_path": 1.0,
+                    "closure_ratio": closure_ratio,
+                    "symmetry_score": symmetry_score,
+                },
+            )
+        )
+        existing_pairs.add(pair)
+        occupied.add(a)
+        occupied.add(b)
+        next_rank += 1
+        next_gap += 1
+
+    return injected
+
+
 def _shape_hint_for_path(path: BezierPath) -> str:
     pts = path.sample(120)
     if len(pts) < 10:
@@ -381,6 +577,8 @@ def execute_restoration(
     efd_data: Dict[int, np.ndarray],
     vocab: Optional[ShapeVocab],
     config: Optional[RestorationConfig] = None,
+    features: Optional["FeatureBundle"] = None,
+    disable_single_gap_guard: bool = False,
 ) -> RestorationResult:
     """Apply ranked hypotheses to synthesize restoration geometry."""
     cfg = config or RestorationConfig()
@@ -397,7 +595,34 @@ def execute_restoration(
     occupied_endpoints: set = set()
     segment_counter = 1
 
-    ranked = sorted(hypotheses, key=lambda h: (-h.confidence, h.score, h.rank))
+    effective_hypotheses = list(hypotheses)
+    if not disable_single_gap_guard:
+        guard_hypotheses = _inject_single_gap_guard_hypotheses(
+            hypotheses=effective_hypotheses,
+            features=features,
+            efd_data=efd_data,
+            cfg=cfg,
+        )
+        if guard_hypotheses:
+            logger.info("Injected %d single-gap guard hypotheses", len(guard_hypotheses))
+            effective_hypotheses.extend(guard_hypotheses)
+
+        path_guard_hypotheses = _inject_open_path_single_gap_hypotheses(
+            hypotheses=effective_hypotheses,
+            paths=base_paths,
+            endpoint_map=endpoint_map,
+            efd_data=efd_data,
+            symmetry_axis=symmetry_axis,
+            cfg=cfg,
+        )
+        if path_guard_hypotheses:
+            logger.info(
+                "Injected %d open-path single-gap fallback hypotheses",
+                len(path_guard_hypotheses),
+            )
+            effective_hypotheses.extend(path_guard_hypotheses)
+
+    ranked = sorted(effective_hypotheses, key=lambda h: (-h.confidence, h.score, h.rank))
     for hyp in ranked[: cfg.max_actions]:
         if hyp.endpoint_a_id not in endpoint_map or hyp.endpoint_b_id not in endpoint_map:
             continue
@@ -492,7 +717,7 @@ def execute_restoration(
         occupied_endpoints.add(hyp.endpoint_b_id)
 
     result.restored_paths.extend(result.new_paths)
-    result.metadata["num_hypotheses"] = float(len(hypotheses))
+    result.metadata["num_hypotheses"] = float(len(effective_hypotheses))
     result.metadata["num_actions"] = float(len(result.actions_applied))
     result.metadata["num_forced"] = float(sum(1 for a in result.additions if a.is_forced))
 
