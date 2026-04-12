@@ -27,11 +27,15 @@ class ConnectionCandidate:
     id: int
     ep_a: EndpointInfo
     ep_b: EndpointInfo
-    scenario: str              # "continuation" | "extension_intersection"
+    scenario: str              # "continuation" | "extension_intersection" | "self_closure"
     bridge_points: np.ndarray  # (N, 2) sampled bridge
     bridge_bezier: List[BezierSegment]
     distance: float
     tier: int = 1              # 1 = normal, 2 = extended-radius
+    bilateral_alignment: float = 0.0
+    misalignment_deg: float = 180.0
+    spur_involved: bool = False
+    same_path_closure: bool = False
     score: float = 0.0
 
 
@@ -44,6 +48,63 @@ def _safe_normalize(v: np.ndarray) -> np.ndarray:
     if n < 1e-12:
         return np.array([1.0, 0.0], dtype=np.float64)
     return v / n
+
+
+def _path_length(path: BezierPath, pts_per_segment: int = 20) -> float:
+    """Approximate arc length of one path by sampling."""
+    if not path.segments:
+        return 0.0
+    pts = path.sample(pts_per_segment=pts_per_segment)
+    if len(pts) < 2:
+        return 0.0
+    return float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+
+
+def _pair_alignment_metrics(ep_a: EndpointInfo, ep_b: EndpointInfo) -> Tuple[float, float, float, float]:
+    """Directional compatibility metrics for endpoint pairing."""
+    direction_ab = ep_b.position - ep_a.position
+    n = np.linalg.norm(direction_ab)
+    if n < 1e-12:
+        return 0.0, 0.0, 0.0, 180.0
+
+    dir_ab = direction_ab / n
+    forward_a = float(np.dot(ep_a.tangent, dir_ab))
+    forward_b = float(np.dot(ep_b.tangent, -dir_ab))
+    bilateral = min(forward_a, forward_b)
+    anti_parallel = float(np.clip(np.dot(ep_a.tangent, -ep_b.tangent), -1.0, 1.0))
+    misalignment = float(np.degrees(np.arccos(anti_parallel)))
+    return forward_a, forward_b, bilateral, misalignment
+
+
+def _passes_direction_gates(
+    forward_a: float,
+    forward_b: float,
+    bilateral: float,
+    misalignment_deg: float,
+    tier: int,
+    same_path: bool = False,
+) -> bool:
+    """Conservative geometric gate to reject ambiguous pairings."""
+    if same_path:
+        min_forward = -0.05
+        min_bilateral = -0.10
+        max_misalignment = 120.0
+    elif tier == 1:
+        min_forward = 0.05
+        min_bilateral = 0.02
+        max_misalignment = 90.0
+    else:
+        min_forward = 0.15
+        min_bilateral = 0.10
+        max_misalignment = 72.0
+
+    if forward_a < min_forward or forward_b < min_forward:
+        return False
+    if bilateral < min_bilateral:
+        return False
+    if misalignment_deg > max_misalignment:
+        return False
+    return True
 
 
 def _ray_point_distance(origin: np.ndarray, direction: np.ndarray,
@@ -266,6 +327,7 @@ def generate_candidates(
     result: ExtractionResult,
     lookahead_fraction: float = 0.15,
     max_per_endpoint: int = 5,
+    self_closure_gap_ratio: float = 0.22,
 ) -> List[ConnectionCandidate]:
     """Generate connection candidates for all open endpoints.
 
@@ -288,6 +350,72 @@ def generate_candidates(
     # Track per-endpoint candidate counts for the cap
     ep_candidate_count: Dict[int, int] = {i: 0 for i in range(len(endpoints))}
     seen_pairs: set = set()
+
+    endpoint_idx_by_key: Dict[Tuple[int, str], int] = {
+        (ep.path_index, ep.end): idx for idx, ep in enumerate(endpoints)
+    }
+
+    path_lengths: Dict[int, float] = {
+        idx: _path_length(path) for idx, path in enumerate(result.paths)
+    }
+    spur_length_soft = max(22.0, result.diagonal * 0.008)
+    spur_length_hard = max(36.0, result.diagonal * 0.012)
+    is_spur_path: Dict[int, bool] = {}
+    for idx, path in enumerate(result.paths):
+        plen = path_lengths.get(idx, 0.0)
+        few_segments = len(path.segments) <= 2
+        is_spur_path[idx] = (plen <= spur_length_soft) or (few_segments and plen <= spur_length_hard)
+
+    # Same-path near-closure candidates (critical for broken circles/loops).
+    for path_idx, path in enumerate(result.paths):
+        if path.is_closed or not path.segments:
+            continue
+        idx_start = endpoint_idx_by_key.get((path_idx, "start"))
+        idx_end = endpoint_idx_by_key.get((path_idx, "end"))
+        if idx_start is None or idx_end is None:
+            continue
+
+        ep_start = endpoints[idx_start]
+        ep_end = endpoints[idx_end]
+        dist = float(np.linalg.norm(ep_end.position - ep_start.position))
+        path_len = max(path_lengths.get(path_idx, 0.0), 1e-6)
+        gap_ratio = dist / path_len
+
+        if gap_ratio > self_closure_gap_ratio or dist > (radius_t1 * 1.25):
+            continue
+
+        if ep_candidate_count[idx_start] >= max_per_endpoint or ep_candidate_count[idx_end] >= max_per_endpoint:
+            continue
+
+        fwd_a, fwd_b, bilateral, misalignment_deg = _pair_alignment_metrics(ep_end, ep_start)
+        if not _passes_direction_gates(
+            fwd_a, fwd_b, bilateral, misalignment_deg, tier=1, same_path=True,
+        ):
+            continue
+
+        pair_key = (min(idx_start, idx_end), max(idx_start, idx_end))
+        if pair_key in seen_pairs:
+            continue
+
+        bridge_segs = _build_continuation_bridge(ep_end, ep_start)
+        candidates.append(ConnectionCandidate(
+            id=cid,
+            ep_a=ep_end,
+            ep_b=ep_start,
+            scenario="self_closure",
+            bridge_points=_sample_bridge(bridge_segs),
+            bridge_bezier=bridge_segs,
+            distance=dist,
+            tier=1,
+            bilateral_alignment=bilateral,
+            misalignment_deg=misalignment_deg,
+            spur_involved=is_spur_path.get(path_idx, False),
+            same_path_closure=True,
+        ))
+        cid += 1
+        ep_candidate_count[idx_start] += 1
+        ep_candidate_count[idx_end] += 1
+        seen_pairs.add(pair_key)
 
     # Query all pairs within Tier 2 radius (superset of Tier 1)
     for i, ep_a in enumerate(endpoints):
@@ -316,13 +444,25 @@ def generate_candidates(
                 continue
 
             tier = 1 if dist <= radius_t1 else 2
+            fwd_a, fwd_b, bilateral, misalignment_deg = _pair_alignment_metrics(ep_a, ep_b)
+            if not _passes_direction_gates(
+                fwd_a, fwd_b, bilateral, misalignment_deg, tier=tier, same_path=False,
+            ):
+                continue
+
+            spur_involved = is_spur_path.get(ep_a.path_index, False) or is_spur_path.get(ep_b.path_index, False)
+            if spur_involved:
+                if dist > radius_t1 * 0.65:
+                    continue
+                if bilateral < 0.45 or misalignment_deg > 64.0:
+                    continue
 
             path_a = result.paths[ep_a.path_index]
             path_b = result.paths[ep_b.path_index]
 
             # --- Scenario 1: Good Continuation ---
             tol = continuation_tolerance if tier == 1 else continuation_tolerance * 0.5
-            if _test_good_continuation(ep_a, ep_b, tol):
+            if _test_good_continuation(ep_a, ep_b, tol) and _test_good_continuation(ep_b, ep_a, tol):
                 bridge_segs = _build_continuation_bridge(ep_a, ep_b)
                 candidates.append(ConnectionCandidate(
                     id=cid,
@@ -332,6 +472,9 @@ def generate_candidates(
                     bridge_bezier=bridge_segs,
                     distance=dist,
                     tier=tier,
+                    bilateral_alignment=bilateral,
+                    misalignment_deg=misalignment_deg,
+                    spur_involved=spur_involved,
                 ))
                 cid += 1
                 ep_candidate_count[i] += 1
@@ -366,12 +509,15 @@ def generate_candidates(
                         bridge_bezier=bridge_segs,
                         distance=dist,
                         tier=tier,
+                        bilateral_alignment=bilateral,
+                        misalignment_deg=misalignment_deg,
+                        spur_involved=spur_involved,
                     ))
                     cid += 1
                     ep_candidate_count[i] += 1
                     ep_candidate_count[j] += 1
                     seen_pairs.add(pair_key)
 
-    # Sort by distance
-    candidates.sort(key=lambda c: c.distance)
+    # Keep geometry-consistent candidates first before scoring.
+    candidates.sort(key=lambda c: (c.distance, c.misalignment_deg, -c.bilateral_alignment, c.id))
     return candidates

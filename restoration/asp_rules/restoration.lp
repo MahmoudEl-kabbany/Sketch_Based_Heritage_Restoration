@@ -7,6 +7,7 @@
 %   endpoint_id(EndpointId, PathIdx, End).
 %   candidate(Id, PathA, EndA, PathB, EndB, Score).
 %   candidate_endpoint(Id, EndpointAId, EndpointBId).
+%   candidate_self_closure(Id).
 %   gestalt_continuation(Id, ContScore).   % 0..100
 %   gestalt_closure(Id, Flag).             % 0 or 1
 %   tier(Id, Tier).                        % 1 or 2
@@ -39,13 +40,16 @@ uses_endpoint(Id, E) :- candidate_endpoint(Id, _, E).
    candidate(Id2, _, _, P, E, _).
 
 % --- Constraint: no self-connections (same path both sides) ---
-:- accept(Id), candidate(Id, P, _, P, _, _).
+:- accept(Id), candidate(Id, P, _, P, _, _), not candidate_self_closure(Id).
 
 % --- Optimization: maximize total score ---
 #maximize { Score, Id : accept(Id), candidate(Id, _, _, _, _, Score) }.
 
 % --- Soft: favour closure-completing connections ---
 :~ accept(Id), gestalt_closure(Id, 1). [-3, Id]
+
+% --- Soft: slightly favour guarded self-closure over cross-shape ambiguity ---
+:~ accept(Id), candidate_self_closure(Id). [-2, Id]
 
 % --- Soft: penalize weak directional continuation ---
 :~ accept(Id), gestalt_continuation(Id, C), C < 40. [2, Id]

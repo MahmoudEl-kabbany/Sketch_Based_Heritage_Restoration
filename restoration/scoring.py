@@ -248,6 +248,28 @@ def score_candidates(
             - weights["jerk"] * norm_jerk[idx]
         )
 
+        # PR2 tie-break refinements: prioritize robust local closure, suppress spur links.
+        c.score += 0.16 * max(0.0, float(getattr(c, "bilateral_alignment", 0.0)))
+        if getattr(c, "same_path_closure", False):
+            c.score += 0.20
+        if getattr(c, "spur_involved", False):
+            c.score -= 0.22
+
+        misalignment_deg = float(getattr(c, "misalignment_deg", 180.0))
+        if misalignment_deg > 70.0:
+            c.score -= 0.08 * min(1.0, (misalignment_deg - 70.0) / 60.0)
+
+        if c.tier == 2 and float(getattr(c, "bilateral_alignment", 0.0)) < 0.25:
+            c.score -= 0.06
+
     # Sort best-first
-    candidates.sort(key=lambda c: -c.score)
+    candidates.sort(
+        key=lambda c: (
+            -c.score,
+            c.distance,
+            c.misalignment_deg,
+            -c.bilateral_alignment,
+            c.id,
+        )
+    )
     return candidates

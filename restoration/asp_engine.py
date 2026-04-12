@@ -57,6 +57,11 @@ def encode_facts(
 
     lines.append("")
 
+    # Sentinel keeps candidate_self_closure/1 in the ASP head space even
+    # when no actual self-closure candidates exist in this solve instance.
+    lines.append("candidate_self_closure(-1).")
+    lines.append("")
+
     # Candidate facts
     for c in candidates:
         ea = end_map[c.ep_a.end]
@@ -69,6 +74,8 @@ def encode_facts(
             f"{c.ep_b.path_index},{eb},{score_int})."
         )
         lines.append(f"candidate_endpoint({c.id},{ea_id},{eb_id}).")
+        if getattr(c, "same_path_closure", False):
+            lines.append(f"candidate_self_closure({c.id}).")
 
         # Gestalt sub-scores (used by soft rules in the ASP program)
         direction_ab = c.ep_b.position - c.ep_a.position
@@ -82,7 +89,8 @@ def encode_facts(
         lines.append(f"gestalt_continuation({c.id},{cont_int}).")
 
         # Closure flag
-        closure_flag = 1 if c.score > 0.5 and c.distance < 30.0 else 0
+        closure_flag = 1 if (getattr(c, "same_path_closure", False)
+                     or (c.score > 0.45 and c.distance < 30.0)) else 0
         lines.append(f"gestalt_closure({c.id},{closure_flag}).")
 
         # Tier
@@ -153,7 +161,7 @@ uses_endpoint(Id, E) :- candidate_endpoint(Id, _, E).
    candidate(Id1, _, _, P, E, _),
    candidate(Id2, _, _, P, E, _).
 
-:- accept(Id), candidate(Id, P, _, P, _, _).
+:- accept(Id), candidate(Id, P, _, P, _, _), not candidate_self_closure(Id).
 
 #maximize { Score, Id : accept(Id), candidate(Id, _, _, _, _, Score) }.
 """
