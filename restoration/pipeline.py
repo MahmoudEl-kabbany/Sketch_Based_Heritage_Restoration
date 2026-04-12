@@ -11,7 +11,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
@@ -74,6 +74,71 @@ def _sanitize_accepted_candidates(
         sanitized.append(c)
 
     return sanitized, dropped
+
+
+def _safe_unit(v: np.ndarray) -> np.ndarray:
+    """Return a unit vector with robust fallback for degenerate vectors."""
+    n = float(np.linalg.norm(v))
+    if n < 1e-12:
+        return np.array([1.0, 0.0], dtype=np.float64)
+    return v / n
+
+
+def _numeric_summary(values: List[float], digits: int = 3) -> Dict[str, float]:
+    """Summarize numeric lists for reporting."""
+    if not values:
+        return {"min": 0.0, "max": 0.0, "mean": 0.0}
+    arr = np.asarray(values, dtype=np.float64)
+    return {
+        "min": round(float(np.min(arr)), digits),
+        "max": round(float(np.max(arr)), digits),
+        "mean": round(float(np.mean(arr)), digits),
+    }
+
+
+def _count_by(items: List[Any], key_fn) -> Dict[str, int]:
+    """Count occurrences of computed keys in a list."""
+    counts: Dict[str, int] = {}
+    for item in items:
+        key = str(key_fn(item))
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _build_bridge_event_explanation(
+    label_id: str,
+    candidate: ConnectionCandidate,
+    segment_count: int,
+    approx_length_px: float,
+) -> str:
+    """Create a detailed, human-readable explanation for an ASP bridge event."""
+    quality = max(0.0, min(1.0, (float(candidate.bilateral_alignment) + max(0.0, 1.0 - float(candidate.misalignment_deg) / 180.0)) / 2.0))
+    return (
+        f"{label_id} is an ASP-selected bridge from candidate C{candidate.id}. "
+        f"It links path {candidate.ep_a.path_index} ({candidate.ep_a.end}) to "
+        f"path {candidate.ep_b.path_index} ({candidate.ep_b.end}) using the "
+        f"'{candidate.scenario}' scenario. Gap distance is {candidate.distance:.1f}px, "
+        f"directional alignment is {candidate.bilateral_alignment:.3f}, and endpoint "
+        f"misalignment is {candidate.misalignment_deg:.1f} deg. The accepted score is "
+        f"{candidate.score:.3f} (tier {candidate.tier}), producing {segment_count} bridge "
+        f"segment(s) with an estimated repaired length of {approx_length_px:.1f}px. "
+        f"Estimated geometric confidence is {quality:.2f}."
+    )
+
+
+def _build_efd_event_explanation(
+    label_id: str,
+    segment_count: int,
+    approx_length_px: float,
+) -> str:
+    """Create a detailed explanation for an EFD closure event."""
+    return (
+        f"{label_id} is an EFD single-gap closure applied after bridge synthesis. "
+        f"The contour remained open with one recoverable gap, so the EFD closure stage "
+        f"inserted {segment_count} closure segment(s) covering approximately "
+        f"{approx_length_px:.1f}px to complete the shape boundary while preserving local "
+        f"curvature continuity."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -144,6 +209,7 @@ def _save_visualization(
 def _save_labeled_restoration(
     image_path: str,
     final_paths: List[BezierPath],
+    accepted: Optional[List[ConnectionCandidate]],
     output_dir: str,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Save an overlay of the original image with labeled restoration bridges."""
@@ -160,8 +226,31 @@ def _save_labeled_restoration(
     fig, ax = plt.subplots(figsize=(10, 10 * h / w))
     ax.imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
 
+    bridge_owner_by_segment_id: Dict[int, ConnectionCandidate] = {}
+    if accepted:
+        for c in accepted:
+            for bridge_seg in getattr(c, "bridge_bezier", []):
+                bridge_owner_by_segment_id[id(bridge_seg)] = c
+
     changes = []
     change_count = 0
+    placed_boxes: List[Tuple[float, float, float, float]] = []
+    img_diag = float(np.hypot(h, w))
+
+    def _estimate_label_box(text: str) -> Tuple[float, float]:
+        width = max(18.0, 5.5 * len(text) + 8.0)
+        height = 12.0
+        return width, height
+
+    def _overlaps(box_a: Tuple[float, float, float, float],
+                  box_b: Tuple[float, float, float, float],
+                  pad: float = 2.0) -> bool:
+        return not (
+            box_a[2] + pad < box_b[0]
+            or box_b[2] + pad < box_a[0]
+            or box_a[3] + pad < box_b[1]
+            or box_b[3] + pad < box_a[1]
+        )
 
     for path in final_paths:
         i = 0
@@ -181,36 +270,138 @@ def _save_labeled_restoration(
 
                 # Sample points for the change accurately
                 change_pts_list = []
-                for s in path.segments[start_i:end_i]:
+                event_segments = path.segments[start_i:end_i]
+                for s in event_segments:
                     change_pts_list.append(s.sample(n=30))
                 change_pts = np.vstack(change_pts_list)
 
-                # 1. Draw the "glow" effect for the bridge
-                ax.plot(change_pts[:, 0], change_pts[:, 1], color='#00FF00',
-                        linewidth=4, alpha=0.3, zorder=4)
-                # 2. Draw the accurate restoration path (neon green)
-                ax.plot(change_pts[:, 0], change_pts[:, 1], color='#39FF14',
-                        linewidth=2, alpha=0.9, zorder=5)
+                # Draw a single clean green line (no glow).
+                ax.plot(
+                    change_pts[:, 0],
+                    change_pts[:, 1],
+                    color="#2ecc40",
+                    linewidth=2.1,
+                    alpha=1.0,
+                    zorder=5,
+                    solid_capstyle="round",
+                    solid_joinstyle="round",
+                )
 
-                # 3. Label position - midpoint of the sampled points
+                # Label position - midpoint, offset along normal with collision avoidance.
                 mid_idx = len(change_pts) // 2
                 pos = change_pts[mid_idx]
+                prev_pt = change_pts[max(0, mid_idx - 1)]
+                next_pt = change_pts[min(len(change_pts) - 1, mid_idx + 1)]
+                tangent = _safe_unit(next_pt - prev_pt)
+                normal = _safe_unit(np.array([-tangent[1], tangent[0]], dtype=np.float64))
+                base_offset = float(np.clip(img_diag * 0.007, 8.0, 18.0))
+                box_w, box_h = _estimate_label_box(label_id)
 
-                # Offset label slightly up
-                ax.text(pos[0], pos[1] - 8, label_id,
-                        color='white', fontsize=10, fontweight='bold',
-                        ha='center', va='bottom', zorder=10,
-                        bbox=dict(facecolor='#006400', alpha=0.85,
-                                  edgecolor='white', boxstyle='round,pad=0.2'))
+                anchor = pos.copy()
+                attempts = [
+                    (1.0, 0.0),
+                    (-1.0, 0.0),
+                    (1.8, 0.4),
+                    (-1.8, 0.4),
+                    (2.6, -0.3),
+                    (-2.6, -0.3),
+                    (0.9, 1.0),
+                    (-0.9, 1.0),
+                ]
+                margin = 8.0
+                for n_scale, t_scale in attempts:
+                    candidate_pos = pos + normal * (base_offset * n_scale) + tangent * (base_offset * t_scale)
+                    cx = float(np.clip(candidate_pos[0], margin, w - margin))
+                    cy = float(np.clip(candidate_pos[1], margin, h - margin))
+                    box = (cx - box_w / 2.0, cy - box_h / 2.0, cx + box_w / 2.0, cy + box_h / 2.0)
+                    if not any(_overlaps(box, existing) for existing in placed_boxes):
+                        anchor = np.array([cx, cy], dtype=np.float64)
+                        placed_boxes.append(box)
+                        break
+                else:
+                    cx = float(np.clip(pos[0], margin, w - margin))
+                    cy = float(np.clip(pos[1], margin, h - margin))
+                    box = (cx - box_w / 2.0, cy - box_h / 2.0, cx + box_w / 2.0, cy + box_h / 2.0)
+                    anchor = np.array([cx, cy], dtype=np.float64)
+                    placed_boxes.append(box)
+
+                ax.text(
+                    anchor[0],
+                    anchor[1],
+                    label_id,
+                    color="white",
+                    fontsize=8,
+                    fontweight="bold",
+                    ha="center",
+                    va="center",
+                    zorder=10,
+                    bbox=dict(
+                        facecolor="#1f7a1f",
+                        alpha=0.82,
+                        edgecolor="none",
+                        boxstyle="round,pad=0.12",
+                    ),
+                )
+
+                approx_length = float(np.sum(np.linalg.norm(np.diff(change_pts, axis=0), axis=1))) if len(change_pts) >= 2 else 0.0
+
+                owning_candidate = None
+                if source == "bridge":
+                    for bridge_seg in event_segments:
+                        owning_candidate = bridge_owner_by_segment_id.get(id(bridge_seg))
+                        if owning_candidate is not None:
+                            break
 
                 # Add to changes list for report explanation
                 desc = "ASP Junction Bridge" if source == "bridge" else "EFD Gap Closure"
-                changes.append({
+                event_entry: Dict[str, Any] = {
                     "id": label_id,
+                    "source": "asp_bridge" if source == "bridge" else "efd_gap_closure",
                     "type": desc,
                     "coordinates": [round(float(pos[0]), 1), round(float(pos[1]), 1)],
-                    "segment_count": end_i - start_i
-                })
+                    "segment_count": end_i - start_i,
+                    "geometry": {
+                        "approx_length_px": round(approx_length, 2),
+                        "sample_points": int(len(change_pts)),
+                    },
+                }
+
+                if source == "bridge" and owning_candidate is not None:
+                    event_entry["candidate"] = {
+                        "id": int(owning_candidate.id),
+                        "scenario": str(owning_candidate.scenario),
+                        "tier": int(owning_candidate.tier),
+                        "distance_px": round(float(owning_candidate.distance), 2),
+                        "score": round(float(owning_candidate.score), 4),
+                        "bilateral_alignment": round(float(owning_candidate.bilateral_alignment), 4),
+                        "misalignment_deg": round(float(owning_candidate.misalignment_deg), 2),
+                        "same_path_closure": bool(owning_candidate.same_path_closure),
+                        "spur_involved": bool(owning_candidate.spur_involved),
+                        "endpoint_a": {
+                            "path_index": int(owning_candidate.ep_a.path_index),
+                            "end": str(owning_candidate.ep_a.end),
+                            "endpoint_id": int(getattr(owning_candidate.ep_a, "endpoint_id", -1)),
+                        },
+                        "endpoint_b": {
+                            "path_index": int(owning_candidate.ep_b.path_index),
+                            "end": str(owning_candidate.ep_b.end),
+                            "endpoint_id": int(getattr(owning_candidate.ep_b, "endpoint_id", -1)),
+                        },
+                    }
+                    event_entry["explanation"] = _build_bridge_event_explanation(
+                        label_id, owning_candidate, end_i - start_i, approx_length,
+                    )
+                elif source == "bridge":
+                    event_entry["explanation"] = (
+                        f"{label_id} is an ASP-generated bridge segment group, but no direct "
+                        "candidate metadata link was available after path merging."
+                    )
+                else:
+                    event_entry["explanation"] = _build_efd_event_explanation(
+                        label_id, end_i - start_i, approx_length,
+                    )
+
+                changes.append(event_entry)
             else:
                 i += 1
 
@@ -234,6 +425,7 @@ def _save_labeled_restoration(
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _build_report(
+    image_path: str,
     result: ExtractionResult,
     candidates: List[ConnectionCandidate],
     accepted: List[ConnectionCandidate],
@@ -242,35 +434,81 @@ def _build_report(
     restoration_history: List[Dict[str, Any]] = None,
     dropped_after_sanitize: int = 0,
 ) -> Dict[str, Any]:
-    """Build a structured restoration report."""
+    """Build a detailed structured restoration report."""
+    extraction_open = sum(1 for p in result.paths if not p.is_closed)
+    extraction_closed = sum(1 for p in result.paths if p.is_closed)
+    final_open = sum(1 for p in final_paths if not p.is_closed)
+    final_closed = sum(1 for p in final_paths if p.is_closed)
+
+    accepted_ids = [int(c.id) for c in accepted]
+    accepted_scenarios = _count_by(accepted, lambda c: c.scenario)
+    scenario_counts = _count_by(candidates, lambda c: c.scenario)
+
+    bridge_events = [e for e in (restoration_history or []) if e.get("source") == "asp_bridge"]
+    efd_events = [e for e in (restoration_history or []) if e.get("source") == "efd_gap_closure"]
+
+    all_scores = [float(c.score) for c in candidates]
+    accepted_scores = [float(c.score) for c in accepted]
+    all_alignment = [float(c.bilateral_alignment) for c in candidates]
+    accepted_alignment = [float(c.bilateral_alignment) for c in accepted]
+    all_misalignment = [float(c.misalignment_deg) for c in candidates]
+    accepted_misalignment = [float(c.misalignment_deg) for c in accepted]
+
     return {
-        "image_shape": list(result.image_shape),
-        "diagonal": round(result.diagonal, 1),
-        "extraction": {
-            "total_paths": len(result.paths),
-            "open_paths": sum(1 for p in result.paths if not p.is_closed),
-            "closed_paths": sum(1 for p in result.paths if p.is_closed),
-            "endpoints": len(result.endpoints),
-            "efd_contours": len(result.efd_contours),
+        "schema_version": "2.0",
+        "image": {
+            "name": os.path.basename(image_path),
+            "shape": list(result.image_shape),
+            "diagonal_px": round(result.diagonal, 1),
         },
-        "candidates": {
-            "total_generated": len(candidates),
-            "tier1": sum(1 for c in candidates if c.tier == 1),
-            "tier2": sum(1 for c in candidates if c.tier == 2),
-            "accepted": len(accepted),
-            "dropped_after_sanitize": int(dropped_after_sanitize),
-            "acceptance_rate": (
-                round(len(accepted) / max(len(candidates), 1) * 100, 1)
-            ),
+        "summary": {
+            "processing_time_s": round(elapsed, 3),
+            "total_restoration_events": len(restoration_history or []),
+            "open_paths_before": extraction_open,
+            "open_paths_after": final_open,
+            "closed_paths_before": extraction_closed,
+            "closed_paths_after": final_closed,
+            "net_open_path_change": final_open - extraction_open,
         },
-        "restoration": {
-            "final_paths": len(final_paths),
-            "final_open": sum(1 for p in final_paths if not p.is_closed),
-            "final_closed": sum(1 for p in final_paths if p.is_closed),
-            "bridges_created": len(accepted),
+        "analysis": {
+            "extraction": {
+                "total_paths": len(result.paths),
+                "open_paths": extraction_open,
+                "closed_paths": extraction_closed,
+                "endpoints": len(result.endpoints),
+                "efd_contours": len(result.efd_contours),
+            },
+            "candidate_generation": {
+                "total": len(candidates),
+                "tier_distribution": {
+                    "tier1": sum(1 for c in candidates if c.tier == 1),
+                    "tier2": sum(1 for c in candidates if c.tier == 2),
+                },
+                "scenario_distribution": scenario_counts,
+                "score_summary": _numeric_summary(all_scores, digits=4),
+                "alignment_summary": _numeric_summary(all_alignment, digits=4),
+                "misalignment_deg_summary": _numeric_summary(all_misalignment, digits=2),
+            },
+            "selection": {
+                "accepted_total": len(accepted),
+                "dropped_after_endpoint_sanitize": int(dropped_after_sanitize),
+                "acceptance_rate_percent": round(len(accepted) / max(len(candidates), 1) * 100, 1),
+                "accepted_candidate_ids": accepted_ids,
+                "accepted_scenarios": accepted_scenarios,
+                "accepted_score_summary": _numeric_summary(accepted_scores, digits=4),
+                "accepted_alignment_summary": _numeric_summary(accepted_alignment, digits=4),
+                "accepted_misalignment_deg_summary": _numeric_summary(accepted_misalignment, digits=2),
+            },
+            "restoration_outcome": {
+                "final_paths": len(final_paths),
+                "final_open_paths": final_open,
+                "final_closed_paths": final_closed,
+                "bridges_created": len(accepted),
+                "bridge_events_logged": len(bridge_events),
+                "efd_closure_events_logged": len(efd_events),
+            },
         },
-        "restoration_logs": restoration_history or [],
-        "timing_seconds": round(elapsed, 3),
+        "detailed_events": restoration_history or [],
     }
 
 
@@ -365,10 +603,10 @@ def restore(
     elapsed = time.time() - t0
 
     # Labeled overlay visualization + logs
-    _, change_logs = _save_labeled_restoration(image_path, final_paths, output_dir)
+    _, change_logs = _save_labeled_restoration(image_path, final_paths, accepted, output_dir)
 
     report = _build_report(
-        extraction, candidates, accepted, final_paths, elapsed,
+        image_path, extraction, candidates, accepted, final_paths, elapsed,
         restoration_history=change_logs,
         dropped_after_sanitize=dropped_after_sanitize,
     )

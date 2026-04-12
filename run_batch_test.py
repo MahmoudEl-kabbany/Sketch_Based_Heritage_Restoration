@@ -15,7 +15,15 @@ for r in results:
     name = os.path.basename(r.image_path)
     orig_open = sum(1 for p in r.original_paths if not p.is_closed)
     rest_open = sum(1 for p in r.restored_paths if not p.is_closed)
-    t = r.report["timing_seconds"]
+    t = (
+        r.report.get("summary", {}).get("processing_time_s")
+        if isinstance(r.report, dict)
+        else None
+    )
+    if t is None and isinstance(r.report, dict):
+        t = r.report.get("timing_seconds", 0.0)
+    if t is None:
+        t = 0.0
     b = len(r.bridges)
     print(f"  {name:40s} | {orig_open} open -> {rest_open} open | bridges={b} | {t}s")
 print("=========================")
