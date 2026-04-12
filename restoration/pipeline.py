@@ -11,7 +11,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -108,6 +108,94 @@ def _save_visualization(
     return out_path
 
 
+def _save_labeled_restoration(
+    image_path: str,
+    final_paths: List[BezierPath],
+    output_dir: str,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Save an overlay of the original image with labeled restoration bridges."""
+    img_bgr = cv2.imread(image_path)
+    if img_bgr is None:
+        return "", []
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    h, w = img_bgr.shape[:2]
+    # Use a consistent figure size
+    fig, ax = plt.subplots(figsize=(10, 10 * h / w))
+    ax.imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+
+    changes = []
+    change_count = 0
+
+    for path in final_paths:
+        i = 0
+        while i < len(path.segments):
+            seg = path.segments[i]
+            # Restoration changes are non-original segments
+            if seg.source_type in ["bridge", "efd_closure"]:
+                start_i = i
+                source = seg.source_type
+                # Group contiguous segments of the same source type
+                while i < len(path.segments) and path.segments[i].source_type == source:
+                    i += 1
+                end_i = i
+
+                change_count += 1
+                label_id = f"R{change_count}"
+
+                # Sample points for the change accurately
+                change_pts_list = []
+                for s in path.segments[start_i:end_i]:
+                    change_pts_list.append(s.sample(n=30))
+                change_pts = np.vstack(change_pts_list)
+
+                # 1. Draw the "glow" effect for the bridge
+                ax.plot(change_pts[:, 0], change_pts[:, 1], color='#00FF00',
+                        linewidth=4, alpha=0.3, zorder=4)
+                # 2. Draw the accurate restoration path (neon green)
+                ax.plot(change_pts[:, 0], change_pts[:, 1], color='#39FF14',
+                        linewidth=2, alpha=0.9, zorder=5)
+
+                # 3. Label position - midpoint of the sampled points
+                mid_idx = len(change_pts) // 2
+                pos = change_pts[mid_idx]
+
+                # Offset label slightly up
+                ax.text(pos[0], pos[1] - 8, label_id,
+                        color='white', fontsize=10, fontweight='bold',
+                        ha='center', va='bottom', zorder=10,
+                        bbox=dict(facecolor='#006400', alpha=0.85,
+                                  edgecolor='white', boxstyle='round,pad=0.2'))
+
+                # Add to changes list for report explanation
+                desc = "ASP Junction Bridge" if source == "bridge" else "EFD Gap Closure"
+                changes.append({
+                    "id": label_id,
+                    "type": desc,
+                    "coordinates": [round(float(pos[0]), 1), round(float(pos[1]), 1)],
+                    "segment_count": end_i - start_i
+                })
+            else:
+                i += 1
+
+    ax.set_title(f"Heritage Restoration: Labeled Overlay ({change_count} changes)",
+                 color="white", fontsize=14, pad=10)
+    ax.axis("off")
+    fig.patch.set_facecolor("#0a0a0a")
+
+    name = os.path.splitext(os.path.basename(image_path))[0]
+    out_path = os.path.join(output_dir, f"{name}_labeled_overlay.png")
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="#0a0a0a")
+    plt.close(fig)
+    print(f"  -> Saved labeled restoration overlay -> {out_path}")
+
+    return out_path, changes
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Report
 # ═══════════════════════════════════════════════════════════════════════════
@@ -118,6 +206,7 @@ def _build_report(
     accepted: List[ConnectionCandidate],
     final_paths: List[BezierPath],
     elapsed: float,
+    restoration_history: List[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build a structured restoration report."""
     return {
@@ -145,6 +234,7 @@ def _build_report(
             "final_closed": sum(1 for p in final_paths if p.is_closed),
             "bridges_created": len(accepted),
         },
+        "restoration_logs": restoration_history or [],
         "timing_seconds": round(elapsed, 3),
     }
 
@@ -234,7 +324,14 @@ def restore(
 
     # Phase 7: Output
     elapsed = time.time() - t0
-    report = _build_report(extraction, candidates, accepted, final_paths, elapsed)
+
+    # Labeled overlay visualization + logs
+    _, change_logs = _save_labeled_restoration(image_path, final_paths, output_dir)
+
+    report = _build_report(
+        extraction, candidates, accepted, final_paths, elapsed,
+        restoration_history=change_logs
+    )
 
     _save_visualization(image_path, extraction.paths, final_paths, output_dir)
 
