@@ -30,7 +30,7 @@ def _reflect_points(points: np.ndarray, axis_angle: float) -> np.ndarray:
 def _detect_symmetry(
     points: np.ndarray,
     centroid: np.ndarray,
-    num_axes: int = 18,
+    num_axes: int = 24,
     hausdorff_threshold: float = 8.0,
     max_points: int = 500,
 ) -> Optional[float]:
@@ -61,6 +61,34 @@ def _detect_symmetry(
             best_angle = angle
 
     return best_angle
+
+
+def _resample_polyline(points: np.ndarray, max_points: int) -> np.ndarray:
+    """Downsample or resample a polyline to at most *max_points* samples."""
+    if len(points) <= max_points:
+        return points.copy()
+    if max_points < 2:
+        return points[[0, -1]].copy()
+
+    diffs = np.diff(points, axis=0)
+    d = np.linalg.norm(diffs, axis=1)
+    cumulative = np.concatenate(([0.0], np.cumsum(d)))
+    total = float(cumulative[-1])
+    if total < 1e-9:
+        idx = np.linspace(0, len(points) - 1, max_points, dtype=int)
+        return points[idx].copy()
+
+    targets = np.linspace(0.0, total, max_points)
+    x = np.interp(targets, cumulative, points[:, 0])
+    y = np.interp(targets, cumulative, points[:, 1])
+    return np.column_stack((x, y)).astype(np.float64)
+
+
+def _polyline_length(points: np.ndarray) -> float:
+    """Arc length of a polyline."""
+    if len(points) < 2:
+        return 0.0
+    return float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -164,6 +192,7 @@ def _curvature_aware_arc(
 
 def _points_to_bezier_segments(
     points: np.ndarray,
+    max_segments: int = 16,
 ) -> List[BezierSegment]:
     """Convert a polyline to a sequence of cubic Bezier segments.
 
@@ -174,7 +203,8 @@ def _points_to_bezier_segments(
 
     segments: List[BezierSegment] = []
     n = len(points)
-    step = max(3, n // max(1, n // 4))
+    max_segments = max(1, int(max_segments))
+    step = max(2, int(math.ceil((n - 1) / max_segments)))
 
     i = 0
     while i < n - 1:
@@ -263,6 +293,14 @@ def close_single_gaps(
     efd_contours: List[dict],
     gap_threshold: float = 0.30,
     symmetry_hausdorff: float = 8.0,
+    skip_if_bridge_present: bool = True,
+    symmetry_min_gap_ratio: float = 0.08,
+    symmetry_max_gap_ratio: float = 0.30,
+    max_mirrored_points: int = 80,
+    max_closure_length_ratio: float = 0.45,
+    conservative_small_gap_px: float = 20.0,
+    conservative_gap_ratio: float = 0.45,
+    conservative_min_perimeter: float = 80.0,
 ) -> List[BezierPath]:
     """Detect and close single-gap contours.
 
@@ -281,6 +319,11 @@ def close_single_gaps(
             result.append(path)
             continue
 
+        if skip_if_bridge_present and any(seg.source_type == "bridge" for seg in path.segments):
+            # PR3: avoid duplicate closures after ASP already bridged this contour.
+            result.append(path)
+            continue
+
         start_pt = path.segments[0].control_points[0]
         end_pt = path.segments[-1].control_points[3]
         gap_dist = float(np.linalg.norm(end_pt - start_pt))
@@ -295,7 +338,19 @@ def close_single_gaps(
             continue
 
         gap_ratio = gap_dist / perimeter
-        if gap_ratio > gap_threshold or gap_ratio < 1e-6:
+
+        force_small_gap_fallback = False
+        if gap_ratio > gap_threshold:
+            force_small_gap_fallback = (
+                gap_dist <= conservative_small_gap_px
+                and gap_ratio <= conservative_gap_ratio
+                and perimeter >= conservative_min_perimeter
+            )
+            if not force_small_gap_fallback:
+                result.append(path)
+                continue
+
+        if gap_ratio < 1e-6:
             result.append(path)
             continue
 
@@ -303,13 +358,19 @@ def close_single_gaps(
         centroid = np.mean(samples, axis=0)
 
         # Scale Hausdorff threshold for larger shapes
-        scaled_hausdorff = max(symmetry_hausdorff, perimeter * 0.01)
+        scaled_hausdorff = max(symmetry_hausdorff, perimeter * 0.015)
 
         # Try symmetry-based mirroring
-        axis_angle = _detect_symmetry(
-            samples, centroid,
-            hausdorff_threshold=scaled_hausdorff,
+        axis_angle = None
+        use_symmetry = (
+            not force_small_gap_fallback
+            and symmetry_min_gap_ratio <= gap_ratio <= symmetry_max_gap_ratio
         )
+        if use_symmetry:
+            axis_angle = _detect_symmetry(
+                samples, centroid,
+                hausdorff_threshold=scaled_hausdorff,
+            )
 
         closure_segments: List[BezierSegment] = []
 
@@ -320,7 +381,14 @@ def close_single_gaps(
                 gap_start=end_pt, gap_end=start_pt,
             )
             if len(mirrored) >= 2:
-                closure_segments = _points_to_bezier_segments(mirrored)
+                mirrored = _resample_polyline(mirrored, max_points=max_mirrored_points)
+                mirrored_len = _polyline_length(mirrored)
+                # PR3: reject mirrored closures that are much too complex for this gap.
+                if mirrored_len <= max(gap_dist * 3.0, perimeter * max_closure_length_ratio):
+                    closure_segments = _points_to_bezier_segments(
+                        mirrored,
+                        max_segments=max(6, int(max_mirrored_points // 8)),
+                    )
 
         if not closure_segments:
             # Fallback: curvature-aware arc

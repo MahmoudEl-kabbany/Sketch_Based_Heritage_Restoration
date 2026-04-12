@@ -262,6 +262,15 @@ def merge_restored_paths(
                 mapping[end_token] = cid
         return mapping
 
+    def estimate_path_length(segments: List[BezierSegment]) -> float:
+        if not segments:
+            return 0.0
+        pts_parts = [seg.sample(12) for seg in segments]
+        pts = np.vstack(pts_parts)
+        if len(pts) < 2:
+            return 0.0
+        return float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+
     endpoint_by_path_end: Dict[Tuple[int, str], Tuple[str, int]] = {}
     for c in accepted:
         endpoint_by_path_end[(c.ep_a.path_index, c.ep_a.end)] = endpoint_token_from_info(c.ep_a)
@@ -338,7 +347,9 @@ def merge_restored_paths(
 
         start_pt = segs[0].control_points[0]
         end_pt = segs[-1].control_points[3]
-        is_closed = float(np.linalg.norm(start_pt - end_pt)) < 5.0
+        path_len = estimate_path_length(segs)
+        closure_tolerance = max(5.0, 0.01 * path_len)
+        is_closed = float(np.linalg.norm(start_pt - end_pt)) < closure_tolerance
 
         result.append(BezierPath(
             segments=segs,
