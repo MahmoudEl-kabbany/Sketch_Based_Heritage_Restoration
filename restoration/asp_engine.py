@@ -60,7 +60,29 @@ def encode_facts(
     # Sentinel keeps candidate_self_closure/1 in the ASP head space even
     # when no actual self-closure candidates exist in this solve instance.
     lines.append("candidate_self_closure(-1).")
+    lines.append("path_self_closure_strength(-1,1).")
+    lines.append("path_self_closure_strength(-1,2).")
     lines.append("")
+
+    # Path-level self-closure support buckets used by ASP soft suppression.
+    best_self_closure_by_path: Dict[int, float] = {}
+    for c in candidates:
+        if not getattr(c, "same_path_closure", False):
+            continue
+        pidx = int(c.ep_a.path_index)
+        best_self_closure_by_path[pidx] = max(best_self_closure_by_path.get(pidx, -1e9), float(c.score))
+
+    for pidx, score in sorted(best_self_closure_by_path.items()):
+        if score >= 0.60:
+            strength_bucket = 2
+        elif score >= 0.45:
+            strength_bucket = 1
+        else:
+            continue
+        lines.append(f"path_self_closure_strength({pidx},{strength_bucket}).")
+
+    if best_self_closure_by_path:
+        lines.append("")
 
     # Candidate facts
     for c in candidates:
@@ -74,6 +96,10 @@ def encode_facts(
             f"{c.ep_b.path_index},{eb},{score_int})."
         )
         lines.append(f"candidate_endpoint({c.id},{ea_id},{eb_id}).")
+        lines.append(f"candidate_touches_path({c.id},{c.ep_a.path_index}).")
+        if c.ep_b.path_index != c.ep_a.path_index:
+            lines.append(f"candidate_touches_path({c.id},{c.ep_b.path_index}).")
+            lines.append(f"candidate_cross_shape({c.id}).")
         if getattr(c, "same_path_closure", False):
             lines.append(f"candidate_self_closure({c.id}).")
 
@@ -164,6 +190,12 @@ uses_endpoint(Id, E) :- candidate_endpoint(Id, _, E).
 :- accept(Id), candidate(Id, P, _, P, _, _), not candidate_self_closure(Id).
 
 #maximize { Score, Id : accept(Id), candidate(Id, _, _, _, _, Score) }.
+
+:~ accept(Id), candidate_cross_shape(Id), candidate_touches_path(Id, P),
+   path_self_closure_strength(P, 1). [2, Id, P]
+
+:~ accept(Id), candidate_cross_shape(Id), candidate_touches_path(Id, P),
+   path_self_closure_strength(P, 2). [4, Id, P]
 """
 
 

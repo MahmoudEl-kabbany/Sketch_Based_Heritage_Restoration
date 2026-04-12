@@ -196,6 +196,52 @@ def _normalize_metric(values: List[float]) -> List[float]:
     return [(v - mn) / rng for v in values]
 
 
+def _path_bbox_stats(paths: List[BezierPath]) -> Dict[int, Tuple[np.ndarray, np.ndarray, float, np.ndarray]]:
+    """Return per-path bbox stats: (min_xy, max_xy, area, centroid)."""
+    stats: Dict[int, Tuple[np.ndarray, np.ndarray, float, np.ndarray]] = {}
+    for idx, path in enumerate(paths):
+        pts = path.sample(pts_per_segment=20)
+        if len(pts) == 0:
+            min_xy = np.array([0.0, 0.0], dtype=np.float64)
+            max_xy = np.array([0.0, 0.0], dtype=np.float64)
+            area = 0.0
+            centroid = np.array([0.0, 0.0], dtype=np.float64)
+        else:
+            min_xy = np.min(pts, axis=0)
+            max_xy = np.max(pts, axis=0)
+            wh = np.maximum(0.0, max_xy - min_xy)
+            area = float(wh[0] * wh[1])
+            centroid = 0.5 * (min_xy + max_xy)
+        stats[idx] = (min_xy, max_xy, area, centroid)
+    return stats
+
+
+def _same_shape_affinity(
+    path_a_idx: int,
+    path_b_idx: int,
+    bbox_stats: Dict[int, Tuple[np.ndarray, np.ndarray, float, np.ndarray]],
+) -> float:
+    """Estimate whether two paths are likely fragments of the same shape."""
+    min_a, max_a, area_a, cent_a = bbox_stats[path_a_idx]
+    min_b, max_b, area_b, cent_b = bbox_stats[path_b_idx]
+
+    if area_a < 1e-6 or area_b < 1e-6:
+        return 0.0
+
+    inter_min = np.maximum(min_a, min_b)
+    inter_max = np.minimum(max_a, max_b)
+    inter_wh = np.maximum(0.0, inter_max - inter_min)
+    inter_area = float(inter_wh[0] * inter_wh[1])
+    overlap_ratio = inter_area / max(min(area_a, area_b), 1e-6)
+
+    centroid_dist = float(np.linalg.norm(cent_a - cent_b))
+    scale = np.sqrt(max(min(area_a, area_b), 1e-6))
+    centroid_factor = max(0.0, 1.0 - centroid_dist / (3.0 * scale))
+
+    affinity = overlap_ratio * centroid_factor
+    return float(np.clip(affinity, 0.0, 1.0))
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════════
@@ -212,6 +258,7 @@ def score_candidates(
     radius_t2 = radius_t1 * 2.0
     paths = result.paths
     endpoints = result.endpoints
+    bbox_stats = _path_bbox_stats(paths)
 
     # Compute raw metrics
     raw_dtw: List[float] = []
@@ -262,10 +309,89 @@ def score_candidates(
         if c.tier == 2 and float(getattr(c, "bilateral_alignment", 0.0)) < 0.25:
             c.score -= 0.06
 
+    # PR4b: suppress cross-shape links when a path has strong self-closure support.
+    best_self_closure_by_path: Dict[int, Tuple[float, float]] = {}
+    affinity_by_candidate: Dict[int, float] = {}
+
+    for c in candidates:
+        if not getattr(c, "same_path_closure", False):
+            continue
+        path_idx = int(c.ep_a.path_index)
+        current = best_self_closure_by_path.get(path_idx)
+        candidate_data = (float(c.score), float(c.distance))
+        if current is None or candidate_data[0] > current[0]:
+            best_self_closure_by_path[path_idx] = candidate_data
+
+    for c in candidates:
+        if getattr(c, "same_path_closure", False):
+            continue
+        if c.ep_a.path_index == c.ep_b.path_index:
+            continue
+
+        suppression = 0.0
+        touched_paths = (int(c.ep_a.path_index), int(c.ep_b.path_index))
+        for path_idx in touched_paths:
+            self_info = best_self_closure_by_path.get(path_idx)
+            if self_info is None:
+                continue
+            self_score, self_dist = self_info
+            distance_ratio = float(c.distance / max(self_dist, 1e-6))
+
+            if self_score >= 0.60 and distance_ratio >= 0.95:
+                suppression = max(suppression, 0.18)
+            elif self_score >= 0.45 and distance_ratio >= 1.02:
+                suppression = max(suppression, 0.12)
+
+        if suppression > 0.0:
+            c.score -= suppression
+
+        # PR4b: boost likely same-shape fragment links (e.g. split bubble parts).
+        affinity = _same_shape_affinity(
+            int(c.ep_a.path_index),
+            int(c.ep_b.path_index),
+            bbox_stats,
+        )
+        affinity_by_candidate[int(c.id)] = affinity
+        if affinity >= 0.18 and c.distance <= (result.diagonal * 0.22):
+            c.score += 0.16 * affinity
+
+    # PR4b: if a path has a strong high-affinity option, suppress low-affinity competitors.
+    best_high_affinity_score_by_path: Dict[int, float] = {}
+    for c in candidates:
+        if getattr(c, "same_path_closure", False):
+            continue
+        affinity = affinity_by_candidate.get(int(c.id), 0.0)
+        if affinity < 0.22:
+            continue
+        for pidx in (int(c.ep_a.path_index), int(c.ep_b.path_index)):
+            best_high_affinity_score_by_path[pidx] = max(
+                best_high_affinity_score_by_path.get(pidx, -1e9),
+                float(c.score),
+            )
+
+    for c in candidates:
+        if getattr(c, "same_path_closure", False):
+            continue
+        affinity = affinity_by_candidate.get(int(c.id), 0.0)
+        if affinity >= 0.10:
+            continue
+
+        suppression = 0.0
+        for pidx in (int(c.ep_a.path_index), int(c.ep_b.path_index)):
+            support_score = best_high_affinity_score_by_path.get(pidx)
+            if support_score is None:
+                continue
+            if float(c.score) <= support_score + 0.18:
+                suppression = max(suppression, 0.10)
+
+        if suppression > 0.0:
+            c.score -= suppression
+
     # Sort best-first
     candidates.sort(
         key=lambda c: (
             -c.score,
+            int(not getattr(c, "same_path_closure", False)),
             c.distance,
             c.misalignment_deg,
             -c.bilateral_alignment,

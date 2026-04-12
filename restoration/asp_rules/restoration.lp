@@ -7,7 +7,10 @@
 %   endpoint_id(EndpointId, PathIdx, End).
 %   candidate(Id, PathA, EndA, PathB, EndB, Score).
 %   candidate_endpoint(Id, EndpointAId, EndpointBId).
+%   candidate_touches_path(Id, PathIdx).
+%   candidate_cross_shape(Id).
 %   candidate_self_closure(Id).
+%   path_self_closure_strength(PathIdx, Bucket). % 1=moderate, 2=strong
 %   gestalt_continuation(Id, ContScore).   % 0..100
 %   gestalt_closure(Id, Flag).             % 0 or 1
 %   tier(Id, Tier).                        % 1 or 2
@@ -50,6 +53,13 @@ uses_endpoint(Id, E) :- candidate_endpoint(Id, _, E).
 
 % --- Soft: slightly favour guarded self-closure over cross-shape ambiguity ---
 :~ accept(Id), candidate_self_closure(Id). [-2, Id]
+
+% --- Soft: suppress cross-shape links into paths with strong self-closure ---
+:~ accept(Id), candidate_cross_shape(Id), candidate_touches_path(Id, P),
+   path_self_closure_strength(P, 1). [2, Id, P]
+
+:~ accept(Id), candidate_cross_shape(Id), candidate_touches_path(Id, P),
+   path_self_closure_strength(P, 2). [4, Id, P]
 
 % --- Soft: penalize weak directional continuation ---
 :~ accept(Id), gestalt_continuation(Id, C), C < 40. [2, Id]

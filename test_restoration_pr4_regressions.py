@@ -2,6 +2,7 @@ import numpy as np
 
 from bezier_curves.bezier import BezierPath, BezierSegment
 from restoration.candidates import ConnectionCandidate, generate_candidates
+from restoration.asp_engine import encode_facts
 from restoration.efd_closure import close_single_gaps
 from restoration.extraction import EndpointInfo, ExtractionResult
 from restoration.pipeline import _sanitize_accepted_candidates
@@ -205,3 +206,119 @@ def test_scale_aware_closure_tolerance_in_synthesis():
     # Long path should close under scale-aware tolerance; short should remain open.
     assert restored[0].is_closed
     assert not restored[1].is_closed
+
+
+def test_cross_shape_suppressed_when_strong_self_closure_exists():
+    loop = _path_from_points(_open_loop_points(center=(90.0, 90.0), rx=34.0, ry=24.0, gap_angle=0.34, n=10))
+    bolt = _path_from_points([(132.0, 88.0), (170.0, 88.0)])
+
+    e_loop_start = _endpoint_from_path(loop, 0, "start", 0)
+    e_loop_end = _endpoint_from_path(loop, 0, "end", 1)
+    e_bolt_start = _endpoint_from_path(bolt, 1, "start", 2)
+    e_bolt_end = _endpoint_from_path(bolt, 1, "end", 3)
+
+    result = ExtractionResult(
+        paths=[loop, bolt],
+        endpoints=[e_loop_start, e_loop_end, e_bolt_start, e_bolt_end],
+        efd_contours=[],
+        image_shape=(260, 260),
+        diagonal=float(np.hypot(260.0, 260.0)),
+    )
+
+    self_candidate = _candidate(1, e_loop_end, e_loop_start, score=0.55, scenario="self_closure")
+    self_candidate.same_path_closure = True
+    cross_candidate = _candidate(2, e_loop_end, e_bolt_start, score=0.55)
+
+    scored_with_self = score_candidates([self_candidate, cross_candidate], result)
+    cross_score_with_self = next(c.score for c in scored_with_self if c.id == 2)
+
+    self_candidate_no_flag = _candidate(1, e_loop_end, e_loop_start, score=0.55, scenario="self_closure")
+    self_candidate_no_flag.same_path_closure = False
+    cross_candidate_no_flag = _candidate(2, e_loop_end, e_bolt_start, score=0.55)
+    scored_without_self = score_candidates([self_candidate_no_flag, cross_candidate_no_flag], result)
+    cross_score_without_self = next(c.score for c in scored_without_self if c.id == 2)
+
+    assert cross_score_with_self < cross_score_without_self - 0.08
+
+
+def test_encode_facts_emits_self_closure_support_and_cross_shape_facts():
+    p0 = _path_from_points(_open_loop_points(center=(80.0, 80.0), rx=32.0, ry=22.0, gap_angle=0.30, n=10))
+    p1 = _path_from_points([(120.0, 80.0), (160.0, 80.0)])
+
+    e0s = _endpoint_from_path(p0, 0, "start", 0)
+    e0e = _endpoint_from_path(p0, 0, "end", 1)
+    e1s = _endpoint_from_path(p1, 1, "start", 2)
+    e1e = _endpoint_from_path(p1, 1, "end", 3)
+
+    c_self = _candidate(10, e0e, e0s, score=0.80, scenario="self_closure")
+    c_self.same_path_closure = True
+    c_self.score = 0.80
+
+    c_cross = _candidate(11, e0e, e1s, score=0.52)
+    c_cross.score = 0.52
+
+    facts = encode_facts([c_self, c_cross], [e0s, e0e, e1s, e1e])
+
+    assert "path_self_closure_strength(0,2)." in facts
+    assert "candidate_cross_shape(11)." in facts
+    assert "candidate_touches_path(11,0)." in facts
+    assert "candidate_touches_path(11,1)." in facts
+
+
+def test_same_shape_affinity_prefers_overlapping_fragments():
+    # A and B overlap strongly (likely one shape split into two paths).
+    path_a = _path_from_points([(120.0, 760.0), (180.0, 860.0), (170.0, 980.0)])
+    path_b = _path_from_points([(155.0, 780.0), (250.0, 860.0), (260.0, 970.0)])
+    # C is a distant shape with similar endpoint distance to A.
+    path_c = _path_from_points([(120.0, 420.0), (220.0, 500.0), (300.0, 560.0)])
+
+    e_a_start = _endpoint_from_path(path_a, 0, "start", 0)
+    e_a_end = _endpoint_from_path(path_a, 0, "end", 1)
+    e_b_start = _endpoint_from_path(path_b, 1, "start", 2)
+    e_c_start = _endpoint_from_path(path_c, 2, "start", 3)
+
+    # Use the same endpoint source and similar candidate setup.
+    c_overlap = _candidate(21, e_a_end, e_b_start, score=0.50)
+    c_far = _candidate(22, e_a_end, e_c_start, score=0.50)
+
+    result = ExtractionResult(
+        paths=[path_a, path_b, path_c],
+        endpoints=[e_a_start, e_a_end, e_b_start, e_c_start],
+        efd_contours=[],
+        image_shape=(1400, 2800),
+        diagonal=float(np.hypot(1400.0, 2800.0)),
+    )
+
+    scored = score_candidates([c_overlap, c_far], result)
+    score_overlap = next(c.score for c in scored if c.id == 21)
+    score_far = next(c.score for c in scored if c.id == 22)
+
+    assert score_overlap > score_far
+
+
+def test_low_affinity_competitor_suppressed_by_high_affinity_support():
+    # path_target is near/overlapping with path_good, but not with path_bad.
+    path_target = _path_from_points([(1400.0, 800.0), (1480.0, 900.0), (1460.0, 1040.0)])
+    path_good = _path_from_points([(1450.0, 820.0), (1560.0, 920.0), (1600.0, 1080.0)])
+    path_bad = _path_from_points([(1300.0, 360.0), (1410.0, 500.0), (1490.0, 640.0)])
+
+    e_t_end = _endpoint_from_path(path_target, 0, "end", 0)
+    e_g_start = _endpoint_from_path(path_good, 1, "start", 1)
+    e_b_start = _endpoint_from_path(path_bad, 2, "start", 2)
+
+    c_good = _candidate(31, e_t_end, e_g_start, score=0.50)
+    c_bad = _candidate(32, e_t_end, e_b_start, score=0.50)
+
+    result = ExtractionResult(
+        paths=[path_target, path_good, path_bad],
+        endpoints=[e_t_end, e_g_start, e_b_start],
+        efd_contours=[],
+        image_shape=(1600, 2800),
+        diagonal=float(np.hypot(1600.0, 2800.0)),
+    )
+
+    scored = score_candidates([c_good, c_bad], result)
+    score_good = next(c.score for c in scored if c.id == 31)
+    score_bad = next(c.score for c in scored if c.id == 32)
+
+    assert score_good > score_bad + 0.05
