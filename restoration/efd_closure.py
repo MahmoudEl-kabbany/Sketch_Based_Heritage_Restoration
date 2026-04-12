@@ -91,6 +91,25 @@ def _polyline_length(points: np.ndarray) -> float:
     return float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
 
 
+def _bridge_overlaps_gap(
+    path: BezierPath,
+    gap_start: np.ndarray,
+    gap_end: np.ndarray,
+    proximity: float,
+) -> bool:
+    """True when a bridge segment appears to already close this specific gap."""
+    for seg in path.segments:
+        if seg.source_type != "bridge":
+            continue
+        b0 = seg.control_points[0]
+        b1 = seg.control_points[3]
+        direct = float(np.linalg.norm(b0 - gap_start) + np.linalg.norm(b1 - gap_end))
+        reverse = float(np.linalg.norm(b0 - gap_end) + np.linalg.norm(b1 - gap_start))
+        if min(direct, reverse) <= 2.0 * proximity:
+            return True
+    return False
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Mirroring
 # ═══════════════════════════════════════════════════════════════════════════
@@ -319,11 +338,6 @@ def close_single_gaps(
             result.append(path)
             continue
 
-        if skip_if_bridge_present and any(seg.source_type == "bridge" for seg in path.segments):
-            # PR3: avoid duplicate closures after ASP already bridged this contour.
-            result.append(path)
-            continue
-
         start_pt = path.segments[0].control_points[0]
         end_pt = path.segments[-1].control_points[3]
         gap_dist = float(np.linalg.norm(end_pt - start_pt))
@@ -336,6 +350,13 @@ def close_single_gaps(
         if perimeter < 1e-6:
             result.append(path)
             continue
+
+        if skip_if_bridge_present:
+            # PR4 tuning: skip only if a bridge overlaps this same open gap.
+            gap_proximity = max(8.0, perimeter * 0.02)
+            if _bridge_overlaps_gap(path, end_pt, start_pt, proximity=gap_proximity):
+                result.append(path)
+                continue
 
         gap_ratio = gap_dist / perimeter
 
