@@ -38,6 +38,7 @@ from eliptic_fourier_descriptors.efd import (
 class EndpointInfo:
     """Geometric descriptor for one end of a BezierPath."""
 
+    endpoint_id: int        # stable endpoint identity within one extraction
     path_index: int          # index into ExtractionResult.paths
     end: str                 # "start" | "end"
     position: np.ndarray     # (x, y)
@@ -129,6 +130,7 @@ def _compute_endpoint_curvature(path: BezierPath, end: str) -> float:
 def _extract_endpoints(paths: List[BezierPath]) -> List[EndpointInfo]:
     """Build EndpointInfo objects for every open path's start and end."""
     endpoints: List[EndpointInfo] = []
+    next_endpoint_id = 0
     for idx, path in enumerate(paths):
         if path.is_closed or not path.segments:
             continue
@@ -139,12 +141,14 @@ def _extract_endpoints(paths: List[BezierPath]) -> List[EndpointInfo]:
                 else path.segments[-1].control_points[3]
             )
             endpoints.append(EndpointInfo(
+                endpoint_id=next_endpoint_id,
                 path_index=idx,
                 end=end,
                 position=pos.astype(np.float64),
                 tangent=_compute_endpoint_tangent(path, end),
                 curvature=_compute_endpoint_curvature(path, end),
             ))
+            next_endpoint_id += 1
     return endpoints
 
 

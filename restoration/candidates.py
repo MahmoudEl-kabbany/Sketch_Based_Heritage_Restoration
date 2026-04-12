@@ -216,6 +216,7 @@ def _build_intersection_bridge(
     for ep, target, path, is_first in [
         (ep_a, I, path_a, True),
         (EndpointInfo(
+            endpoint_id=-1,
             path_index=ep_b.path_index, end=ep_b.end,
             position=I, tangent=_safe_normalize(ep_b.position - I),
             curvature=0.0,

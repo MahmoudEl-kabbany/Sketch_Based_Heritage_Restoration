@@ -43,6 +43,39 @@ class RestorationResult:
     report: Dict[str, Any]
 
 
+def _endpoint_token(ep) -> Tuple[str, int]:
+    """Canonical endpoint token used for occupancy checks."""
+    if getattr(ep, "endpoint_id", -1) >= 0:
+        return ("id", int(ep.endpoint_id))
+    # Fallback for synthetic endpoints.
+    return ("path_end", int(ep.path_index) * 2 + (1 if ep.end == "end" else 0))
+
+
+def _sanitize_accepted_candidates(
+    accepted: List[ConnectionCandidate],
+) -> Tuple[List[ConnectionCandidate], int]:
+    """Drop accepted candidates that reuse an endpoint already consumed."""
+    if not accepted:
+        return [], 0
+
+    ordered = sorted(accepted, key=lambda c: (-c.score, c.distance, c.id))
+    used_tokens: Set[Tuple[str, int]] = set()
+    sanitized: List[ConnectionCandidate] = []
+    dropped = 0
+
+    for c in ordered:
+        token_a = _endpoint_token(c.ep_a)
+        token_b = _endpoint_token(c.ep_b)
+        if token_a == token_b or token_a in used_tokens or token_b in used_tokens:
+            dropped += 1
+            continue
+        used_tokens.add(token_a)
+        used_tokens.add(token_b)
+        sanitized.append(c)
+
+    return sanitized, dropped
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Visualization
 # ═══════════════════════════════════════════════════════════════════════════
@@ -207,6 +240,7 @@ def _build_report(
     final_paths: List[BezierPath],
     elapsed: float,
     restoration_history: List[Dict[str, Any]] = None,
+    dropped_after_sanitize: int = 0,
 ) -> Dict[str, Any]:
     """Build a structured restoration report."""
     return {
@@ -224,6 +258,7 @@ def _build_report(
             "tier1": sum(1 for c in candidates if c.tier == 1),
             "tier2": sum(1 for c in candidates if c.tier == 2),
             "accepted": len(accepted),
+            "dropped_after_sanitize": int(dropped_after_sanitize),
             "acceptance_rate": (
                 round(len(accepted) / max(len(candidates), 1) * 100, 1)
             ),
@@ -301,7 +336,11 @@ def restore(
         accepted = decode_solution(accepted_ids, scored)
     else:
         accepted = []
+
+    accepted, dropped_after_sanitize = _sanitize_accepted_candidates(accepted)
     print(f"    {len(accepted)} connections accepted")
+    if dropped_after_sanitize:
+        print(f"    {dropped_after_sanitize} conflicting connection(s) dropped")
 
     # Phase 5: Synthesis
     print("  Phase 5: Synthesizing bridges...")
@@ -330,7 +369,8 @@ def restore(
 
     report = _build_report(
         extraction, candidates, accepted, final_paths, elapsed,
-        restoration_history=change_logs
+        restoration_history=change_logs,
+        dropped_after_sanitize=dropped_after_sanitize,
     )
 
     _save_visualization(image_path, extraction.paths, final_paths, output_dir)

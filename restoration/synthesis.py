@@ -226,70 +226,116 @@ def merge_restored_paths(
 
     Returns the new set of paths (some merged, some untouched).
     """
-    # Build a union-find over path indices
-    n = len(original_paths)
-    parent = list(range(n))
+    def endpoint_token_from_info(ep: EndpointInfo) -> Tuple[str, int]:
+        if getattr(ep, "endpoint_id", -1) >= 0:
+            return ("id", int(ep.endpoint_id))
+        return ("path_end", int(ep.path_index) * 2 + (1 if ep.end == "end" else 0))
 
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
+    def reverse_component(comp: Dict[str, object]) -> None:
+        comp["segments"] = _reverse_segments(comp["segments"])
+        comp["start_token"], comp["end_token"] = comp["end_token"], comp["start_token"]
 
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
+    def orient_component_to_end(comp: Dict[str, object], token: Tuple[str, int]) -> bool:
+        if comp["end_token"] == token:
+            return True
+        if comp["start_token"] == token:
+            reverse_component(comp)
+            return True
+        return False
 
-    # Map: path_index → accumulated segments (in order)
-    path_segments: Dict[int, List[BezierSegment]] = {}
-    for i, p in enumerate(original_paths):
-        path_segments[i] = list(p.segments)
+    def orient_component_to_start(comp: Dict[str, object], token: Tuple[str, int]) -> bool:
+        if comp["start_token"] == token:
+            return True
+        if comp["end_token"] == token:
+            reverse_component(comp)
+            return True
+        return False
 
-    # Process accepted connections
-    connection_order: List[Tuple[int, int, List[BezierSegment], str, str]] = []
+    def rebuild_endpoint_to_component(active: Dict[int, Dict[str, object]]) -> Dict[Tuple[str, int], int]:
+        mapping: Dict[Tuple[str, int], int] = {}
+        for cid, comp in active.items():
+            start_token = comp.get("start_token")
+            end_token = comp.get("end_token")
+            if start_token is not None:
+                mapping[start_token] = cid
+            if end_token is not None:
+                mapping[end_token] = cid
+        return mapping
+
+    endpoint_by_path_end: Dict[Tuple[int, str], Tuple[str, int]] = {}
     for c in accepted:
-        connection_order.append((
-            c.ep_a.path_index, c.ep_b.path_index,
-            c.bridge_bezier,
-            c.ep_a.end, c.ep_b.end,
-        ))
+        endpoint_by_path_end[(c.ep_a.path_index, c.ep_a.end)] = endpoint_token_from_info(c.ep_a)
+        endpoint_by_path_end[(c.ep_b.path_index, c.ep_b.end)] = endpoint_token_from_info(c.ep_b)
 
-    # Build merged paths
-    merged_into: Set[int] = set()
+    active: Dict[int, Dict[str, object]] = {}
+    for i, path in enumerate(original_paths):
+        if path.is_closed or not path.segments:
+            start_token = None
+            end_token = None
+        else:
+            start_token = endpoint_by_path_end.get((i, "start"), ("path_end", i * 2))
+            end_token = endpoint_by_path_end.get((i, "end"), ("path_end", i * 2 + 1))
 
-    for pa_idx, pb_idx, bridge_segs, end_a, end_b in connection_order:
-        if pa_idx in merged_into or pb_idx in merged_into:
-            # Already consumed by a prior merge — add bridge as standalone
-            path_segments.setdefault(n, []).extend(bridge_segs)
-            n += 1
+        active[i] = {
+            "segments": list(path.segments),
+            "start_token": start_token,
+            "end_token": end_token,
+        }
+
+    endpoint_to_component = rebuild_endpoint_to_component(active)
+    ordered_connections = sorted(accepted, key=lambda c: (-c.score, c.distance, c.id))
+
+    for c in ordered_connections:
+        token_a = endpoint_token_from_info(c.ep_a)
+        token_b = endpoint_token_from_info(c.ep_b)
+
+        comp_a_id = endpoint_to_component.get(token_a)
+        comp_b_id = endpoint_to_component.get(token_b)
+        if comp_a_id is None or comp_b_id is None:
             continue
 
-        # Orient paths so bridge connects end of A to start of B
-        segs_a = path_segments[pa_idx]
-        segs_b = path_segments[pb_idx]
+        comp_a = active.get(comp_a_id)
+        comp_b = active.get(comp_b_id)
+        if comp_a is None or comp_b is None:
+            continue
 
-        if end_a == "start":
-            segs_a = _reverse_segments(segs_a)
-        if end_b == "end":
-            segs_b = _reverse_segments(segs_b)
+        if comp_a_id == comp_b_id:
+            if token_a == token_b:
+                continue
+            if not orient_component_to_end(comp_a, token_a):
+                continue
+            if comp_a.get("start_token") != token_b:
+                continue
 
-        new_segs = segs_a + bridge_segs + segs_b
-        path_segments[pa_idx] = new_segs
-        merged_into.add(pb_idx)
-        union(pa_idx, pb_idx)
+            comp_a["segments"] = comp_a["segments"] + list(c.bridge_bezier)
+            comp_a["start_token"] = None
+            comp_a["end_token"] = None
+            endpoint_to_component = rebuild_endpoint_to_component(active)
+            continue
 
-    # Collect final paths
+        if not orient_component_to_end(comp_a, token_a):
+            continue
+        if not orient_component_to_start(comp_b, token_b):
+            continue
+
+        merged_segments = comp_a["segments"] + list(c.bridge_bezier) + comp_b["segments"]
+        merged_start = comp_a.get("start_token")
+        merged_end = comp_b.get("end_token")
+
+        active[comp_a_id] = {
+            "segments": merged_segments,
+            "start_token": merged_start,
+            "end_token": merged_end,
+        }
+        del active[comp_b_id]
+        endpoint_to_component = rebuild_endpoint_to_component(active)
+
     result: List[BezierPath] = []
-    seen_roots: Set[int] = set()
-    for i in range(max(n, len(path_segments))):
-        if i in merged_into or i not in path_segments:
-            continue
-        segs = path_segments[i]
+    for comp in active.values():
+        segs: List[BezierSegment] = comp["segments"]
         if not segs:
             continue
 
-        # Detect closure
         start_pt = segs[0].control_points[0]
         end_pt = segs[-1].control_points[3]
         is_closed = float(np.linalg.norm(start_pt - end_pt)) < 5.0

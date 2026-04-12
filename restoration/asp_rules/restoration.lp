@@ -4,13 +4,23 @@
 %
 % Facts supplied by Python (asp_engine.py):
 %   endpoint(PathIdx, End, X, Y).
+%   endpoint_id(EndpointId, PathIdx, End).
 %   candidate(Id, PathA, EndA, PathB, EndB, Score).
+%   candidate_endpoint(Id, EndpointAId, EndpointBId).
 %   gestalt_continuation(Id, ContScore).   % 0..100
 %   gestalt_closure(Id, Flag).             % 0 or 1
 %   tier(Id, Tier).                        % 1 or 2
 
 % --- Choice: accept or reject each candidate ---
 { accept(Id) } :- candidate(Id, _, _, _, _, _).
+
+% --- Endpoint usage helper ---
+uses_endpoint(Id, E) :- candidate_endpoint(Id, E, _).
+uses_endpoint(Id, E) :- candidate_endpoint(Id, _, E).
+
+% --- Strong endpoint occupancy by endpoint identity ---
+:- accept(Id1), accept(Id2), Id1 != Id2,
+   uses_endpoint(Id1, E), uses_endpoint(Id2, E).
 
 % --- Constraint: each (path, end) participates in at most one connection ---
 % Source side
