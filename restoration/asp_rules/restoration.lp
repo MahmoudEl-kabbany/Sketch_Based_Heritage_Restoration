@@ -10,6 +10,8 @@
 %   candidate_touches_path(Id, PathIdx).
 %   candidate_cross_shape(Id).
 %   candidate_self_closure(Id).
+%   candidate_scenario(Id, ScenarioCode). % 0=continuation, 1=extension_intersection, 2=self_closure
+%   extension_quality(Id, Q).             % 0..100
 %   path_self_closure_strength(PathIdx, Bucket). % 1=moderate, 2=strong
 %   gestalt_continuation(Id, ContScore).   % 0..100
 %   gestalt_closure(Id, Flag).             % 0 or 1
@@ -63,6 +65,10 @@ uses_endpoint(Id, E) :- candidate_endpoint(Id, _, E).
 
 % --- Soft: penalize weak directional continuation ---
 :~ accept(Id), gestalt_continuation(Id, C), C < 40. [2, Id]
+
+% --- Soft: penalize weak same-path extension evidence ---
+:~ accept(Id), candidate_scenario(Id, 1), candidate_self_closure(Id),
+   extension_quality(Id, Q), Q < 45. [3, Id]
 
 % --- Soft: penalize Tier 2 candidates (prefer Tier 1 when both viable) ---
 :~ accept(Id), tier(Id, 2). [1, Id]

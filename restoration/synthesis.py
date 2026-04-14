@@ -230,15 +230,22 @@ def _synthesize_single(candidate: ConnectionCandidate) -> List[BezierSegment]:
         return [_build_g1_bridge(ep_a, ep_b)]
 
     if candidate.scenario == "extension_intersection":
-        # Recover intersection point from the bridge geometry
-        bridge_pts = candidate.bridge_points
-        if len(bridge_pts) < 2:
-            return [_build_g1_bridge(ep_a, ep_b)]
+        intersection_obj = getattr(candidate, "intersection_point", None)
+        if intersection_obj is None:
+            bridge_pts = candidate.bridge_points
+            if len(bridge_pts) < 2:
+                return [_build_g1_bridge(ep_a, ep_b)]
+            mid = len(bridge_pts) // 2
+            intersection = bridge_pts[mid].copy()
+        else:
+            intersection = np.asarray(intersection_obj, dtype=np.float64).reshape(2)
 
-        # The intersection point is approximately where the two bridge
-        # sub-segments meet — use the midpoint index of the bridge samples
-        mid = len(bridge_pts) // 2
-        intersection = bridge_pts[mid].copy()
+        if (
+            getattr(candidate, "same_path_closure", False)
+            and ep_a.curvature < 0.008
+            and ep_b.curvature < 0.008
+        ):
+            return _build_intersection_bridge_linear(ep_a, ep_b, intersection)
 
         if _is_straight(ep_a.curvature, ep_b.curvature,
                         ep_a.tangent, ep_b.tangent):

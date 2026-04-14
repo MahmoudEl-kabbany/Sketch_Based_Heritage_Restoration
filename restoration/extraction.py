@@ -44,6 +44,7 @@ class EndpointInfo:
     position: np.ndarray     # (x, y)
     tangent: np.ndarray      # unit tangent pointing *outward* from the path
     curvature: float         # unsigned curvature κ at this endpoint
+    tangent_confidence: float = 1.0  # confidence in endpoint tangent direction
 
 
 @dataclass
@@ -101,20 +102,74 @@ def _safe_normalize(v: np.ndarray) -> np.ndarray:
     return v / n
 
 
+def _dedupe_polyline(points: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Remove near-duplicate consecutive points from a sampled polyline."""
+    if len(points) <= 1:
+        return points
+    diffs = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    keep = np.ones(len(points), dtype=bool)
+    keep[1:] = diffs > eps
+    return points[keep]
+
+
+def _estimate_endpoint_context_tangent(
+    path: BezierPath,
+    end: str,
+    window_fraction: float = 0.12,
+    min_window_points: int = 6,
+    max_window_points: int = 28,
+) -> Tuple[np.ndarray, float]:
+    """Estimate endpoint tangent from local sampled context and return confidence."""
+    sampled = path.sample(pts_per_segment=24)
+    sampled = _dedupe_polyline(sampled)
+    if len(sampled) < 3:
+        return np.array([1.0, 0.0], dtype=np.float64), 0.0
+
+    max_window = max(2, len(sampled) - 1)
+    window = int(round(len(sampled) * window_fraction))
+    window = max(min_window_points, min(max_window_points, max_window, window))
+
+    if end == "start":
+        local = sampled[: window + 1]
+        path_dir = local[-1] - local[0]
+        outward_ref = _safe_normalize(-path_dir)
+    else:
+        local = sampled[-(window + 1):]
+        path_dir = local[-1] - local[0]
+        outward_ref = _safe_normalize(path_dir)
+
+    centered = local - np.mean(local, axis=0)
+    cov = centered.T @ centered
+    vals, vecs = np.linalg.eigh(cov)
+    principal = vecs[:, int(np.argmax(vals))]
+    if float(np.dot(principal, outward_ref)) < 0.0:
+        principal = -principal
+    context_tangent = _safe_normalize(principal)
+
+    var_sum = float(np.sum(vals))
+    linearity = float(vals[int(np.argmax(vals))] / (var_sum + 1e-12))
+    directional = max(0.0, float(np.dot(context_tangent, outward_ref)))
+    confidence = float(np.clip(0.5 * linearity + 0.5 * directional, 0.0, 1.0))
+    return context_tangent, confidence
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Endpoint extraction
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _compute_endpoint_tangent(path: BezierPath, end: str) -> np.ndarray:
-    """Unit tangent pointing *outward* from the path at the given end."""
+def _compute_endpoint_tangent(path: BezierPath, end: str) -> Tuple[np.ndarray, float]:
+    """Outward endpoint tangent blended with local context and confidence."""
     if end == "start":
         cp = path.segments[0].control_points
-        tangent = _bezier_derivative_at(cp, 0.0)
-        return _safe_normalize(-tangent)  # negate: outward from path start
+        derivative_tangent = _safe_normalize(-_bezier_derivative_at(cp, 0.0))
     else:
         cp = path.segments[-1].control_points
-        tangent = _bezier_derivative_at(cp, 1.0)
-        return _safe_normalize(tangent)   # already points outward
+        derivative_tangent = _safe_normalize(_bezier_derivative_at(cp, 1.0))
+
+    context_tangent, confidence = _estimate_endpoint_context_tangent(path, end)
+    blend = float(np.clip(confidence, 0.15, 0.90))
+    tangent = _safe_normalize((1.0 - blend) * derivative_tangent + blend * context_tangent)
+    return tangent, confidence
 
 
 def _compute_endpoint_curvature(path: BezierPath, end: str) -> float:
@@ -140,13 +195,15 @@ def _extract_endpoints(paths: List[BezierPath]) -> List[EndpointInfo]:
                 if end == "start"
                 else path.segments[-1].control_points[3]
             )
+            tangent, tangent_confidence = _compute_endpoint_tangent(path, end)
             endpoints.append(EndpointInfo(
                 endpoint_id=next_endpoint_id,
                 path_index=idx,
                 end=end,
                 position=pos.astype(np.float64),
-                tangent=_compute_endpoint_tangent(path, end),
+                tangent=tangent,
                 curvature=_compute_endpoint_curvature(path, end),
+                tangent_confidence=tangent_confidence,
             ))
             next_endpoint_id += 1
     return endpoints

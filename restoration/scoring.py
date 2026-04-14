@@ -309,6 +309,21 @@ def score_candidates(
         if c.tier == 2 and float(getattr(c, "bilateral_alignment", 0.0)) < 0.25:
             c.score -= 0.06
 
+        ext_quality = float(np.clip(getattr(c, "extension_quality", 0.0), 0.0, 1.0))
+        if c.scenario == "extension_intersection":
+            if getattr(c, "same_path_closure", False):
+                # Favor extension for sharp same-path closures only when alignment evidence is strong.
+                corner_factor = float(np.clip((misalignment_deg - 55.0) / 60.0, 0.0, 1.0))
+                continuation_strength = float(np.clip(getattr(c, "bilateral_alignment", 0.0), 0.0, 1.0))
+                extension_need = 1.0 - continuation_strength
+                c.score += (0.26 + 0.10 * corner_factor) * ext_quality * (extension_need ** 2)
+                if continuation_strength > 0.70:
+                    c.score -= 0.12 * ((continuation_strength - 0.70) / 0.30)
+                if ext_quality < 0.45:
+                    c.score -= 0.06 * ((0.45 - ext_quality) / 0.45)
+            else:
+                c.score += 0.04 * ext_quality
+
     # PR4b: suppress cross-shape links when a path has strong self-closure support.
     best_self_closure_by_path: Dict[int, Tuple[float, float]] = {}
     affinity_by_candidate: Dict[int, float] = {}
@@ -392,6 +407,7 @@ def score_candidates(
         key=lambda c: (
             -c.score,
             int(not getattr(c, "same_path_closure", False)),
+            -float(getattr(c, "extension_quality", 0.0)),
             c.distance,
             c.misalignment_deg,
             -c.bilateral_alignment,

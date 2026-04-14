@@ -41,6 +41,11 @@ def encode_facts(
 ) -> str:
     """Convert scored candidates and endpoints into ASP fact strings."""
     lines: List[str] = []
+    scenario_map = {
+        "continuation": 0,
+        "extension_intersection": 1,
+        "self_closure": 2,
+    }
 
     # Endpoint facts — encode "start"/"end" as 0/1
     end_map = {"start": 0, "end": 1}
@@ -102,6 +107,11 @@ def encode_facts(
             lines.append(f"candidate_cross_shape({c.id}).")
         if getattr(c, "same_path_closure", False):
             lines.append(f"candidate_self_closure({c.id}).")
+
+        scenario_code = scenario_map.get(str(c.scenario), 0)
+        lines.append(f"candidate_scenario({c.id},{scenario_code}).")
+        ext_quality = _to_int_score(float(getattr(c, "extension_quality", 0.0)))
+        lines.append(f"extension_quality({c.id},{ext_quality}).")
 
         # Gestalt sub-scores (used by soft rules in the ASP program)
         direction_ab = c.ep_b.position - c.ep_a.position
@@ -196,6 +206,9 @@ uses_endpoint(Id, E) :- candidate_endpoint(Id, _, E).
 
 :~ accept(Id), candidate_cross_shape(Id), candidate_touches_path(Id, P),
    path_self_closure_strength(P, 2). [4, Id, P]
+
+:~ accept(Id), candidate_scenario(Id, 1), candidate_self_closure(Id),
+   extension_quality(Id, Q), Q < 45. [3, Id]
 """
 
 

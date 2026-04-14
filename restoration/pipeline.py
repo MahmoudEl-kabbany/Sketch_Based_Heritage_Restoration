@@ -113,16 +113,25 @@ def _build_bridge_event_explanation(
 ) -> str:
     """Create a detailed, human-readable explanation for an ASP bridge event."""
     quality = max(0.0, min(1.0, (float(candidate.bilateral_alignment) + max(0.0, 1.0 - float(candidate.misalignment_deg) / 180.0)) / 2.0))
+    scenario_desc = f"'{candidate.scenario}' scenario"
+    if candidate.scenario == "extension_intersection" and candidate.same_path_closure:
+        scenario_desc = "extension-based same-path closure"
+
+    extension_suffix = ""
+    if candidate.scenario == "extension_intersection":
+        ext_quality = float(getattr(candidate, "extension_quality", 0.0))
+        extension_suffix = f" Extension convergence quality is {ext_quality:.2f}."
+
     return (
         f"{label_id} is an ASP-selected bridge from candidate C{candidate.id}. "
         f"It links path {candidate.ep_a.path_index} ({candidate.ep_a.end}) to "
         f"path {candidate.ep_b.path_index} ({candidate.ep_b.end}) using the "
-        f"'{candidate.scenario}' scenario. Gap distance is {candidate.distance:.1f}px, "
+        f"{scenario_desc}. Gap distance is {candidate.distance:.1f}px, "
         f"directional alignment is {candidate.bilateral_alignment:.3f}, and endpoint "
         f"misalignment is {candidate.misalignment_deg:.1f} deg. The accepted score is "
         f"{candidate.score:.3f} (tier {candidate.tier}), producing {segment_count} bridge "
         f"segment(s) with an estimated repaired length of {approx_length_px:.1f}px. "
-        f"Estimated geometric confidence is {quality:.2f}."
+        f"Estimated geometric confidence is {quality:.2f}.{extension_suffix}"
     )
 
 
@@ -373,6 +382,7 @@ def _save_labeled_restoration(
                         "tier": int(owning_candidate.tier),
                         "distance_px": round(float(owning_candidate.distance), 2),
                         "score": round(float(owning_candidate.score), 4),
+                        "extension_quality": round(float(getattr(owning_candidate, "extension_quality", 0.0)), 4),
                         "bilateral_alignment": round(float(owning_candidate.bilateral_alignment), 4),
                         "misalignment_deg": round(float(owning_candidate.misalignment_deg), 2),
                         "same_path_closure": bool(owning_candidate.same_path_closure),
@@ -388,6 +398,12 @@ def _save_labeled_restoration(
                             "endpoint_id": int(getattr(owning_candidate.ep_b, "endpoint_id", -1)),
                         },
                     }
+                    if getattr(owning_candidate, "intersection_point", None) is not None:
+                        ip = np.asarray(owning_candidate.intersection_point, dtype=np.float64).reshape(2)
+                        event_entry["candidate"]["intersection_point"] = [
+                            round(float(ip[0]), 2),
+                            round(float(ip[1]), 2),
+                        ]
                     event_entry["explanation"] = _build_bridge_event_explanation(
                         label_id, owning_candidate, end_i - start_i, approx_length,
                     )

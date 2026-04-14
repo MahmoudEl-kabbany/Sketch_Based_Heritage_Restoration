@@ -36,6 +36,8 @@ class ConnectionCandidate:
     misalignment_deg: float = 180.0
     spur_involved: bool = False
     same_path_closure: bool = False
+    intersection_point: Optional[np.ndarray] = None
+    extension_quality: float = 0.0
     score: float = 0.0
 
 
@@ -83,6 +85,8 @@ def _passes_direction_gates(
     misalignment_deg: float,
     tier: int,
     same_path: bool = False,
+    tangent_confidence_a: float = 1.0,
+    tangent_confidence_b: float = 1.0,
 ) -> bool:
     """Conservative geometric gate to reject ambiguous pairings."""
     if same_path:
@@ -103,7 +107,20 @@ def _passes_direction_gates(
     if bilateral < min_bilateral:
         return False
     if misalignment_deg > max_misalignment:
-        return False
+        same_path_high_conf = (
+            same_path
+            and misalignment_deg <= 150.0
+            and bilateral >= -0.02
+            and min(tangent_confidence_a, tangent_confidence_b) >= 0.55
+        )
+        if not same_path_high_conf:
+            return False
+
+    if same_path:
+        low_context_conf = min(tangent_confidence_a, tangent_confidence_b) < 0.35
+        if low_context_conf and misalignment_deg > 95.0:
+            return False
+
     return True
 
 
@@ -176,6 +193,80 @@ def _nearest_approach(pts_a: np.ndarray, pts_b: np.ndarray,
     if D[min_idx] < threshold:
         return (pts_a[min_idx[0]] + pts_b[min_idx[1]]) / 2.0
     return None
+
+
+def _extension_alignment_quality(
+    ep_a: EndpointInfo,
+    ep_b: EndpointInfo,
+    intersection: np.ndarray,
+) -> float:
+    """Quality of endpoint-to-intersection alignment for extension closures."""
+    dir_a = _safe_normalize(intersection - ep_a.position)
+    dir_b = _safe_normalize(intersection - ep_b.position)
+    align_a = max(0.0, float(np.dot(ep_a.tangent, dir_a)))
+    align_b = max(0.0, float(np.dot(ep_b.tangent, dir_b)))
+
+    dist_a = float(np.linalg.norm(intersection - ep_a.position))
+    dist_b = float(np.linalg.norm(intersection - ep_b.position))
+    balance = 1.0 - (abs(dist_a - dist_b) / max(dist_a + dist_b, 1e-6))
+
+    conf_a = float(np.clip(getattr(ep_a, "tangent_confidence", 1.0), 0.0, 1.0))
+    conf_b = float(np.clip(getattr(ep_b, "tangent_confidence", 1.0), 0.0, 1.0))
+    context_conf = min(conf_a, conf_b)
+
+    quality = 0.55 * min(align_a, align_b) + 0.25 * max(0.0, balance) + 0.20 * context_conf
+    return float(np.clip(quality, 0.0, 1.0))
+
+
+def _safe_same_path_extension_intersection(
+    ep_a: EndpointInfo,
+    ep_b: EndpointInfo,
+    path: BezierPath,
+    path_length: float,
+    gap_distance: float,
+    max_reach: float,
+    convergence_threshold: float,
+) -> Tuple[Optional[np.ndarray], float]:
+    """Return a guarded same-path extension intersection and quality."""
+    intersection = _test_extension_intersection_linear(ep_a, ep_b, max_reach=max_reach)
+    if intersection is None:
+        intersection = _test_extension_intersection_curved(
+            ep_a,
+            ep_b,
+            path,
+            path,
+            convergence_threshold=convergence_threshold,
+        )
+
+    if intersection is None:
+        return None, 0.0
+
+    dist_a = float(np.linalg.norm(intersection - ep_a.position))
+    dist_b = float(np.linalg.norm(intersection - ep_b.position))
+    if dist_a < 0.25 * gap_distance or dist_b < 0.25 * gap_distance:
+        return None, 0.0
+    if dist_a > max_reach or dist_b > max_reach:
+        return None, 0.0
+
+    max_reasonable = max(1.8 * gap_distance, 0.42 * max(path_length, 1e-6))
+    if max(dist_a, dist_b) > max_reasonable:
+        return None, 0.0
+
+    quality = _extension_alignment_quality(ep_a, ep_b, intersection)
+
+    samples = path.sample(pts_per_segment=25)
+    if len(samples) >= 12:
+        trim = max(3, int(round(len(samples) * 0.12)))
+        core = samples[trim:-trim] if len(samples) > (2 * trim) else np.empty((0, 2))
+        if len(core) > 0:
+            min_core_dist = float(np.min(np.linalg.norm(core - intersection, axis=1)))
+            if min_core_dist < max(6.0, 0.012 * max(path_length, 1.0)) and quality < 0.60:
+                return None, 0.0
+
+    if quality < 0.25:
+        return None, quality
+
+    return intersection, quality
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -389,7 +480,14 @@ def generate_candidates(
 
         fwd_a, fwd_b, bilateral, misalignment_deg = _pair_alignment_metrics(ep_end, ep_start)
         if not _passes_direction_gates(
-            fwd_a, fwd_b, bilateral, misalignment_deg, tier=1, same_path=True,
+            fwd_a,
+            fwd_b,
+            bilateral,
+            misalignment_deg,
+            tier=1,
+            same_path=True,
+            tangent_confidence_a=float(getattr(ep_end, "tangent_confidence", 1.0)),
+            tangent_confidence_b=float(getattr(ep_start, "tangent_confidence", 1.0)),
         ):
             continue
 
@@ -397,6 +495,9 @@ def generate_candidates(
         if pair_key in seen_pairs:
             continue
 
+        added_for_pair = False
+
+        # Keep a conservative continuation self-closure candidate as fallback.
         bridge_segs = _build_continuation_bridge(ep_end, ep_start)
         candidates.append(ConnectionCandidate(
             id=cid,
@@ -411,11 +512,48 @@ def generate_candidates(
             misalignment_deg=misalignment_deg,
             spur_involved=is_spur_path.get(path_idx, False),
             same_path_closure=True,
+            extension_quality=0.0,
         ))
         cid += 1
-        ep_candidate_count[idx_start] += 1
-        ep_candidate_count[idx_end] += 1
-        seen_pairs.add(pair_key)
+        added_for_pair = True
+
+        # Add same-path extension candidate when a stable convergence point exists.
+        max_reach_same = min(radius_t1 * 1.8, max(radius_t1 * 0.75, dist * 1.8))
+        intersection, ext_quality = _safe_same_path_extension_intersection(
+            ep_end,
+            ep_start,
+            path,
+            path_length=path_len,
+            gap_distance=dist,
+            max_reach=max_reach_same,
+            convergence_threshold=convergence_threshold * 0.85,
+        )
+        if intersection is not None:
+            ext_bridge = _build_intersection_bridge(ep_end, ep_start, intersection, path, path)
+            if ext_bridge:
+                candidates.append(ConnectionCandidate(
+                    id=cid,
+                    ep_a=ep_end,
+                    ep_b=ep_start,
+                    scenario="extension_intersection",
+                    bridge_points=_sample_bridge(ext_bridge),
+                    bridge_bezier=ext_bridge,
+                    distance=dist,
+                    tier=1,
+                    bilateral_alignment=bilateral,
+                    misalignment_deg=misalignment_deg,
+                    spur_involved=is_spur_path.get(path_idx, False),
+                    same_path_closure=True,
+                    intersection_point=intersection.copy(),
+                    extension_quality=float(ext_quality),
+                ))
+                cid += 1
+                added_for_pair = True
+
+        if added_for_pair:
+            ep_candidate_count[idx_start] += 1
+            ep_candidate_count[idx_end] += 1
+            seen_pairs.add(pair_key)
 
     # Query all pairs within Tier 2 radius (superset of Tier 1)
     for i, ep_a in enumerate(endpoints):
@@ -446,7 +584,14 @@ def generate_candidates(
             tier = 1 if dist <= radius_t1 else 2
             fwd_a, fwd_b, bilateral, misalignment_deg = _pair_alignment_metrics(ep_a, ep_b)
             if not _passes_direction_gates(
-                fwd_a, fwd_b, bilateral, misalignment_deg, tier=tier, same_path=False,
+                fwd_a,
+                fwd_b,
+                bilateral,
+                misalignment_deg,
+                tier=tier,
+                same_path=False,
+                tangent_confidence_a=float(getattr(ep_a, "tangent_confidence", 1.0)),
+                tangent_confidence_b=float(getattr(ep_b, "tangent_confidence", 1.0)),
             ):
                 continue
 
@@ -475,6 +620,7 @@ def generate_candidates(
                     bilateral_alignment=bilateral,
                     misalignment_deg=misalignment_deg,
                     spur_involved=spur_involved,
+                    extension_quality=0.0,
                 ))
                 cid += 1
                 ep_candidate_count[i] += 1
@@ -512,6 +658,8 @@ def generate_candidates(
                         bilateral_alignment=bilateral,
                         misalignment_deg=misalignment_deg,
                         spur_involved=spur_involved,
+                        intersection_point=intersection.copy(),
+                        extension_quality=_extension_alignment_quality(ep_a, ep_b, intersection),
                     ))
                     cid += 1
                     ep_candidate_count[i] += 1

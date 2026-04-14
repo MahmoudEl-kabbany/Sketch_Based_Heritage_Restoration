@@ -268,18 +268,59 @@ def _points_to_bezier_segments(
 # Endpoint tangent extraction
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _safe_normalize(v: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    if n < 1e-12:
+        return np.array([1.0, 0.0], dtype=np.float64)
+    return (v / n).astype(np.float64)
+
+
+def _context_endpoint_tangent(path: BezierPath, end: str) -> Tuple[np.ndarray, float]:
+    """Estimate outward tangent from local sampled path context."""
+    sampled = path.sample(pts_per_segment=24)
+    if len(sampled) < 3:
+        return np.array([1.0, 0.0], dtype=np.float64), 0.0
+
+    diffs = np.linalg.norm(np.diff(sampled, axis=0), axis=1)
+    keep = np.ones(len(sampled), dtype=bool)
+    keep[1:] = diffs > 1e-6
+    sampled = sampled[keep]
+    if len(sampled) < 3:
+        return np.array([1.0, 0.0], dtype=np.float64), 0.0
+
+    max_window = max(2, len(sampled) - 1)
+    window = int(round(len(sampled) * 0.12))
+    window = max(6, min(24, max_window, window))
+
+    if end == "end":
+        local = sampled[-(window + 1):]
+        vectors = np.diff(local, axis=0)
+    else:
+        local = sampled[: window + 1]
+        vectors = -np.diff(local, axis=0)
+
+    valid = np.linalg.norm(vectors, axis=1) > 1e-9
+    if not np.any(valid):
+        return np.array([1.0, 0.0], dtype=np.float64), 0.0
+
+    unit = vectors[valid] / np.linalg.norm(vectors[valid], axis=1, keepdims=True)
+    mean_vec = _safe_normalize(np.mean(unit, axis=0))
+    consistency = float(np.mean(np.clip(unit @ mean_vec, 0.0, 1.0)))
+    return mean_vec, float(np.clip(consistency, 0.0, 1.0))
+
 def _path_tangent_at(path: BezierPath, end: str) -> np.ndarray:
     """Unit tangent pointing into the gap (outward from path boundary)."""
     if end == "end":
         cp = path.segments[-1].control_points
-        d = 3.0 * (cp[3] - cp[2])
+        derivative = 3.0 * (cp[3] - cp[2])
     else:
         cp = path.segments[0].control_points
-        d = 3.0 * (cp[0] - cp[1])
-    n = np.linalg.norm(d)
-    if n < 1e-12:
-        return np.array([1.0, 0.0])
-    return d / n
+        derivative = 3.0 * (cp[0] - cp[1])
+
+    derivative_tangent = _safe_normalize(derivative)
+    context_tangent, confidence = _context_endpoint_tangent(path, end)
+    blend = float(np.clip(confidence, 0.15, 0.90))
+    return _safe_normalize((1.0 - blend) * derivative_tangent + blend * context_tangent)
 
 
 def _path_curvature_at(path: BezierPath, end: str) -> float:
