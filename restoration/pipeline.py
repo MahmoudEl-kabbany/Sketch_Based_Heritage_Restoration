@@ -420,6 +420,71 @@ def _save_labeled_restoration(
     return out_path, changes
 
 
+def _save_unlabeled_restoration_overlay(
+    image_path: str,
+    final_paths: List[BezierPath],
+    output_dir: str,
+) -> str:
+    """Save an overlay of restoration changes on the original image (no labels)."""
+    img_bgr = cv2.imread(image_path)
+    if img_bgr is None:
+        return ""
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    h, w = img_bgr.shape[:2]
+    fig, ax = plt.subplots(figsize=(10, 10 * h / w))
+    ax.imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+
+    change_count = 0
+
+    for path in final_paths:
+        i = 0
+        while i < len(path.segments):
+            seg = path.segments[i]
+            if seg.source_type in ["bridge", "efd_closure"]:
+                source = seg.source_type
+                event_segments: List[BezierSegment] = []
+                while i < len(path.segments) and path.segments[i].source_type == source:
+                    event_segments.append(path.segments[i])
+                    i += 1
+
+                if event_segments:
+                    change_count += 1
+                    change_pts = np.vstack([s.sample(n=30) for s in event_segments])
+                    ax.plot(
+                        change_pts[:, 0],
+                        change_pts[:, 1],
+                        color="#2ecc40",
+                        linewidth=2.1,
+                        alpha=1.0,
+                        zorder=5,
+                        solid_capstyle="round",
+                        solid_joinstyle="round",
+                    )
+            else:
+                i += 1
+
+    ax.set_title(
+        f"Heritage Restoration: Change Overlay ({change_count} changes)",
+        color="white",
+        fontsize=14,
+        pad=10,
+    )
+    ax.axis("off")
+    fig.patch.set_facecolor("#0a0a0a")
+
+    name = os.path.splitext(os.path.basename(image_path))[0]
+    out_path = os.path.join(output_dir, f"{name}_overlay.png")
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="#0a0a0a")
+    plt.close(fig)
+    print(f"  -> Saved unlabeled restoration overlay -> {out_path}")
+    return out_path
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Report
 # ═══════════════════════════════════════════════════════════════════════════
@@ -604,6 +669,7 @@ def restore(
 
     # Labeled overlay visualization + logs
     _, change_logs = _save_labeled_restoration(image_path, final_paths, accepted, output_dir)
+    _save_unlabeled_restoration_overlay(image_path, final_paths, output_dir)
 
     report = _build_report(
         image_path, extraction, candidates, accepted, final_paths, elapsed,
