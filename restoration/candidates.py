@@ -215,7 +215,25 @@ def _extension_alignment_quality(
     context_conf = min(conf_a, conf_b)
 
     quality = 0.55 * min(align_a, align_b) + 0.25 * max(0.0, balance) + 0.20 * context_conf
+
+    # Curved-curved endpoints are more prone to spurious straight extensions.
+    curvature_product = float(max(ep_a.curvature, 0.0) * max(ep_b.curvature, 0.0))
+    curvature_penalty = float(np.clip((curvature_product - 1e-5) / 4e-5, 0.0, 1.0))
+    quality *= (1.0 - 0.25 * curvature_penalty)
+
     return float(np.clip(quality, 0.0, 1.0))
+
+
+def _is_high_curvature_endpoint(ep: EndpointInfo, threshold: float = 0.008) -> bool:
+    """True if endpoint curvature indicates a smooth curved boundary."""
+    return float(getattr(ep, "curvature", 0.0)) >= float(threshold)
+
+
+def _distance_to_aabb(point: np.ndarray, min_xy: np.ndarray, max_xy: np.ndarray) -> float:
+    """Euclidean distance from point to axis-aligned bounding box (0 if inside)."""
+    dx = max(float(min_xy[0] - point[0]), 0.0, float(point[0] - max_xy[0]))
+    dy = max(float(min_xy[1] - point[1]), 0.0, float(point[1] - max_xy[1]))
+    return float(np.hypot(dx, dy))
 
 
 def _safe_same_path_extension_intersection(
@@ -226,17 +244,53 @@ def _safe_same_path_extension_intersection(
     gap_distance: float,
     max_reach: float,
     convergence_threshold: float,
+    bilateral_alignment: float,
+    misalignment_deg: float,
 ) -> Tuple[Optional[np.ndarray], float]:
     """Return a guarded same-path extension intersection and quality."""
-    intersection = _test_extension_intersection_linear(ep_a, ep_b, max_reach=max_reach)
-    if intersection is None:
+    context_conf = min(
+        float(np.clip(getattr(ep_a, "tangent_confidence", 1.0), 0.0, 1.0)),
+        float(np.clip(getattr(ep_b, "tangent_confidence", 1.0), 0.0, 1.0)),
+    )
+    both_high_curvature = _is_high_curvature_endpoint(ep_a) and _is_high_curvature_endpoint(ep_b)
+
+    if both_high_curvature and bilateral_alignment < 0.35 and context_conf < 0.65:
+        return None, 0.0
+
+    # Hard guard: very weak bilateral support with near-opposed tangents is unreliable.
+    if bilateral_alignment < 0.28 and misalignment_deg > 118.0:
+        return None, 0.0
+
+    # Long-gap same-path extension on weakly aligned endpoints is a common spike artifact.
+    gap_ratio = float(gap_distance / max(path_length, 1e-6))
+    if (gap_ratio > 0.095 or gap_distance > 90.0) and bilateral_alignment < 0.50 and misalignment_deg > 105.0:
+        return None, 0.0
+
+    if both_high_curvature:
+        # For curved pairs, prefer curved extrapolation with tighter convergence.
         intersection = _test_extension_intersection_curved(
             ep_a,
             ep_b,
             path,
             path,
-            convergence_threshold=convergence_threshold,
+            convergence_threshold=convergence_threshold * 0.70,
+            steps=25,
+            dt=0.04,
         )
+        if intersection is None:
+            intersection = _test_extension_intersection_linear(ep_a, ep_b, max_reach=max_reach * 0.85)
+    else:
+        intersection = _test_extension_intersection_linear(ep_a, ep_b, max_reach=max_reach)
+        if intersection is None:
+            intersection = _test_extension_intersection_curved(
+                ep_a,
+                ep_b,
+                path,
+                path,
+                convergence_threshold=convergence_threshold * 0.85,
+                steps=18,
+                dt=0.05,
+            )
 
     if intersection is None:
         return None, 0.0
@@ -248,13 +302,23 @@ def _safe_same_path_extension_intersection(
     if dist_a > max_reach or dist_b > max_reach:
         return None, 0.0
 
-    max_reasonable = max(1.8 * gap_distance, 0.42 * max(path_length, 1e-6))
+    if both_high_curvature:
+        max_reasonable = max(1.35 * gap_distance, 0.28 * max(path_length, 1e-6))
+    else:
+        max_reasonable = max(1.8 * gap_distance, 0.42 * max(path_length, 1e-6))
     if max(dist_a, dist_b) > max_reasonable:
         return None, 0.0
 
     quality = _extension_alignment_quality(ep_a, ep_b, intersection)
 
     samples = path.sample(pts_per_segment=25)
+    if len(samples) >= 4 and both_high_curvature:
+        min_xy = np.min(samples, axis=0)
+        max_xy = np.max(samples, axis=0)
+        outside = _distance_to_aabb(intersection, min_xy, max_xy)
+        if outside > max(8.0, 0.55 * gap_distance):
+            return None, 0.0
+
     if len(samples) >= 12:
         trim = max(3, int(round(len(samples) * 0.12)))
         core = samples[trim:-trim] if len(samples) > (2 * trim) else np.empty((0, 2))
@@ -304,6 +368,8 @@ def _test_extension_intersection_curved(
     ep_a: EndpointInfo, ep_b: EndpointInfo,
     path_a: BezierPath, path_b: BezierPath,
     convergence_threshold: float,
+    steps: int = 15,
+    dt: float = 0.05,
 ) -> Optional[np.ndarray]:
     """Extrapolate both curves beyond their endpoints, find convergence."""
     # Get the relevant terminal segment
@@ -321,8 +387,8 @@ def _test_extension_intersection_curved(
         cp_b = path_b.segments[0].control_points
         dir_b = "backward"
 
-    ext_a = _extrapolate_bezier(cp_a, dir_a, steps=15, dt=0.05)
-    ext_b = _extrapolate_bezier(cp_b, dir_b, steps=15, dt=0.05)
+    ext_a = _extrapolate_bezier(cp_a, dir_a, steps=steps, dt=dt)
+    ext_b = _extrapolate_bezier(cp_b, dir_b, steps=steps, dt=dt)
 
     return _nearest_approach(ext_a, ext_b, convergence_threshold)
 
@@ -491,6 +557,12 @@ def generate_candidates(
         ):
             continue
 
+        if (gap_ratio > 0.095 or dist > 90.0) and bilateral < 0.50 and misalignment_deg > 105.0:
+            continue
+
+        if gap_ratio > 0.10 and bilateral < 0.25 and misalignment_deg > 120.0:
+            continue
+
         pair_key = (min(idx_start, idx_end), max(idx_start, idx_end))
         if pair_key in seen_pairs:
             continue
@@ -527,6 +599,8 @@ def generate_candidates(
             gap_distance=dist,
             max_reach=max_reach_same,
             convergence_threshold=convergence_threshold * 0.85,
+            bilateral_alignment=bilateral,
+            misalignment_deg=misalignment_deg,
         )
         if intersection is not None:
             ext_bridge = _build_intersection_bridge(ep_end, ep_start, intersection, path, path)

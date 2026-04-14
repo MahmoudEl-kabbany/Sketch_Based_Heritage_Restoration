@@ -316,11 +316,17 @@ def score_candidates(
                 corner_factor = float(np.clip((misalignment_deg - 55.0) / 60.0, 0.0, 1.0))
                 continuation_strength = float(np.clip(getattr(c, "bilateral_alignment", 0.0), 0.0, 1.0))
                 extension_need = 1.0 - continuation_strength
-                c.score += (0.26 + 0.10 * corner_factor) * ext_quality * (extension_need ** 2)
-                if continuation_strength > 0.70:
-                    c.score -= 0.12 * ((continuation_strength - 0.70) / 0.30)
-                if ext_quality < 0.45:
-                    c.score -= 0.06 * ((0.45 - ext_quality) / 0.45)
+                context_conf = min(
+                    float(np.clip(getattr(c.ep_a, "tangent_confidence", 1.0), 0.0, 1.0)),
+                    float(np.clip(getattr(c.ep_b, "tangent_confidence", 1.0), 0.0, 1.0)),
+                )
+                c.score += (0.26 + 0.10 * corner_factor) * ext_quality * (extension_need ** 2) * context_conf
+                if continuation_strength > 0.60:
+                    c.score -= 0.16 * ((continuation_strength - 0.60) / 0.40)
+                if 70.0 <= misalignment_deg <= 100.0 and continuation_strength > 0.60:
+                    c.score -= 0.08 * ((continuation_strength - 0.60) / 0.40)
+                if ext_quality < 0.40:
+                    c.score -= 0.06 * ((0.40 - ext_quality) / 0.40)
             else:
                 c.score += 0.04 * ext_quality
 

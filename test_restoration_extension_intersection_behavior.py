@@ -136,6 +136,44 @@ def test_low_confidence_same_path_misalignment_is_rejected():
     assert len(candidates) == 0
 
 
+def test_high_curvature_weak_context_rejects_same_path_extension():
+    path = _path_from_points([
+        (20.0, 52.0),
+        (38.0, 25.0),
+        (72.0, 14.0),
+        (108.0, 25.0),
+        (124.0, 52.0),
+        (108.0, 79.0),
+        (72.0, 90.0),
+        (38.0, 79.0),
+        (20.0, 58.0),
+    ])
+
+    ep_start = EndpointInfo(
+        endpoint_id=0,
+        path_index=0,
+        end="start",
+        position=np.array([20.0, 52.0], dtype=np.float64),
+        tangent=_normalize(np.array([-0.95, 0.31], dtype=np.float64)),
+        curvature=0.015,
+        tangent_confidence=0.60,
+    )
+    ep_end = EndpointInfo(
+        endpoint_id=1,
+        path_index=0,
+        end="end",
+        position=np.array([20.0, 58.0], dtype=np.float64),
+        tangent=_normalize(np.array([-0.95, -0.31], dtype=np.float64)),
+        curvature=0.016,
+        tangent_confidence=0.60,
+    )
+    result = _make_result([path], [ep_start, ep_end])
+
+    candidates = generate_candidates(result, lookahead_fraction=0.22, max_per_endpoint=5)
+    assert any(c.scenario == "self_closure" for c in candidates)
+    assert not any(c.scenario == "extension_intersection" and c.same_path_closure for c in candidates)
+
+
 def test_synthesis_uses_explicit_intersection_point_metadata():
     ep_a = EndpointInfo(
         endpoint_id=0,
