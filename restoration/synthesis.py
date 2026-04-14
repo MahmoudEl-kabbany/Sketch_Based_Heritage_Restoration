@@ -26,6 +26,42 @@ def _safe_normalize(v: np.ndarray) -> np.ndarray:
     return v / n
 
 
+def _stabilize_bridge_control_points(cp: np.ndarray) -> np.ndarray:
+    """Clamp handle geometry to prevent local hook/backtracking artifacts."""
+    p0, p1, p2, p3 = cp.astype(np.float64)
+    chord_vec = p3 - p0
+    chord = float(np.linalg.norm(chord_vec))
+    if chord < 1e-6:
+        return cp
+
+    chord_dir = chord_vec / chord
+    min_forward = 0.02 * chord
+    rescue_forward = 0.08 * chord
+    max_side = 0.60 * chord
+
+    v1 = p1 - p0
+    proj1 = float(np.dot(v1, chord_dir))
+    side1 = v1 - proj1 * chord_dir
+    side1_norm = float(np.linalg.norm(side1))
+    if proj1 < min_forward:
+        proj1 = rescue_forward
+    if side1_norm > max_side and side1_norm > 1e-12:
+        side1 = side1 * (max_side / side1_norm)
+    p1_new = p0 + proj1 * chord_dir + side1
+
+    v2 = p3 - p2
+    proj2 = float(np.dot(v2, chord_dir))
+    side2 = v2 - proj2 * chord_dir
+    side2_norm = float(np.linalg.norm(side2))
+    if proj2 < min_forward:
+        proj2 = rescue_forward
+    if side2_norm > max_side and side2_norm > 1e-12:
+        side2 = side2 * (max_side / side2_norm)
+    p2_new = p3 - (proj2 * chord_dir + side2)
+
+    return np.vstack([p0, p1_new, p2_new, p3])
+
+
 def _is_straight(curvature_a: float, curvature_b: float,
                   tangent_a: np.ndarray, tangent_b: np.ndarray) -> bool:
     """Both endpoints are straight and tangents are nearly collinear."""
@@ -51,8 +87,10 @@ def _build_straight_bridge(ep_a: EndpointInfo, ep_b: EndpointInfo) -> BezierSegm
     step = norm / 3.0
     p1 = p0 + unit * step
     p2 = p3 - unit * step
+    cp = np.vstack([p0, p1, p2, p3])
+    cp = _stabilize_bridge_control_points(cp)
     return BezierSegment(
-        control_points=np.vstack([p0, p1, p2, p3]),
+        control_points=cp,
         source_type="bridge",
     )
 
@@ -74,10 +112,14 @@ def _build_g1_bridge(ep_a: EndpointInfo, ep_b: EndpointInfo) -> BezierSegment:
         alpha_b = min(alpha_b, 1.0 / (3.0 * ep_b.curvature))
 
     p1 = p0 + alpha_a * ep_a.tangent
-    p2 = p3 + alpha_b * (-ep_b.tangent)
+    # ep_b.tangent is outward; incoming derivative at p3 should align with -ep_b.tangent.
+    p2 = p3 + alpha_b * ep_b.tangent
+
+    cp = np.vstack([p0, p1, p2, p3])
+    cp = _stabilize_bridge_control_points(cp)
 
     return BezierSegment(
-        control_points=np.vstack([p0, p1, p2, p3]),
+        control_points=cp,
         source_type="bridge",
     )
 
@@ -97,8 +139,10 @@ def _build_intersection_bridge_linear(
         alpha = chord / 3.0
         p1 = p0 + alpha * ep_a.tangent
         p2 = p3 - alpha * _safe_normalize(p3 - p0)
+        cp = np.vstack([p0, p1, p2, p3])
+        cp = _stabilize_bridge_control_points(cp)
         segments.append(BezierSegment(
-            control_points=np.vstack([p0, p1, p2, p3]),
+            control_points=cp,
             source_type="bridge",
         ))
 
@@ -109,9 +153,12 @@ def _build_intersection_bridge_linear(
     if chord > 1e-6:
         alpha = chord / 3.0
         p1 = p0 + alpha * _safe_normalize(p3 - p0)
-        p2 = p3 + alpha * (-ep_b.tangent)
+        # ep_b.tangent is outward; incoming derivative at p3 should align with -ep_b.tangent.
+        p2 = p3 + alpha * ep_b.tangent
+        cp = np.vstack([p0, p1, p2, p3])
+        cp = _stabilize_bridge_control_points(cp)
         segments.append(BezierSegment(
-            control_points=np.vstack([p0, p1, p2, p3]),
+            control_points=cp,
             source_type="bridge",
         ))
 
@@ -138,8 +185,10 @@ def _build_intersection_bridge_curved(
         # but respects curvature continuity
         approach_dir = _safe_normalize(I - p0)
         p2 = p3 - (chord / 3.0) * approach_dir
+        cp = np.vstack([p0, p1, p2, p3])
+        cp = _stabilize_bridge_control_points(cp)
         segments.append(BezierSegment(
-            control_points=np.vstack([p0, p1, p2, p3]),
+            control_points=cp,
             source_type="bridge",
         ))
 
@@ -153,9 +202,12 @@ def _build_intersection_bridge_curved(
         alpha_b = chord / 3.0
         if ep_b.curvature > 1e-6:
             alpha_b = min(alpha_b, 1.0 / (3.0 * ep_b.curvature))
-        p2 = p3 + alpha_b * (-ep_b.tangent)
+        # ep_b.tangent is outward; incoming derivative at p3 should align with -ep_b.tangent.
+        p2 = p3 + alpha_b * ep_b.tangent
+        cp = np.vstack([p0, p1, p2, p3])
+        cp = _stabilize_bridge_control_points(cp)
         segments.append(BezierSegment(
-            control_points=np.vstack([p0, p1, p2, p3]),
+            control_points=cp,
             source_type="bridge",
         ))
 
