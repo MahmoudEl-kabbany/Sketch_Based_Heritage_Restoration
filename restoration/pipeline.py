@@ -509,6 +509,7 @@ def _build_report(
     image_path: str,
     result: ExtractionResult,
     candidates: List[ConnectionCandidate],
+    candidate_diagnostics: Optional[Dict[str, Any]],
     accepted: List[ConnectionCandidate],
     final_paths: List[BezierPath],
     elapsed: float,
@@ -569,6 +570,7 @@ def _build_report(
                 "score_summary": _numeric_summary(all_scores, digits=4),
                 "alignment_summary": _numeric_summary(all_alignment, digits=4),
                 "misalignment_deg_summary": _numeric_summary(all_misalignment, digits=2),
+                "diagnostics": candidate_diagnostics or {},
             },
             "selection": {
                 "accepted_total": len(accepted),
@@ -633,8 +635,12 @@ def restore(
 
     # Phase 2: Candidate Generation
     print("  Phase 2: Generating connection candidates...")
+    candidate_diagnostics: Dict[str, Any] = {}
     candidates = generate_candidates(
-        extraction, lookahead_fraction, max_candidates_per_endpoint,
+        extraction,
+        lookahead_fraction,
+        max_candidates_per_endpoint,
+        diagnostics=candidate_diagnostics,
     )
     t1_count = sum(1 for c in candidates if c.tier == 1)
     t2_count = sum(1 for c in candidates if c.tier == 2)
@@ -688,7 +694,13 @@ def restore(
     _save_unlabeled_restoration_overlay(image_path, final_paths, output_dir)
 
     report = _build_report(
-        image_path, extraction, candidates, accepted, final_paths, elapsed,
+        image_path,
+        extraction,
+        candidates,
+        candidate_diagnostics,
+        accepted,
+        final_paths,
+        elapsed,
         restoration_history=change_logs,
         dropped_after_sanitize=dropped_after_sanitize,
     )

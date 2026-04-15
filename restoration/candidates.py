@@ -7,7 +7,7 @@ with support for both straight and curved extrapolation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -122,6 +122,106 @@ def _passes_direction_gates(
             return False
 
     return True
+
+
+def _init_candidate_diagnostics(
+    diagnostics: Optional[Dict[str, Any]],
+    radius_t1: float,
+    radius_t2: float,
+) -> Optional[Dict[str, Any]]:
+    """Initialize optional candidate-generation diagnostics payload.
+
+    Keep this compact: only aggregate counts and a small sample of rejections.
+    """
+    if diagnostics is None:
+        return None
+
+    diagnostics.clear()
+    diagnostics.update({
+        "radius_px": {
+            "tier1": round(float(radius_t1), 2),
+            "tier2": round(float(radius_t2), 2),
+        },
+        "max_rejected_pair_records": 80,
+        "same_path": {
+            "evaluated_paths": 0,
+            "eligible_pairs": 0,
+            "generated_pairs": 0,
+            "rejection_reason_counts": {},
+            "rejected_pairs_total": 0,
+            "rejected_pairs": [],
+        },
+        "cross_path": {
+            "pairs_within_tier2": 0,
+            "eligible_pairs": 0,
+            "generated_pairs": 0,
+            "rejection_reason_counts": {},
+            "rejected_pairs_total": 0,
+            "rejected_pairs": [],
+        },
+    })
+    return diagnostics
+
+
+def _diag_increment_reason(section: Dict[str, Any], reason: str) -> None:
+    """Increment a rejection reason counter in diagnostics."""
+    counts = section.setdefault("rejection_reason_counts", {})
+    counts[reason] = int(counts.get(reason, 0)) + 1
+
+
+def _diag_record_rejection(
+    section: Dict[str, Any],
+    payload: Dict[str, Any],
+    max_records: int,
+) -> None:
+    """Record one rejected pair payload with capped storage."""
+    section["rejected_pairs_total"] = int(section.get("rejected_pairs_total", 0)) + 1
+    records = section.setdefault("rejected_pairs", [])
+    if len(records) < max_records:
+        records.append(payload)
+
+
+def _diag_pair_payload(
+    ep_a: EndpointInfo,
+    ep_b: EndpointInfo,
+    distance: float,
+    reasons: List[str],
+    tier: Optional[int] = None,
+    forward_a: Optional[float] = None,
+    forward_b: Optional[float] = None,
+    bilateral: Optional[float] = None,
+    misalignment_deg: Optional[float] = None,
+    extension_pregate_pass: Optional[bool] = None,
+    intersection_available: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Build a compact JSON-friendly diagnostics payload for a rejected pair."""
+    payload: Dict[str, Any] = {
+        "endpoint_a": {
+            "path_index": int(ep_a.path_index),
+            "end": str(ep_a.end),
+        },
+        "endpoint_b": {
+            "path_index": int(ep_b.path_index),
+            "end": str(ep_b.end),
+        },
+        "distance_px": round(float(distance), 2),
+        "reasons": list(reasons),
+    }
+    if tier is not None:
+        payload["tier"] = int(tier)
+    if forward_a is not None:
+        payload["forward_a"] = round(float(forward_a), 4)
+    if forward_b is not None:
+        payload["forward_b"] = round(float(forward_b), 4)
+    if bilateral is not None:
+        payload["bilateral_alignment"] = round(float(bilateral), 4)
+    if misalignment_deg is not None:
+        payload["misalignment_deg"] = round(float(misalignment_deg), 2)
+    if extension_pregate_pass is not None:
+        payload["extension_pregate_pass"] = bool(extension_pregate_pass)
+    if intersection_available is not None:
+        payload["intersection_available"] = bool(intersection_available)
+    return payload
 
 
 def _ray_point_distance(origin: np.ndarray, direction: np.ndarray,
@@ -485,6 +585,7 @@ def generate_candidates(
     lookahead_fraction: float = 0.15,
     max_per_endpoint: int = 5,
     self_closure_gap_ratio: float = 0.22,
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> List[ConnectionCandidate]:
     """Generate connection candidates for all open endpoints.
 
@@ -501,12 +602,17 @@ def generate_candidates(
     continuation_tolerance = max(10.0, radius_t1 * 0.15)
     convergence_threshold = max(8.0, radius_t1 * 0.12)
 
+    diag = _init_candidate_diagnostics(diagnostics, radius_t1, radius_t2)
+    max_diag_records = int(diag.get("max_rejected_pair_records", 80)) if diag is not None else 80
+    same_diag = diag.get("same_path") if diag is not None else None
+    cross_diag = diag.get("cross_path") if diag is not None else None
+
     candidates: List[ConnectionCandidate] = []
     cid = 0
 
     # Track per-endpoint candidate counts for the cap
     ep_candidate_count: Dict[int, int] = {i: 0 for i in range(len(endpoints))}
-    seen_pairs: set = set()
+    seen_pairs: Set[Tuple[int, int]] = set()
 
     endpoint_idx_by_key: Dict[Tuple[int, str], int] = {
         (ep.path_index, ep.end): idx for idx, ep in enumerate(endpoints)
@@ -527,6 +633,8 @@ def generate_candidates(
     for path_idx, path in enumerate(result.paths):
         if path.is_closed or not path.segments:
             continue
+        if same_diag is not None:
+            same_diag["evaluated_paths"] = int(same_diag.get("evaluated_paths", 0)) + 1
         idx_start = endpoint_idx_by_key.get((path_idx, "start"))
         idx_end = endpoint_idx_by_key.get((path_idx, "end"))
         if idx_start is None or idx_end is None:
@@ -538,11 +646,47 @@ def generate_candidates(
         path_len = max(path_lengths.get(path_idx, 0.0), 1e-6)
         gap_ratio = dist / path_len
 
-        if gap_ratio > self_closure_gap_ratio or dist > (radius_t1 * 1.25):
+        same_reasons: List[str] = []
+        if gap_ratio > self_closure_gap_ratio:
+            same_reasons.append("same_gap_ratio_exceeds_cap")
+        if dist > (radius_t1 * 1.25):
+            same_reasons.append("same_distance_exceeds_cap")
+
+        if same_reasons:
+            if same_diag is not None:
+                for reason in same_reasons:
+                    _diag_increment_reason(same_diag, reason)
+                _diag_record_rejection(
+                    same_diag,
+                    _diag_pair_payload(
+                        ep_end,
+                        ep_start,
+                        dist,
+                        reasons=same_reasons,
+                        tier=1,
+                    ),
+                    max_records=max_diag_records,
+                )
             continue
 
         if ep_candidate_count[idx_start] >= max_per_endpoint or ep_candidate_count[idx_end] >= max_per_endpoint:
+            if same_diag is not None:
+                _diag_increment_reason(same_diag, "same_endpoint_cap")
+                _diag_record_rejection(
+                    same_diag,
+                    _diag_pair_payload(
+                        ep_end,
+                        ep_start,
+                        dist,
+                        reasons=["same_endpoint_cap"],
+                        tier=1,
+                    ),
+                    max_records=max_diag_records,
+                )
             continue
+
+        if same_diag is not None:
+            same_diag["eligible_pairs"] = int(same_diag.get("eligible_pairs", 0)) + 1
 
         fwd_a, fwd_b, bilateral, misalignment_deg = _pair_alignment_metrics(ep_end, ep_start)
         if not _passes_direction_gates(
@@ -555,16 +699,80 @@ def generate_candidates(
             tangent_confidence_a=float(getattr(ep_end, "tangent_confidence", 1.0)),
             tangent_confidence_b=float(getattr(ep_start, "tangent_confidence", 1.0)),
         ):
+            if same_diag is not None:
+                _diag_increment_reason(same_diag, "same_direction_gate")
+                _diag_record_rejection(
+                    same_diag,
+                    _diag_pair_payload(
+                        ep_end,
+                        ep_start,
+                        dist,
+                        reasons=["same_direction_gate"],
+                        tier=1,
+                        forward_a=fwd_a,
+                        forward_b=fwd_b,
+                        bilateral=bilateral,
+                        misalignment_deg=misalignment_deg,
+                    ),
+                    max_records=max_diag_records,
+                )
             continue
 
         if (gap_ratio > 0.095 or dist > 90.0) and bilateral < 0.50 and misalignment_deg > 105.0:
+            if same_diag is not None:
+                _diag_increment_reason(same_diag, "same_long_gap_guard")
+                _diag_record_rejection(
+                    same_diag,
+                    _diag_pair_payload(
+                        ep_end,
+                        ep_start,
+                        dist,
+                        reasons=["same_long_gap_guard"],
+                        tier=1,
+                        forward_a=fwd_a,
+                        forward_b=fwd_b,
+                        bilateral=bilateral,
+                        misalignment_deg=misalignment_deg,
+                    ),
+                    max_records=max_diag_records,
+                )
             continue
 
         if gap_ratio > 0.10 and bilateral < 0.25 and misalignment_deg > 120.0:
+            if same_diag is not None:
+                _diag_increment_reason(same_diag, "same_corner_guard")
+                _diag_record_rejection(
+                    same_diag,
+                    _diag_pair_payload(
+                        ep_end,
+                        ep_start,
+                        dist,
+                        reasons=["same_corner_guard"],
+                        tier=1,
+                        forward_a=fwd_a,
+                        forward_b=fwd_b,
+                        bilateral=bilateral,
+                        misalignment_deg=misalignment_deg,
+                    ),
+                    max_records=max_diag_records,
+                )
             continue
 
         pair_key = (min(idx_start, idx_end), max(idx_start, idx_end))
         if pair_key in seen_pairs:
+            if same_diag is not None:
+                _diag_increment_reason(same_diag, "same_pair_seen")
+                _diag_record_rejection(
+                    same_diag,
+                    _diag_pair_payload(
+                        ep_end,
+                        ep_start,
+                        dist,
+                        reasons=["same_pair_seen"],
+                        tier=1,
+                    ),
+                    max_records=max_diag_records,
+                )
             continue
 
         added_for_pair = False
@@ -628,6 +836,8 @@ def generate_candidates(
             ep_candidate_count[idx_start] += 1
             ep_candidate_count[idx_end] += 1
             seen_pairs.add(pair_key)
+            if same_diag is not None:
+                same_diag["generated_pairs"] = int(same_diag.get("generated_pairs", 0)) + 1
 
     # Query all pairs within Tier 2 radius (superset of Tier 1)
     for i, ep_a in enumerate(endpoints):
@@ -649,15 +859,44 @@ def generate_candidates(
             if pair_key in seen_pairs:
                 continue
 
+            if cross_diag is not None:
+                cross_diag["pairs_within_tier2"] = int(cross_diag.get("pairs_within_tier2", 0)) + 1
+
             # Enforce per-endpoint cap
             if ep_candidate_count[i] >= max_per_endpoint:
-                break
+                if cross_diag is not None:
+                    _diag_increment_reason(cross_diag, "cross_endpoint_cap_source")
+                    _diag_record_rejection(
+                        cross_diag,
+                        _diag_pair_payload(
+                            ep_a,
+                            ep_b,
+                            dist,
+                            reasons=["cross_endpoint_cap_source"],
+                        ),
+                        max_records=max_diag_records,
+                    )
+                continue
             if ep_candidate_count[j] >= max_per_endpoint:
+                if cross_diag is not None:
+                    _diag_increment_reason(cross_diag, "cross_endpoint_cap_target")
+                    _diag_record_rejection(
+                        cross_diag,
+                        _diag_pair_payload(
+                            ep_a,
+                            ep_b,
+                            dist,
+                            reasons=["cross_endpoint_cap_target"],
+                        ),
+                        max_records=max_diag_records,
+                    )
                 continue
 
             tier = 1 if dist <= radius_t1 else 2
             fwd_a, fwd_b, bilateral, misalignment_deg = _pair_alignment_metrics(ep_a, ep_b)
-            if not _passes_direction_gates(
+            spur_involved = is_spur_path.get(ep_a.path_index, False) or is_spur_path.get(ep_b.path_index, False)
+
+            strict_direction_ok = _passes_direction_gates(
                 fwd_a,
                 fwd_b,
                 bilateral,
@@ -666,14 +905,110 @@ def generate_candidates(
                 same_path=False,
                 tangent_confidence_a=float(getattr(ep_a, "tangent_confidence", 1.0)),
                 tangent_confidence_b=float(getattr(ep_b, "tangent_confidence", 1.0)),
-            ):
+            )
+            min_conf = min(
+                float(getattr(ep_a, "tangent_confidence", 1.0)),
+                float(getattr(ep_b, "tangent_confidence", 1.0)),
+            )
+            best_forward = max(fwd_a, fwd_b)
+            worst_forward = min(fwd_a, fwd_b)
+            extension_pregate_ok = (
+                tier == 1
+                and not spur_involved
+                and dist <= max(80.0, radius_t1 * 0.42)
+                and 92.0 <= misalignment_deg <= 165.0
+                and best_forward >= 0.28
+                and worst_forward >= -0.22
+                and bilateral >= -0.22
+                and min_conf >= 0.50
+            )
+
+            if not strict_direction_ok and not extension_pregate_ok:
+                intersection_for_diag = _test_extension_intersection_linear(
+                    ep_a,
+                    ep_b,
+                    radius_t1 * 1.5 if tier == 1 else radius_t2,
+                )
+                if intersection_for_diag is None:
+                    path_a_diag = result.paths[ep_a.path_index]
+                    path_b_diag = result.paths[ep_b.path_index]
+                    intersection_for_diag = _test_extension_intersection_curved(
+                        ep_a,
+                        ep_b,
+                        path_a_diag,
+                        path_b_diag,
+                        convergence_threshold=convergence_threshold,
+                    )
+
+                if cross_diag is not None:
+                    _diag_increment_reason(cross_diag, "cross_direction_gate")
+                    reasons = ["cross_direction_gate"]
+                    if intersection_for_diag is not None:
+                        _diag_increment_reason(cross_diag, "cross_direction_gate_with_intersection")
+                        reasons.append("cross_direction_gate_with_intersection")
+
+                    _diag_record_rejection(
+                        cross_diag,
+                        _diag_pair_payload(
+                            ep_a,
+                            ep_b,
+                            dist,
+                            reasons=reasons,
+                            tier=tier,
+                            forward_a=fwd_a,
+                            forward_b=fwd_b,
+                            bilateral=bilateral,
+                            misalignment_deg=misalignment_deg,
+                            extension_pregate_pass=extension_pregate_ok,
+                            intersection_available=intersection_for_diag is not None,
+                        ),
+                        max_records=max_diag_records,
+                    )
                 continue
 
-            spur_involved = is_spur_path.get(ep_a.path_index, False) or is_spur_path.get(ep_b.path_index, False)
+            if cross_diag is not None:
+                cross_diag["eligible_pairs"] = int(cross_diag.get("eligible_pairs", 0)) + 1
+
             if spur_involved:
                 if dist > radius_t1 * 0.65:
+                    if cross_diag is not None:
+                        _diag_increment_reason(cross_diag, "cross_spur_distance_gate")
+                        _diag_record_rejection(
+                            cross_diag,
+                            _diag_pair_payload(
+                                ep_a,
+                                ep_b,
+                                dist,
+                                reasons=["cross_spur_distance_gate"],
+                                tier=tier,
+                                forward_a=fwd_a,
+                                forward_b=fwd_b,
+                                bilateral=bilateral,
+                                misalignment_deg=misalignment_deg,
+                                extension_pregate_pass=extension_pregate_ok,
+                            ),
+                            max_records=max_diag_records,
+                        )
                     continue
                 if bilateral < 0.45 or misalignment_deg > 64.0:
+                    if cross_diag is not None:
+                        _diag_increment_reason(cross_diag, "cross_spur_geometry_gate")
+                        _diag_record_rejection(
+                            cross_diag,
+                            _diag_pair_payload(
+                                ep_a,
+                                ep_b,
+                                dist,
+                                reasons=["cross_spur_geometry_gate"],
+                                tier=tier,
+                                forward_a=fwd_a,
+                                forward_b=fwd_b,
+                                bilateral=bilateral,
+                                misalignment_deg=misalignment_deg,
+                                extension_pregate_pass=extension_pregate_ok,
+                            ),
+                            max_records=max_diag_records,
+                        )
                     continue
 
             path_a = result.paths[ep_a.path_index]
@@ -681,7 +1016,7 @@ def generate_candidates(
 
             # --- Scenario 1: Good Continuation ---
             tol = continuation_tolerance if tier == 1 else continuation_tolerance * 0.5
-            if _test_good_continuation(ep_a, ep_b, tol) and _test_good_continuation(ep_b, ep_a, tol):
+            if strict_direction_ok and _test_good_continuation(ep_a, ep_b, tol) and _test_good_continuation(ep_b, ep_a, tol):
                 bridge_segs = _build_continuation_bridge(ep_a, ep_b)
                 candidates.append(ConnectionCandidate(
                     id=cid,
@@ -700,6 +1035,8 @@ def generate_candidates(
                 ep_candidate_count[i] += 1
                 ep_candidate_count[j] += 1
                 seen_pairs.add(pair_key)
+                if cross_diag is not None:
+                    cross_diag["generated_pairs"] = int(cross_diag.get("generated_pairs", 0)) + 1
                 continue  # prefer continuation over intersection
 
             # --- Scenario 2: Extension Intersection ---
@@ -739,6 +1076,46 @@ def generate_candidates(
                     ep_candidate_count[i] += 1
                     ep_candidate_count[j] += 1
                     seen_pairs.add(pair_key)
+                    if cross_diag is not None:
+                        cross_diag["generated_pairs"] = int(cross_diag.get("generated_pairs", 0)) + 1
+                elif cross_diag is not None:
+                    _diag_increment_reason(cross_diag, "cross_extension_bridge_empty")
+                    _diag_record_rejection(
+                        cross_diag,
+                        _diag_pair_payload(
+                            ep_a,
+                            ep_b,
+                            dist,
+                            reasons=["cross_extension_bridge_empty"],
+                            tier=tier,
+                            forward_a=fwd_a,
+                            forward_b=fwd_b,
+                            bilateral=bilateral,
+                            misalignment_deg=misalignment_deg,
+                            extension_pregate_pass=extension_pregate_ok,
+                            intersection_available=True,
+                        ),
+                        max_records=max_diag_records,
+                    )
+            elif cross_diag is not None:
+                _diag_increment_reason(cross_diag, "cross_no_extension_intersection")
+                _diag_record_rejection(
+                    cross_diag,
+                    _diag_pair_payload(
+                        ep_a,
+                        ep_b,
+                        dist,
+                        reasons=["cross_no_extension_intersection"],
+                        tier=tier,
+                        forward_a=fwd_a,
+                        forward_b=fwd_b,
+                        bilateral=bilateral,
+                        misalignment_deg=misalignment_deg,
+                        extension_pregate_pass=extension_pregate_ok,
+                        intersection_available=False,
+                    ),
+                    max_records=max_diag_records,
+                )
 
     # Keep geometry-consistent candidates first before scoring.
     candidates.sort(key=lambda c: (c.distance, c.misalignment_deg, -c.bilateral_alignment, c.id))

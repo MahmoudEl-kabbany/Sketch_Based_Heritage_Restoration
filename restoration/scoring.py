@@ -329,6 +329,17 @@ def score_candidates(
                     c.score -= 0.06 * ((0.40 - ext_quality) / 0.40)
             else:
                 c.score += 0.04 * ext_quality
+                # Recover short corner-like cross-path closures that are geometrically
+                # plausible but under-scored by continuation-based penalties.
+                bilateral = float(np.clip(getattr(c, "bilateral_alignment", 0.0), -1.0, 1.0))
+                if (
+                    c.tier == 1
+                    and c.distance <= min(60.0, radius_t1 * 0.42)
+                    and ext_quality >= 0.90
+                    and 125.0 <= misalignment_deg <= 165.0
+                    and 0.0 <= bilateral <= 0.18
+                ):
+                    c.score += 0.20 * ext_quality
 
     # PR4b: suppress cross-shape links when a path has strong self-closure support.
     best_self_closure_by_path: Dict[int, Tuple[float, float]] = {}
