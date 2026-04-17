@@ -20,7 +20,7 @@ from bezier_curves.bezier import BezierPath, BezierSegment, visualize_paths
 from restoration.extraction import ExtractionResult, extract_paths
 from restoration.candidates import ConnectionCandidate, generate_candidates
 from restoration.scoring import score_candidates
-from restoration.asp_engine import encode_facts, solve, decode_solution, RULES_PATH
+from restoration.asp_engine import decode_solution, solve_partitioned, RULES_PATH
 from restoration.synthesis import synthesize_bridges, merge_restored_paths
 from restoration.efd_closure import close_single_gaps
 
@@ -103,6 +103,22 @@ def _count_by(items: List[Any], key_fn) -> Dict[str, int]:
         key = str(key_fn(item))
         counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def _endpoint_token_key(token: Tuple[str, int]) -> str:
+    """Serialize endpoint token tuples into stable text keys."""
+    return f"{token[0]}:{token[1]}"
+
+
+def _candidate_endpoint_pair_key(candidate: ConnectionCandidate) -> str:
+    """Canonical order-independent endpoint pair key for exactness checks."""
+    token_a = _endpoint_token(candidate.ep_a)
+    token_b = _endpoint_token(candidate.ep_b)
+    key_a = _endpoint_token_key(token_a)
+    key_b = _endpoint_token_key(token_b)
+    if key_a <= key_b:
+        return f"{key_a}|{key_b}"
+    return f"{key_b}|{key_a}"
 
 
 def _build_bridge_event_explanation(
@@ -515,6 +531,8 @@ def _build_report(
     elapsed: float,
     restoration_history: List[Dict[str, Any]] = None,
     dropped_after_sanitize: int = 0,
+    stage_timings: Optional[Dict[str, float]] = None,
+    asp_solver_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build a detailed structured restoration report."""
     extraction_open = sum(1 for p in result.paths if not p.is_closed)
@@ -523,6 +541,7 @@ def _build_report(
     final_closed = sum(1 for p in final_paths if p.is_closed)
 
     accepted_ids = [int(c.id) for c in accepted]
+    accepted_endpoint_pairs = sorted(_candidate_endpoint_pair_key(c) for c in accepted)
     accepted_scenarios = _count_by(accepted, lambda c: c.scenario)
     scenario_counts = _count_by(candidates, lambda c: c.scenario)
 
@@ -545,6 +564,10 @@ def _build_report(
         },
         "summary": {
             "processing_time_s": round(elapsed, 3),
+            "stage_timings_s": {
+                str(k): round(float(v), 6)
+                for k, v in (stage_timings or {}).items()
+            },
             "total_restoration_events": len(restoration_history or []),
             "open_paths_before": extraction_open,
             "open_paths_after": final_open,
@@ -577,11 +600,13 @@ def _build_report(
                 "dropped_after_endpoint_sanitize": int(dropped_after_sanitize),
                 "acceptance_rate_percent": round(len(accepted) / max(len(candidates), 1) * 100, 1),
                 "accepted_candidate_ids": accepted_ids,
+                "accepted_endpoint_pairs": accepted_endpoint_pairs,
                 "accepted_scenarios": accepted_scenarios,
                 "accepted_score_summary": _numeric_summary(accepted_scores, digits=4),
                 "accepted_alignment_summary": _numeric_summary(accepted_alignment, digits=4),
                 "accepted_misalignment_deg_summary": _numeric_summary(accepted_misalignment, digits=2),
             },
+            "asp_solver": asp_solver_summary or {},
             "restoration_outcome": {
                 "final_paths": len(final_paths),
                 "final_open_paths": final_open,
@@ -619,7 +644,13 @@ def restore(
         RestorationResult with original paths, restored paths, bridges, and report
     """
     os.makedirs(output_dir, exist_ok=True)
-    t0 = time.time()
+    t0 = time.perf_counter()
+    stage_timings: Dict[str, float] = {}
+    asp_solver_summary: Dict[str, Any] = {
+        "fact_lines": 0,
+        "fact_bytes": 0,
+        "accepted_id_count_before_decode": 0,
+    }
     name = os.path.splitext(os.path.basename(image_path))[0]
 
     print(f"\n{'=' * 60}")
@@ -628,7 +659,9 @@ def restore(
 
     # Phase 1: Extraction
     print("  Phase 1: Extracting paths and endpoints...")
+    t_phase = time.perf_counter()
     extraction = extract_paths(image_path)
+    stage_timings["phase1_extraction_s"] = time.perf_counter() - t_phase
     print(f"    {len(extraction.paths)} paths, "
           f"{len(extraction.endpoints)} endpoints, "
           f"diagonal = {extraction.diagonal:.0f}px")
@@ -636,19 +669,23 @@ def restore(
     # Phase 2: Candidate Generation
     print("  Phase 2: Generating connection candidates...")
     candidate_diagnostics: Dict[str, Any] = {}
+    t_phase = time.perf_counter()
     candidates = generate_candidates(
         extraction,
         lookahead_fraction,
         max_candidates_per_endpoint,
         diagnostics=candidate_diagnostics,
     )
+    stage_timings["phase2_candidate_generation_s"] = time.perf_counter() - t_phase
     t1_count = sum(1 for c in candidates if c.tier == 1)
     t2_count = sum(1 for c in candidates if c.tier == 2)
     print(f"    {len(candidates)} candidates (Tier1={t1_count}, Tier2={t2_count})")
 
     # Phase 3: Scoring
     print("  Phase 3: Scoring candidates...")
+    t_phase = time.perf_counter()
     scored = score_candidates(candidates, extraction)
+    stage_timings["phase3_scoring_s"] = time.perf_counter() - t_phase
     if scored:
         print(f"    Best score: {scored[0].score:.3f}, "
               f"Worst score: {scored[-1].score:.3f}")
@@ -656,11 +693,29 @@ def restore(
     # Phase 4: ASP Decision
     print("  Phase 4: Solving with ASP...")
     if scored:
-        facts = encode_facts(scored, extraction.endpoints)
-        accepted_ids = solve(facts, RULES_PATH)
+        accepted_ids, partition_summary = solve_partitioned(
+            scored,
+            extraction.endpoints,
+            RULES_PATH,
+        )
+        stage_timings["phase4_asp_fact_encoding_s"] = float(partition_summary.get("encoding_time_s", 0.0))
+        stage_timings["phase4_asp_solving_s"] = float(partition_summary.get("solving_time_s", 0.0))
+        asp_solver_summary.update(partition_summary)
+
+        t_decode = time.perf_counter()
         accepted = decode_solution(accepted_ids, scored)
+        stage_timings["phase4_asp_decode_s"] = time.perf_counter() - t_decode
     else:
         accepted = []
+        stage_timings["phase4_asp_fact_encoding_s"] = 0.0
+        stage_timings["phase4_asp_solving_s"] = 0.0
+        stage_timings["phase4_asp_decode_s"] = 0.0
+
+    stage_timings["phase4_asp_total_s"] = (
+        stage_timings.get("phase4_asp_fact_encoding_s", 0.0)
+        + stage_timings.get("phase4_asp_solving_s", 0.0)
+        + stage_timings.get("phase4_asp_decode_s", 0.0)
+    )
 
     accepted, dropped_after_sanitize = _sanitize_accepted_candidates(accepted)
     print(f"    {len(accepted)} connections accepted")
@@ -669,17 +724,21 @@ def restore(
 
     # Phase 5: Synthesis
     print("  Phase 5: Synthesizing bridges...")
+    t_phase = time.perf_counter()
     bridges = synthesize_bridges(accepted)
     restored_paths = merge_restored_paths(
         extraction.paths, bridges, accepted,
     )
+    stage_timings["phase5_synthesis_s"] = time.perf_counter() - t_phase
     print(f"    {len(bridges)} bridge segment(s) created")
 
     # Phase 6: EFD Gap Closure
     print("  Phase 6: EFD single-gap closure...")
+    t_phase = time.perf_counter()
     final_paths = close_single_gaps(
         restored_paths, extraction.efd_contours, efd_gap_threshold,
     )
+    stage_timings["phase6_efd_closure_s"] = time.perf_counter() - t_phase
     closed_by_efd = (
         sum(1 for p in final_paths if p.is_closed)
         - sum(1 for p in restored_paths if p.is_closed)
@@ -687,11 +746,16 @@ def restore(
     print(f"    {max(0, closed_by_efd)} path(s) closed by EFD")
 
     # Phase 7: Output
-    elapsed = time.time() - t0
+    t_phase = time.perf_counter()
 
     # Labeled overlay visualization + logs
     _, change_logs = _save_labeled_restoration(image_path, final_paths, accepted, output_dir)
     _save_unlabeled_restoration_overlay(image_path, final_paths, output_dir)
+    _save_visualization(image_path, extraction.paths, final_paths, output_dir)
+
+    stage_timings["phase7_output_s"] = time.perf_counter() - t_phase
+    elapsed = time.perf_counter() - t0
+    stage_timings["total_pipeline_s"] = elapsed
 
     report = _build_report(
         image_path,
@@ -703,9 +767,9 @@ def restore(
         elapsed,
         restoration_history=change_logs,
         dropped_after_sanitize=dropped_after_sanitize,
+        stage_timings=stage_timings,
+        asp_solver_summary=asp_solver_summary,
     )
-
-    _save_visualization(image_path, extraction.paths, final_paths, output_dir)
 
     # Save report JSON
     report_path = os.path.join(output_dir, f"{name}_report.json")
