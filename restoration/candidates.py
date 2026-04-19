@@ -1016,6 +1016,7 @@ def generate_candidates(
 
             # --- Scenario 1: Good Continuation ---
             tol = continuation_tolerance if tier == 1 else continuation_tolerance * 0.5
+            continuation_added = False
             if strict_direction_ok and _test_good_continuation(ep_a, ep_b, tol) and _test_good_continuation(ep_b, ep_a, tol):
                 bridge_segs = _build_continuation_bridge(ep_a, ep_b)
                 candidates.append(ConnectionCandidate(
@@ -1032,12 +1033,7 @@ def generate_candidates(
                     extension_quality=0.0,
                 ))
                 cid += 1
-                ep_candidate_count[i] += 1
-                ep_candidate_count[j] += 1
-                seen_pairs.add(pair_key)
-                if cross_diag is not None:
-                    cross_diag["generated_pairs"] = int(cross_diag.get("generated_pairs", 0)) + 1
-                continue  # prefer continuation over intersection
+                continuation_added = True
 
             # --- Scenario 2: Extension Intersection ---
             # Try linear intersection first
@@ -1073,12 +1069,8 @@ def generate_candidates(
                         extension_quality=_extension_alignment_quality(ep_a, ep_b, intersection),
                     ))
                     cid += 1
-                    ep_candidate_count[i] += 1
-                    ep_candidate_count[j] += 1
-                    seen_pairs.add(pair_key)
-                    if cross_diag is not None:
-                        cross_diag["generated_pairs"] = int(cross_diag.get("generated_pairs", 0)) + 1
-                elif cross_diag is not None:
+                    continuation_added = True
+                elif not continuation_added and cross_diag is not None:
                     _diag_increment_reason(cross_diag, "cross_extension_bridge_empty")
                     _diag_record_rejection(
                         cross_diag,
@@ -1097,7 +1089,7 @@ def generate_candidates(
                         ),
                         max_records=max_diag_records,
                     )
-            elif cross_diag is not None:
+            elif not continuation_added and cross_diag is not None:
                 _diag_increment_reason(cross_diag, "cross_no_extension_intersection")
                 _diag_record_rejection(
                     cross_diag,
@@ -1116,6 +1108,13 @@ def generate_candidates(
                     ),
                     max_records=max_diag_records,
                 )
+                
+            if continuation_added:
+                ep_candidate_count[i] += 1
+                ep_candidate_count[j] += 1
+                seen_pairs.add(pair_key)
+                if cross_diag is not None:
+                    cross_diag["generated_pairs"] = int(cross_diag.get("generated_pairs", 0)) + 1
 
     # Keep geometry-consistent candidates first before scoring.
     candidates.sort(key=lambda c: (c.distance, c.misalignment_deg, -c.bilateral_alignment, c.id))
