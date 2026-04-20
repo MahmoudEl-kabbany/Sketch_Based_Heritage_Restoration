@@ -7,7 +7,6 @@ connection candidates.
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Set, Tuple
-from collections import defaultdict
 
 import numpy as np
 from dtaidistance import dtw
@@ -247,72 +246,6 @@ def _same_shape_affinity(
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _efd_corner_signal(
-    candidate: ConnectionCandidate,
-    efd_contours: List[dict],
-    corner_curvature_threshold: float = 0.015,
-    max_contour_distance: float = 25.0,
-) -> float:
-    """Estimate corner likelihood at bridge location from EFD contour data.
-    
-    Returns value in [0, 1]:
-      0.0 = no corner evidence (smooth or no nearby contour)
-      1.0 = strong corner evidence
-    """
-    # Bridge midpoint
-    bridge_pts = candidate.bridge_points
-    if len(bridge_pts) < 2:
-        return 0.0
-    bridge_mid = bridge_pts[len(bridge_pts) // 2]
-
-    best_corner_score = 0.0
-
-    for efd_entry in efd_contours:
-        contour = efd_entry["contour"]  # (N, 2)
-        if len(contour) < 5:
-            continue
-
-        # Find nearest contour point to bridge midpoint
-        dists = np.linalg.norm(contour - bridge_mid, axis=1)
-        nearest_idx = int(np.argmin(dists))
-        nearest_dist = float(dists[nearest_idx])
-
-        if nearest_dist > max_contour_distance:
-            continue
-
-        # Compute local curvature at nearest_idx using finite differences
-        # (3-point curvature estimate)
-        n = len(contour)
-        prev_idx = (nearest_idx - 2) % n
-        next_idx = (nearest_idx + 2) % n
-        p_prev = contour[prev_idx].astype(np.float64)
-        p_curr = contour[nearest_idx].astype(np.float64)
-        p_next = contour[next_idx].astype(np.float64)
-
-        v1 = p_curr - p_prev
-        v2 = p_next - p_curr
-        n1 = np.linalg.norm(v1)
-        n2 = np.linalg.norm(v2)
-        if n1 < 1e-9 or n2 < 1e-9:
-            continue
-
-        # Angle change = curvature proxy
-        cos_angle = float(np.dot(v1, v2) / (n1 * n2))
-        cos_angle = np.clip(cos_angle, -1.0, 1.0)
-        angle_change = float(np.arccos(cos_angle))  # radians
-        local_curvature = angle_change / max(0.5 * (n1 + n2), 1e-6)
-
-        # Distance-weighted corner score
-        proximity_weight = max(0.0, 1.0 - nearest_dist / max_contour_distance)
-        corner_intensity = float(np.clip(
-            (local_curvature - corner_curvature_threshold) 
-            / (3.0 * corner_curvature_threshold), 
-            0.0, 1.0
-        ))
-        best_corner_score = max(best_corner_score, proximity_weight * corner_intensity)
-
-    return best_corner_score
-
 def score_candidates(
     candidates: List[ConnectionCandidate],
     result: ExtractionResult,
@@ -407,53 +340,6 @@ def score_candidates(
                     and 0.0 <= bilateral <= 0.18
                 ):
                     c.score += 0.20 * ext_quality
-
-    # --- Cross-path continuation vs. extension arbitration ---
-    # Group cross-path candidates by endpoint pair
-    cross_pair_groups: Dict[Tuple[int, int], List[ConnectionCandidate]] = defaultdict(list)
-    for c in candidates:
-        if getattr(c, "same_path_closure", False):
-            continue
-        ea_id = int(getattr(c.ep_a, "endpoint_id", -1))
-        eb_id = int(getattr(c.ep_b, "endpoint_id", -1))
-        pair_key = (min(ea_id, eb_id), max(ea_id, eb_id))
-        cross_pair_groups[pair_key].append(c)
-
-    for pair_key, group in cross_pair_groups.items():
-        has_continuation = any(c.scenario == "continuation" for c in group)
-        has_extension = any(c.scenario == "extension_intersection" for c in group)
-        if not (has_continuation and has_extension):
-            continue  # No competing types — nothing to arbitrate
-
-        # Curvature signal: high endpoint curvature suggests corner
-        ep_curvatures = []
-        for c in group:
-            ep_curvatures.append(max(c.ep_a.curvature, c.ep_b.curvature))
-        max_curvature = max(ep_curvatures)
-        curvature_corner_signal = float(np.clip(
-            (max_curvature - 0.005) / 0.015, 0.0, 1.0
-        ))
-
-        # EFD corner signal from contour data
-        ext_candidates = [c for c in group if c.scenario == "extension_intersection"]
-        efd_signal = max(
-            (_efd_corner_signal(c, result.efd_contours) for c in ext_candidates),
-            default=0.0,
-        )
-
-        # Combined corner evidence
-        corner_evidence = max(curvature_corner_signal, efd_signal)
-
-        # Apply adjustments
-        for c in group:
-            if c.scenario == "continuation" and corner_evidence > 0.3:
-                # Penalize continuation when corner evidence is strong
-                c.score -= 0.12 * corner_evidence
-            elif c.scenario == "extension_intersection" and corner_evidence > 0.3:
-                # Boost extension when corner evidence is strong
-                c.score += 0.10 * corner_evidence * float(
-                    np.clip(getattr(c, "extension_quality", 0.0), 0.0, 1.0)
-                )
 
     # PR4b: suppress cross-shape links when a path has strong self-closure support.
     best_self_closure_by_path: Dict[int, Tuple[float, float]] = {}
