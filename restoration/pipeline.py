@@ -166,6 +166,42 @@ def _build_efd_event_explanation(
     )
 
 
+def _build_efd_phase_summary(
+    efd_phase_diagnostics: Optional[List[Dict[str, Any]]],
+    validity_enabled: bool,
+    plausibility_threshold: float,
+) -> Dict[str, Any]:
+    """Summarize Phase 6 EFD validity diagnostics for report analysis."""
+    entries = list(efd_phase_diagnostics or [])
+    attempted = len(entries)
+    accepted_entries = [e for e in entries if bool(e.get("accepted", False))]
+    rejected_entries = [e for e in entries if not bool(e.get("accepted", False))]
+
+    reason_counts: Dict[str, int] = {}
+    for entry in rejected_entries:
+        reason = str(entry.get("reason", "unknown"))
+        reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+
+    plausibility_values: List[float] = []
+    for entry in entries:
+        metrics = entry.get("metrics", {}) if isinstance(entry, dict) else {}
+        val = metrics.get("plausibility_score") if isinstance(metrics, dict) else None
+        if isinstance(val, (float, int)):
+            plausibility_values.append(float(val))
+
+    return {
+        "validity_check_enabled": bool(validity_enabled),
+        "plausibility_threshold": round(float(plausibility_threshold), 4),
+        "attempted": int(attempted),
+        "accepted": int(len(accepted_entries)),
+        "rejected": int(len(rejected_entries)),
+        "rejection_reasons": reason_counts,
+        "plausibility_score_summary": _numeric_summary(plausibility_values, digits=4),
+        "accepted_path_indices": [int(e.get("path_index", -1)) for e in accepted_entries],
+        "rejected_path_indices": [int(e.get("path_index", -1)) for e in rejected_entries],
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Visualization
 # ═══════════════════════════════════════════════════════════════════════════
@@ -235,6 +271,7 @@ def _save_labeled_restoration(
     image_path: str,
     final_paths: List[BezierPath],
     accepted: Optional[List[ConnectionCandidate]],
+    efd_phase_diagnostics: Optional[List[Dict[str, Any]]],
     output_dir: str,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Save an overlay of the original image with labeled restoration bridges."""
@@ -259,6 +296,8 @@ def _save_labeled_restoration(
 
     changes = []
     change_count = 0
+    efd_accepted_diags = [e for e in (efd_phase_diagnostics or []) if bool(e.get("accepted", False))]
+    efd_diag_idx = 0
     placed_boxes: List[Tuple[float, float, float, float]] = []
     img_diag = float(np.hypot(h, w))
 
@@ -429,9 +468,25 @@ def _save_labeled_restoration(
                         "candidate metadata link was available after path merging."
                     )
                 else:
+                    efd_diag: Dict[str, Any] = {}
+                    if efd_diag_idx < len(efd_accepted_diags):
+                        efd_diag = dict(efd_accepted_diags[efd_diag_idx])
+                        efd_diag_idx += 1
+
                     event_entry["explanation"] = _build_efd_event_explanation(
                         label_id, end_i - start_i, approx_length,
                     )
+                    if efd_diag:
+                        event_entry["efd_closure_validity"] = {
+                            "accepted": bool(efd_diag.get("accepted", True)),
+                            "closure_method": str(efd_diag.get("closure_method", "unknown")),
+                            "reason": str(efd_diag.get("reason", "accepted")),
+                            "path_index": int(efd_diag.get("path_index", -1)),
+                            "gap_distance_px": float(efd_diag.get("gap_distance_px", 0.0)),
+                            "gap_ratio": float(efd_diag.get("gap_ratio", 0.0)),
+                            "plausibility_threshold": float(efd_diag.get("plausibility_threshold", 0.0)),
+                            "metrics": efd_diag.get("metrics", {}),
+                        }
 
                 changes.append(event_entry)
             else:
@@ -530,6 +585,9 @@ def _build_report(
     final_paths: List[BezierPath],
     elapsed: float,
     restoration_history: List[Dict[str, Any]] = None,
+    efd_phase_diagnostics: Optional[List[Dict[str, Any]]] = None,
+    efd_validity_check_enabled: bool = True,
+    efd_plausibility_threshold: float = 0.50,
     dropped_after_sanitize: int = 0,
     stage_timings: Optional[Dict[str, float]] = None,
     asp_solver_summary: Optional[Dict[str, Any]] = None,
@@ -547,6 +605,11 @@ def _build_report(
 
     bridge_events = [e for e in (restoration_history or []) if e.get("source") == "asp_bridge"]
     efd_events = [e for e in (restoration_history or []) if e.get("source") == "efd_gap_closure"]
+    efd_phase_summary = _build_efd_phase_summary(
+        efd_phase_diagnostics,
+        validity_enabled=efd_validity_check_enabled,
+        plausibility_threshold=efd_plausibility_threshold,
+    )
 
     all_scores = [float(c.score) for c in candidates]
     accepted_scores = [float(c.score) for c in accepted]
@@ -615,6 +678,7 @@ def _build_report(
                 "bridge_events_logged": len(bridge_events),
                 "efd_closure_events_logged": len(efd_events),
             },
+            "efd_closure_phase": efd_phase_summary,
         },
         "detailed_events": restoration_history or [],
     }
@@ -629,6 +693,9 @@ def restore(
     lookahead_fraction: float = 0.15,
     max_candidates_per_endpoint: int = 5,
     efd_gap_threshold: float = 0.30,
+    efd_validity_check_enabled: bool = True,
+    efd_plausibility_threshold: float = 0.50,
+    efd_min_gap_for_validity_check: float = 3.0,
     output_dir: str = OUTPUT_DIR,
 ) -> RestorationResult:
     """Restore a single damaged sketch image.
@@ -638,6 +705,9 @@ def restore(
         lookahead_fraction: endpoint search radius as fraction of image diagonal
         max_candidates_per_endpoint: ASP candidate cap per endpoint
         efd_gap_threshold: max gap/perimeter ratio for EFD closure
+        efd_validity_check_enabled: enable semantic plausibility gate in Phase 6
+        efd_plausibility_threshold: minimum plausibility score required for Phase 6 closure
+        efd_min_gap_for_validity_check: bypass plausibility check for tiny gaps (pixels)
         output_dir: where to save visualization outputs
 
     Returns:
@@ -735,8 +805,12 @@ def restore(
     # Phase 6: EFD Gap Closure
     print("  Phase 6: EFD single-gap closure...")
     t_phase = time.perf_counter()
-    final_paths = close_single_gaps(
+    final_paths, efd_phase_diagnostics = close_single_gaps(
         restored_paths, extraction.efd_contours, efd_gap_threshold,
+        validity_check_enabled=efd_validity_check_enabled,
+        plausibility_threshold=efd_plausibility_threshold,
+        min_gap_for_validity_check=efd_min_gap_for_validity_check,
+        return_diagnostics=True,
     )
     stage_timings["phase6_efd_closure_s"] = time.perf_counter() - t_phase
     closed_by_efd = (
@@ -749,7 +823,13 @@ def restore(
     t_phase = time.perf_counter()
 
     # Labeled overlay visualization + logs
-    _, change_logs = _save_labeled_restoration(image_path, final_paths, accepted, output_dir)
+    _, change_logs = _save_labeled_restoration(
+        image_path,
+        final_paths,
+        accepted,
+        efd_phase_diagnostics,
+        output_dir,
+    )
     _save_unlabeled_restoration_overlay(image_path, final_paths, output_dir)
     _save_visualization(image_path, extraction.paths, final_paths, output_dir)
 
@@ -766,6 +846,9 @@ def restore(
         final_paths,
         elapsed,
         restoration_history=change_logs,
+        efd_phase_diagnostics=efd_phase_diagnostics,
+        efd_validity_check_enabled=efd_validity_check_enabled,
+        efd_plausibility_threshold=efd_plausibility_threshold,
         dropped_after_sanitize=dropped_after_sanitize,
         stage_timings=stage_timings,
         asp_solver_summary=asp_solver_summary,

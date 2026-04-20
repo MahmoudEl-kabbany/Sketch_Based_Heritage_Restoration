@@ -7,7 +7,7 @@ uses symmetry detection or curvature-aware arc interpolation to close them.
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from scipy.spatial.distance import directed_hausdorff
@@ -344,6 +344,121 @@ def _path_curvature_at(path: BezierPath, end: str) -> float:
     return abs(cross) / (speed_sq ** 1.5)
 
 
+def _closure_plausibility_metrics(
+    path: BezierPath,
+    gap_start: np.ndarray,
+    gap_end: np.ndarray,
+    gap_dist: float,
+    gap_ratio: float,
+) -> Dict[str, float]:
+    """Compute semantic closure plausibility metrics for one open path."""
+    t_start = _path_tangent_at(path, "end")
+    t_end = _path_tangent_at(path, "start")
+    _, conf_start = _context_endpoint_tangent(path, "end")
+    _, conf_end = _context_endpoint_tangent(path, "start")
+
+    gap_dir = _safe_normalize(gap_end - gap_start)
+    forward_start = float(np.dot(t_start, gap_dir))
+    forward_end = float(np.dot(t_end, -gap_dir))
+    bilateral = float(min(forward_start, forward_end))
+    continuation = float(np.clip(0.5 * (max(0.0, forward_start) + max(0.0, forward_end)), 0.0, 1.0))
+
+    anti_parallel = float(np.clip(np.dot(t_start, -t_end), -1.0, 1.0))
+    misalignment_deg = float(np.degrees(np.arccos(anti_parallel)))
+
+    k_start = _path_curvature_at(path, "end")
+    k_end = _path_curvature_at(path, "start")
+    k_sum = float(k_start + k_end)
+    if k_sum < 1e-9:
+        curvature_coherence = 1.0
+    else:
+        curvature_coherence = float(np.clip(1.0 - abs(k_start - k_end) / k_sum, 0.0, 1.0))
+
+    context_conf = float(np.clip(min(conf_start, conf_end), 0.0, 1.0))
+    confidence_factor = float(np.clip(0.60 + 0.40 * context_conf, 0.0, 1.0))
+    score_raw = (
+        0.45 * continuation
+        + 0.35 * float(np.clip(bilateral, 0.0, 1.0))
+        + 0.20 * curvature_coherence
+    )
+    plausibility_score = float(np.clip(score_raw * confidence_factor, 0.0, 1.0))
+
+    long_gap_semantic_risk = bool(
+        gap_dist > 90.0
+        and gap_ratio > 0.16
+        and plausibility_score < 0.62
+        and (bilateral < 0.12 or misalignment_deg > 95.0)
+    )
+
+    return {
+        "forward_start": forward_start,
+        "forward_end": forward_end,
+        "bilateral_alignment": bilateral,
+        "continuation_score": continuation,
+        "misalignment_deg": misalignment_deg,
+        "curvature_start": float(k_start),
+        "curvature_end": float(k_end),
+        "curvature_coherence": curvature_coherence,
+        "context_confidence": context_conf,
+        "plausibility_score": plausibility_score,
+        "long_gap_semantic_risk": float(1.0 if long_gap_semantic_risk else 0.0),
+    }
+
+
+def _evaluate_closure_validity(
+    metrics: Dict[str, float],
+    gap_dist: float,
+    gap_ratio: float,
+    has_symmetry: bool,
+    plausibility_threshold: float,
+    min_gap_for_check: float,
+) -> Tuple[bool, str]:
+    """Return (accepted, reason) for semantic EFD closure validation."""
+    if gap_dist <= min_gap_for_check:
+        return True, "tiny_gap_bypass"
+
+    if bool(metrics.get("long_gap_semantic_risk", 0.0) >= 0.5):
+        return False, "long_gap_semantic_risk"
+
+    bilateral = float(metrics.get("bilateral_alignment", 0.0))
+    continuation = float(metrics.get("continuation_score", 0.0))
+    misalignment = float(metrics.get("misalignment_deg", 180.0))
+    score = float(metrics.get("plausibility_score", 0.0))
+    effective_threshold = float(plausibility_threshold)
+
+    # Be slightly more permissive for tiny smooth gaps where tangent evidence is
+    # often unstable but geometric closure is still valid.
+    if (
+        gap_ratio <= 0.035
+        and gap_dist <= 45.0
+        and continuation >= 0.10
+        and misalignment <= 35.0
+    ):
+        effective_threshold = min(effective_threshold, 0.24)
+
+    # Symmetry can rescue a borderline case, but not highly implausible tangent geometry.
+    if has_symmetry and bilateral >= 0.05 and misalignment <= 132.0:
+        if score >= max(0.35, effective_threshold * 0.70):
+            return True, "symmetry_supported"
+
+    if score >= effective_threshold:
+        return True, "plausibility_pass"
+
+    # Borderline pass for moderately long but coherent closures.
+    if (
+        gap_ratio <= 0.16
+        and score >= max(0.42, plausibility_threshold * 0.85)
+        and bilateral >= 0.16
+        and continuation >= 0.35
+        and misalignment <= 132.0
+    ):
+        return True, "borderline_continuation_pass"
+
+    if bilateral < 0.05 and misalignment > 120.0:
+        return False, "weak_continuation_support"
+    return False, "low_plausibility_score"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════════
@@ -361,7 +476,11 @@ def close_single_gaps(
     conservative_small_gap_px: float = 20.0,
     conservative_gap_ratio: float = 0.45,
     conservative_min_perimeter: float = 80.0,
-) -> List[BezierPath]:
+    validity_check_enabled: bool = True,
+    plausibility_threshold: float = 0.50,
+    min_gap_for_validity_check: float = 3.0,
+    return_diagnostics: bool = False,
+) -> Union[List[BezierPath], Tuple[List[BezierPath], List[Dict[str, Any]]]]:
     """Detect and close single-gap contours.
 
     A path qualifies if:
@@ -373,8 +492,9 @@ def close_single_gaps(
     Multi-gap shapes are left untouched.
     """
     result: List[BezierPath] = []
+    diagnostics: List[Dict[str, Any]] = []
 
-    for path in paths:
+    for path_index, path in enumerate(paths):
         if path.is_closed or len(path.segments) < 3:
             result.append(path)
             continue
@@ -434,7 +554,42 @@ def close_single_gaps(
                 hausdorff_threshold=scaled_hausdorff,
             )
 
+        plausibility_metrics = _closure_plausibility_metrics(
+            path=path,
+            gap_start=end_pt,
+            gap_end=start_pt,
+            gap_dist=gap_dist,
+            gap_ratio=gap_ratio,
+        )
+
+        validity_enabled = bool(validity_check_enabled) and not force_small_gap_fallback
+        if validity_enabled:
+            valid, reject_reason = _evaluate_closure_validity(
+                plausibility_metrics,
+                gap_dist=gap_dist,
+                gap_ratio=gap_ratio,
+                has_symmetry=(axis_angle is not None),
+                plausibility_threshold=plausibility_threshold,
+                min_gap_for_check=min_gap_for_validity_check,
+            )
+            if not valid:
+                diagnostics.append({
+                    "path_index": int(path_index),
+                    "accepted": False,
+                    "closure_method": "none",
+                    "reason": str(reject_reason),
+                    "gap_distance_px": round(float(gap_dist), 3),
+                    "gap_ratio": round(float(gap_ratio), 6),
+                    "plausibility_threshold": round(float(plausibility_threshold), 4),
+                    "metrics": {
+                        k: round(float(v), 6) for k, v in plausibility_metrics.items()
+                    },
+                })
+                result.append(path)
+                continue
+
         closure_segments: List[BezierSegment] = []
+        closure_method = "curvature_arc"
 
         if axis_angle is not None:
             # Mirror the opposite portion
@@ -451,6 +606,8 @@ def close_single_gaps(
                         mirrored,
                         max_segments=max(6, int(max_mirrored_points // 8)),
                     )
+                    if closure_segments:
+                        closure_method = "symmetry_mirroring"
 
         if not closure_segments:
             # Fallback: curvature-aware arc
@@ -463,6 +620,7 @@ def close_single_gaps(
                 t_start, t_end,
                 k_start, k_end,
             )
+            closure_method = "curvature_arc"
 
         if closure_segments:
             new_segments = list(path.segments) + closure_segments
@@ -473,7 +631,33 @@ def close_single_gaps(
                 is_closed=True,
                 source_type="restored",
             ))
+            diagnostics.append({
+                "path_index": int(path_index),
+                "accepted": True,
+                "closure_method": str(closure_method),
+                "reason": "accepted",
+                "gap_distance_px": round(float(gap_dist), 3),
+                "gap_ratio": round(float(gap_ratio), 6),
+                "plausibility_threshold": round(float(plausibility_threshold), 4),
+                "metrics": {
+                    k: round(float(v), 6) for k, v in plausibility_metrics.items()
+                },
+            })
         else:
             result.append(path)
+            diagnostics.append({
+                "path_index": int(path_index),
+                "accepted": False,
+                "closure_method": "none",
+                "reason": "no_geometry_constructed",
+                "gap_distance_px": round(float(gap_dist), 3),
+                "gap_ratio": round(float(gap_ratio), 6),
+                "plausibility_threshold": round(float(plausibility_threshold), 4),
+                "metrics": {
+                    k: round(float(v), 6) for k, v in plausibility_metrics.items()
+                },
+            })
 
+    if return_diagnostics:
+        return result, diagnostics
     return result
