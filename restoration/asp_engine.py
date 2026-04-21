@@ -297,6 +297,7 @@ def _solve_facts(
     facts: str,
     rules_path: str,
     max_solutions: int,
+    timeout_s: float = 30.0,
 ) -> List[int]:
     """Run clingo on one fact bundle and return accepted candidate IDs."""
     import clingo
@@ -320,7 +321,14 @@ def _solve_facts(
             if atom.name == "accept" and len(atom.arguments) == 1:
                 accepted_ids.append(atom.arguments[0].number)
 
-    ctl.solve(on_model=on_model)
+    if timeout_s > 0:
+        with ctl.solve(on_model=on_model, async_=True) as handle:
+            finished = handle.wait(timeout_s)
+            if not finished:
+                handle.cancel()
+    else:
+        ctl.solve(on_model=on_model)
+
     return sorted(accepted_ids)
 
 
@@ -331,6 +339,7 @@ def solve_partitioned(
     max_solutions: int = 1,
     enable_component_partition: bool = True,
     enable_dominance_pruning: bool = True,
+    timeout_s: float = 30.0,
 ) -> Tuple[List[int], Dict[str, Any]]:
     """Solve ASP in independent endpoint components and return accepted IDs + stats."""
     start_total = time.perf_counter()
@@ -374,7 +383,7 @@ def solve_partitioned(
         fact_bytes += int(len(facts.encode("utf-8")))
 
         t_solve = time.perf_counter()
-        accepted_ids.extend(_solve_facts(facts, rules_path, max_solutions))
+        accepted_ids.extend(_solve_facts(facts, rules_path, max_solutions, timeout_s))
         solving_time_s += (time.perf_counter() - t_solve)
 
     summary: Dict[str, Any] = {
@@ -402,9 +411,10 @@ def solve(
     facts: str,
     rules_path: str = RULES_PATH,
     max_solutions: int = 1,
+    timeout_s: float = 30.0,
 ) -> List[int]:
     """Run clingo on the encoded facts + rules and return accepted candidate IDs."""
-    return _solve_facts(facts, rules_path, max_solutions)
+    return _solve_facts(facts, rules_path, max_solutions, timeout_s)
 
 
 def _fallback_rules() -> str:

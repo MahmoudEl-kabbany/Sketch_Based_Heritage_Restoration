@@ -697,6 +697,7 @@ def restore(
     efd_plausibility_threshold: float = 0.50,
     efd_min_gap_for_validity_check: float = 3.0,
     output_dir: str = OUTPUT_DIR,
+    asp_timeout_s: float = 30.0,
 ) -> RestorationResult:
     """Restore a single damaged sketch image.
 
@@ -709,6 +710,7 @@ def restore(
         efd_plausibility_threshold: minimum plausibility score required for Phase 6 closure
         efd_min_gap_for_validity_check: bypass plausibility check for tiny gaps (pixels)
         output_dir: where to save visualization outputs
+        asp_timeout_s: max time in seconds for the ASP solver to run per component
 
     Returns:
         RestorationResult with original paths, restored paths, bridges, and report
@@ -767,6 +769,7 @@ def restore(
             scored,
             extraction.endpoints,
             RULES_PATH,
+            timeout_s=asp_timeout_s,
         )
         stage_timings["phase4_asp_fact_encoding_s"] = float(partition_summary.get("encoding_time_s", 0.0))
         stage_timings["phase4_asp_solving_s"] = float(partition_summary.get("solving_time_s", 0.0))
