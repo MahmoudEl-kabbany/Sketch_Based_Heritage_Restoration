@@ -159,6 +159,7 @@ def _candidate_effective_utility(
 ) -> int:
     """Compute candidate utility equivalent to current ASP objective terms."""
     utility = int(_to_int_score(float(candidate.score)))
+    relaxed_tier2_extension = bool(getattr(candidate, "relaxed_tier2_extension", False))
 
     # Soft rewards from weak constraints with negative weights.
     closure_flag = bool(
@@ -187,7 +188,7 @@ def _candidate_effective_utility(
     else:
         cont_raw = 0.0
     cont_int = int(_to_int_score(max(0.0, cont_raw)))
-    if cont_int < 40:
+    if cont_int < 40 and not relaxed_tier2_extension:
         utility -= 2
 
     ext_quality = int(_to_int_score(float(getattr(candidate, "extension_quality", 0.0))))
@@ -200,6 +201,8 @@ def _candidate_effective_utility(
 
     if int(getattr(candidate, "tier", 1)) == 2:
         utility -= 1
+        if relaxed_tier2_extension:
+            utility += 1
 
     return utility
 

@@ -38,6 +38,7 @@ class ConnectionCandidate:
     same_path_closure: bool = False
     intersection_point: Optional[np.ndarray] = None
     extension_quality: float = 0.0
+    relaxed_tier2_extension: bool = False
     score: float = 0.0
 
 
@@ -629,6 +630,9 @@ def generate_candidates(
         few_segments = len(path.segments) <= 2
         is_spur_path[idx] = (plen <= spur_length_soft) or (few_segments and plen <= spur_length_hard)
 
+    open_path_count = sum(1 for p in result.paths if not p.is_closed)
+    sparse_scene = len(endpoints) <= 8 and open_path_count <= 3
+
     # Same-path near-closure candidates (critical for broken circles/loops).
     for path_idx, path in enumerate(result.paths):
         if path.is_closed or not path.segments:
@@ -912,7 +916,7 @@ def generate_candidates(
             )
             best_forward = max(fwd_a, fwd_b)
             worst_forward = min(fwd_a, fwd_b)
-            extension_pregate_ok = (
+            extension_pregate_t1 = (
                 tier == 1
                 and not spur_involved
                 and dist <= max(80.0, radius_t1 * 0.42)
@@ -922,6 +926,25 @@ def generate_candidates(
                 and bilateral >= -0.22
                 and min_conf >= 0.50
             )
+
+            # Narrow Tier-2 fallback for sparse straight-edged scenes (e.g., staggered rectangle sides).
+            curv_a = float(getattr(ep_a, "curvature", 0.0))
+            curv_b = float(getattr(ep_b, "curvature", 0.0))
+            low_curvature_pair = max(curv_a, curv_b) <= 0.0045
+            extension_pregate_t2 = (
+                tier == 2
+                and sparse_scene
+                and not spur_involved
+                and low_curvature_pair
+                and dist >= max(140.0, radius_t1 * 0.75)
+                and 86.0 <= misalignment_deg <= 112.0
+                and best_forward >= 0.90
+                and worst_forward >= -0.04
+                and bilateral >= -0.04
+                and min_conf >= 0.58
+            )
+            extension_pregate_ok = extension_pregate_t1 or extension_pregate_t2
+            relaxed_tier2_extension = (extension_pregate_t2 and not strict_direction_ok)
 
             if not strict_direction_ok and not extension_pregate_ok:
                 intersection_for_diag = _test_extension_intersection_linear(
@@ -1071,6 +1094,7 @@ def generate_candidates(
                         spur_involved=spur_involved,
                         intersection_point=intersection.copy(),
                         extension_quality=_extension_alignment_quality(ep_a, ep_b, intersection),
+                        relaxed_tier2_extension=relaxed_tier2_extension,
                     ))
                     cid += 1
                     ep_candidate_count[i] += 1

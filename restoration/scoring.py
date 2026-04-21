@@ -341,6 +341,11 @@ def score_candidates(
                 ):
                     c.score += 0.20 * ext_quality
 
+                # Sparse-scene Tier-2 fallback for long orthogonal side gaps
+                # (e.g., staggered rectangle sides), flagged in candidate generation.
+                if bool(getattr(c, "relaxed_tier2_extension", False)):
+                    c.score += 0.62 * ext_quality
+
     # PR4b: suppress cross-shape links when a path has strong self-closure support.
     best_self_closure_by_path: Dict[int, Tuple[float, float]] = {}
     affinity_by_candidate: Dict[int, float] = {}
