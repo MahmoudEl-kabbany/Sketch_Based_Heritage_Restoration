@@ -112,45 +112,126 @@ def _dedupe_polyline(points: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     return points[keep]
 
 
+def _strip_sway_prefix(points: np.ndarray, end: str, max_strip_fraction: float = 0.15) -> np.ndarray:
+    """Walk inward from the endpoint and drop high-curvature sway segments."""
+    if len(points) < 10:
+        return points
+
+    n_strip_max = int(round(len(points) * max_strip_fraction))
+    if n_strip_max < 2:
+        return points
+
+    diffs = np.diff(points, axis=0)
+    strip_count = 0
+    
+    if end == "start":
+        for i in range(n_strip_max):
+            a = diffs[i]
+            b = diffs[i + 1]
+            na = np.linalg.norm(a)
+            nb = np.linalg.norm(b)
+            if na < 1e-12 or nb < 1e-12:
+                continue
+            dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
+            angle = float(np.degrees(np.arccos(dot)))
+            if angle > 25.0:
+                strip_count = i + 1
+            elif i > strip_count + 1:
+                break
+        if strip_count > 0:
+            return points[strip_count:]
+    else:
+        for i in range(n_strip_max):
+            idx = len(diffs) - 1 - i
+            a = diffs[idx - 1]
+            b = diffs[idx]
+            na = np.linalg.norm(a)
+            nb = np.linalg.norm(b)
+            if na < 1e-12 or nb < 1e-12:
+                continue
+            dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
+            angle = float(np.degrees(np.arccos(dot)))
+            if angle > 25.0:
+                strip_count = i + 1
+            elif i > strip_count + 1:
+                break
+        if strip_count > 0:
+            return points[:-strip_count]
+
+    return points
+
+
+def _multiscale_context_tangent(
+    sampled: np.ndarray, end: str, outward_ref: np.ndarray
+) -> Tuple[np.ndarray, float]:
+    """Run PCA at 4 different window sizes and return circular mean of directions."""
+    fractions = [0.08, 0.12, 0.16, 0.20]
+    directions = []
+    weights = []
+    n_pts = len(sampled)
+    
+    for frac in fractions:
+        window = int(round(n_pts * frac))
+        window = max(6, min(28, max(2, n_pts - 1), window))
+        
+        if end == "start":
+            local = sampled[: window + 1]
+        else:
+            local = sampled[-(window + 1):]
+            
+        centered = local - np.mean(local, axis=0)
+        cov = centered.T @ centered
+        vals, vecs = np.linalg.eigh(cov)
+        idx_max = int(np.argmax(vals))
+        principal = vecs[:, idx_max]
+        
+        if float(np.dot(principal, outward_ref)) < 0.0:
+            principal = -principal
+            
+        var_sum = float(np.sum(vals))
+        linearity = float(vals[idx_max] / (var_sum + 1e-12))
+        directional = max(0.0, float(np.dot(principal, outward_ref)))
+        conf = float(np.clip(0.5 * linearity + 0.5 * directional, 0.0, 1.0))
+        
+        directions.append(principal)
+        weights.append(conf)
+        
+    mean_dir = np.zeros(2, dtype=np.float64)
+    for d, w in zip(directions, weights):
+        mean_dir += d * w
+        
+    norm = np.linalg.norm(mean_dir)
+    if norm < 1e-12:
+        return outward_ref, 0.0
+        
+    final_tangent = mean_dir / norm
+    R = norm / sum(weights) if sum(weights) > 0 else 0.0
+    final_conf = float(np.clip(R * np.mean(weights), 0.0, 1.0))
+    
+    return final_tangent, final_conf
+
+
 def _estimate_endpoint_context_tangent(
     path: BezierPath,
     end: str,
-    window_fraction: float = 0.12,
-    min_window_points: int = 6,
-    max_window_points: int = 28,
 ) -> Tuple[np.ndarray, float]:
     """Estimate endpoint tangent from local sampled context and return confidence."""
     sampled = path.sample(pts_per_segment=24)
     sampled = _dedupe_polyline(sampled)
+    # Sway stripping removed to avoid tangent misalignments
+    # sampled = _strip_sway_prefix(sampled, end)
+    
     if len(sampled) < 3:
         return np.array([1.0, 0.0], dtype=np.float64), 0.0
 
-    max_window = max(2, len(sampled) - 1)
-    window = int(round(len(sampled) * window_fraction))
-    window = max(min_window_points, min(max_window_points, max_window, window))
-
     if end == "start":
-        local = sampled[: window + 1]
-        path_dir = local[-1] - local[0]
+        path_dir = sampled[min(2, len(sampled)-1)] - sampled[0]
         outward_ref = _safe_normalize(-path_dir)
     else:
-        local = sampled[-(window + 1):]
-        path_dir = local[-1] - local[0]
+        path_dir = sampled[-1] - sampled[max(0, len(sampled)-3)]
         outward_ref = _safe_normalize(path_dir)
 
-    centered = local - np.mean(local, axis=0)
-    cov = centered.T @ centered
-    vals, vecs = np.linalg.eigh(cov)
-    principal = vecs[:, int(np.argmax(vals))]
-    if float(np.dot(principal, outward_ref)) < 0.0:
-        principal = -principal
-    context_tangent = _safe_normalize(principal)
-
-    var_sum = float(np.sum(vals))
-    linearity = float(vals[int(np.argmax(vals))] / (var_sum + 1e-12))
-    directional = max(0.0, float(np.dot(context_tangent, outward_ref)))
-    confidence = float(np.clip(0.5 * linearity + 0.5 * directional, 0.0, 1.0))
-    return context_tangent, confidence
+    return _multiscale_context_tangent(sampled, end, outward_ref)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -167,8 +248,23 @@ def _compute_endpoint_tangent(path: BezierPath, end: str) -> Tuple[np.ndarray, f
         derivative_tangent = _safe_normalize(_bezier_derivative_at(cp, 1.0))
 
     context_tangent, confidence = _estimate_endpoint_context_tangent(path, end)
-    blend = float(np.clip(confidence, 0.15, 0.90))
+    
+    if confidence < 0.40:
+        blend = float(np.clip(confidence, 0.05, 0.35))
+    else:
+        blend = float(np.clip(confidence, 0.40, 0.88))
+        
     tangent = _safe_normalize((1.0 - blend) * derivative_tangent + blend * context_tangent)
+    
+    if end == "start":
+        interior_dir = _safe_normalize(path.segments[0].control_points[3] - path.segments[0].control_points[0])
+    else:
+        interior_dir = _safe_normalize(path.segments[-1].control_points[0] - path.segments[-1].control_points[3])
+        
+    if float(np.dot(tangent, interior_dir)) > 0.50:
+        tangent = -tangent
+        confidence *= 0.5
+        
     return tangent, confidence
 
 

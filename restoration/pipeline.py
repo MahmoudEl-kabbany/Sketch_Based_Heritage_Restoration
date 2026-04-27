@@ -767,7 +767,7 @@ def restore(
     if scored:
         accepted_ids, partition_summary = solve_partitioned(
             scored,
-            extraction.endpoints,
+            extraction,
             RULES_PATH,
             timeout_s=asp_timeout_s,
         )

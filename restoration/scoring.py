@@ -260,6 +260,21 @@ def score_candidates(
     endpoints = result.endpoints
     bbox_stats = _path_bbox_stats(paths)
 
+    from scipy.spatial import cKDTree
+    all_path_pts = []
+    path_indices = []
+    for idx, p in enumerate(paths):
+        pts = p.sample(pts_per_segment=20)
+        if len(pts) > 0:
+            all_path_pts.append(pts)
+            path_indices.extend([idx] * len(pts))
+    
+    kdtree = None
+    if all_path_pts:
+        all_path_pts = np.vstack(all_path_pts)
+        kdtree = cKDTree(all_path_pts)
+        path_indices = np.array(path_indices)
+
     # Compute raw metrics
     raw_dtw: List[float] = []
     raw_jerk: List[float] = []
@@ -341,10 +356,15 @@ def score_candidates(
                 ):
                     c.score += 0.20 * ext_quality
 
-                # Sparse-scene Tier-2 fallback for long orthogonal side gaps
-                # (e.g., staggered rectangle sides), flagged in candidate generation.
-                if bool(getattr(c, "relaxed_tier2_extension", False)):
-                    c.score += 0.62 * ext_quality
+                # Sparse-scene Tier-2 fallback removed to prevent massive false connections.
+                
+                # Penalize extension intersections that cross other paths.
+                if c.tier == 2 and kdtree is not None:
+                    dists, idxs = kdtree.query(c.bridge_points)
+                    closest_paths = path_indices[idxs]
+                    mask = (closest_paths != int(c.ep_a.path_index)) & (closest_paths != int(c.ep_b.path_index))
+                    if np.any(dists[mask] < 3.0):
+                        c.score -= 0.60
 
     # PR4b: suppress cross-shape links when a path has strong self-closure support.
     best_self_closure_by_path: Dict[int, Tuple[float, float]] = {}

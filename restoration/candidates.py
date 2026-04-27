@@ -1039,7 +1039,11 @@ def generate_candidates(
 
             # --- Scenario 1: Good Continuation ---
             tol = continuation_tolerance if tier == 1 else continuation_tolerance * 0.5
-            if strict_direction_ok and _test_good_continuation(ep_a, ep_b, tol) and _test_good_continuation(ep_b, ep_a, tol):
+            
+            good_cont = _test_good_continuation(ep_a, ep_b, tol) and _test_good_continuation(ep_b, ep_a, tol)
+            parallel_offset = (tier == 1 and misalignment_deg < 35.0)
+            
+            if strict_direction_ok and (good_cont or parallel_offset):
                 bridge_segs = _build_continuation_bridge(ep_a, ep_b)
                 candidates.append(ConnectionCandidate(
                     id=cid,

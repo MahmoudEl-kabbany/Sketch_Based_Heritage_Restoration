@@ -80,15 +80,55 @@ def _endpoint_token_id(ep: EndpointInfo) -> int:
     return int(ep.path_index * 2 + end_map.get(ep.end, 0))
 
 
+def _compute_nested_shape_pairs(
+    candidates: List[ConnectionCandidate],
+    extraction: "ExtractionResult"
+) -> Set[Tuple[int, int]]:
+    import cv2
+    import numpy as np
+    
+    hulls = {}
+    for i, path in enumerate(extraction.paths):
+        if not path.is_closed or not path.segments:
+            continue
+        samples = path.sample(20)
+        if len(samples) > 2:
+            hulls[i] = cv2.convexHull(samples.astype(np.float32))
+            
+    nested_pairs = set()
+    for c in candidates:
+        idx_a = int(c.ep_a.path_index)
+        idx_b = int(c.ep_b.path_index)
+        if idx_a == idx_b:
+            continue
+            
+        if idx_b in hulls:
+            path_a = extraction.paths[idx_a]
+            if path_a.segments:
+                pt_a = path_a.segments[0].control_points[0]
+                if cv2.pointPolygonTest(hulls[idx_b], (float(pt_a[0]), float(pt_a[1])), False) >= 0:
+                    nested_pairs.add((min(idx_a, idx_b), max(idx_a, idx_b)))
+                    
+        if idx_a in hulls:
+            path_b = extraction.paths[idx_b]
+            if path_b.segments:
+                pt_b = path_b.segments[0].control_points[0]
+                if cv2.pointPolygonTest(hulls[idx_a], (float(pt_b[0]), float(pt_b[1])), False) >= 0:
+                    nested_pairs.add((min(idx_a, idx_b), max(idx_a, idx_b)))
+                    
+    return nested_pairs
+
+
 def encode_facts(
     candidates: List[ConnectionCandidate],
-    endpoints: List[EndpointInfo],
+    extraction: "ExtractionResult",
+    nested_pairs: Set[Tuple[int, int]] = None,
 ) -> str:
     """Convert scored candidates and endpoints into ASP fact strings."""
     lines: List[str] = []
     end_map = {"start": 0, "end": 1}
     endpoint_token_cache: Dict[Tuple[int, int, str], int] = {}
-    for ep in endpoints:
+    for ep in extraction.endpoints:
         key = (int(getattr(ep, "endpoint_id", -1)), int(ep.path_index), str(ep.end))
         endpoint_token_cache[key] = _endpoint_token_id(ep)
 
@@ -122,6 +162,11 @@ def encode_facts(
         lines.append(f"candidate_utility({c.id},{utility}).")
 
         lines.append("")
+
+    if nested_pairs:
+        for pa, pb in nested_pairs:
+            lines.append(f"nested_shape({pa},{pb}).")
+            lines.append(f"nested_shape({pb},{pa}).")
 
     return "\n".join(lines)
 
@@ -334,7 +379,7 @@ def _solve_facts(
 
 def solve_partitioned(
     candidates: List[ConnectionCandidate],
-    endpoints: List[EndpointInfo],
+    extraction: "ExtractionResult",
     rules_path: str = RULES_PATH,
     max_solutions: int = 1,
     enable_component_partition: bool = True,
@@ -343,6 +388,8 @@ def solve_partitioned(
 ) -> Tuple[List[int], Dict[str, Any]]:
     """Solve ASP in independent endpoint components and return accepted IDs + stats."""
     start_total = time.perf_counter()
+
+    nested_pairs = _compute_nested_shape_pairs(candidates, extraction)
 
     working = list(candidates)
     pruned_count = 0
@@ -376,7 +423,7 @@ def solve_partitioned(
 
     for component_candidates in components:
         t_encode = time.perf_counter()
-        facts = encode_facts(component_candidates, endpoints)
+        facts = encode_facts(component_candidates, extraction, nested_pairs)
         encoding_time_s += (time.perf_counter() - t_encode)
 
         fact_lines += int(len(facts.splitlines()))
