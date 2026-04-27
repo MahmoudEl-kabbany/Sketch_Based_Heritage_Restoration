@@ -11,6 +11,7 @@ images = [
 results = restore_batch(images)
 
 print("\n\n===== BATCH SUMMARY =====")
+total_time = 0
 for r in results:
     name = os.path.basename(r.image_path)
     orig_open = sum(1 for p in r.original_paths if not p.is_closed)
@@ -26,4 +27,6 @@ for r in results:
         t = 0.0
     b = len(r.bridges)
     print(f"  {name:40s} | {orig_open} open -> {rest_open} open | bridges={b} | {t}s")
+    total_time += t
+print(f"  Total processing time: {total_time}s")
 print("=========================")
