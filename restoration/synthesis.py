@@ -247,6 +247,16 @@ def _synthesize_single(candidate: ConnectionCandidate) -> List[BezierSegment]:
         ):
             return _build_intersection_bridge_linear(ep_a, ep_b, intersection)
 
+        # If the intersection point is very close to the chord midpoint,
+        # a 2-segment bridge through it would create an unnecessary kink.
+        # Fall back to a smooth single-segment G1 bridge instead.
+        chord = float(np.linalg.norm(ep_b.position - ep_a.position))
+        if chord > 1e-6:
+            midpoint = (ep_a.position + ep_b.position) / 2.0
+            dist_to_mid = float(np.linalg.norm(intersection - midpoint))
+            if dist_to_mid < 0.15 * chord:
+                return [_build_g1_bridge(ep_a, ep_b)]
+
         if _is_straight(ep_a.curvature, ep_b.curvature,
                         ep_a.tangent, ep_b.tangent):
             return _build_intersection_bridge_linear(ep_a, ep_b, intersection)

@@ -495,6 +495,76 @@ def _test_extension_intersection_curved(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Bridge-body crossing filter
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _build_path_samples_cache(
+    paths: List[BezierPath],
+    pts_per_segment: int = 16,
+) -> Dict[int, np.ndarray]:
+    """Pre-sample all path bodies for fast proximity tests."""
+    cache: Dict[int, np.ndarray] = {}
+    for idx, path in enumerate(paths):
+        if not path.segments:
+            continue
+        pts = path.sample(pts_per_segment=pts_per_segment)
+        if len(pts) >= 2:
+            cache[idx] = pts
+    return cache
+
+
+def _bridge_crosses_paths(
+    bridge_points: np.ndarray,
+    path_samples: Dict[int, np.ndarray],
+    exclude_path_indices: Set[int],
+    proximity_px: float = 4.0,
+) -> int:
+    """Count how many distinct path bodies the bridge passes near.
+
+    A bridge is considered to "cross" a path if any bridge sample point
+    is within *proximity_px* of any path body sample point, for paths
+    not in *exclude_path_indices*.
+
+    Returns the number of distinct crossed path indices.
+    """
+    if len(bridge_points) < 2:
+        return 0
+
+    crossed: Set[int] = set()
+    for path_idx, body_pts in path_samples.items():
+        if path_idx in exclude_path_indices:
+            continue
+        if len(body_pts) < 2:
+            continue
+
+        # Quick AABB pre-filter to avoid expensive distance checks.
+        bridge_min = np.min(bridge_points, axis=0)
+        bridge_max = np.max(bridge_points, axis=0)
+        body_min = np.min(body_pts, axis=0)
+        body_max = np.max(body_pts, axis=0)
+        if (bridge_max[0] + proximity_px < body_min[0]
+                or body_max[0] + proximity_px < bridge_min[0]
+                or bridge_max[1] + proximity_px < body_min[1]
+                or body_max[1] + proximity_px < bridge_min[1]):
+            continue
+
+        # Subsample bridge for speed if it has many points.
+        bp = bridge_points
+        if len(bp) > 30:
+            step = max(1, len(bp) // 30)
+            bp = bp[::step]
+
+        from scipy.spatial.distance import cdist
+        D = cdist(bp, body_pts)
+        if float(np.min(D)) < proximity_px:
+            crossed.add(path_idx)
+            if len(crossed) >= 2:
+                return len(crossed)
+
+    return len(crossed)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Bridge construction (preliminary — refined in synthesis.py)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -632,6 +702,12 @@ def generate_candidates(
 
     open_path_count = sum(1 for p in result.paths if not p.is_closed)
     sparse_scene = len(endpoints) <= 8 and open_path_count <= 3
+
+    # Pre-sample all path bodies for bridge-crossing checks.
+    path_samples_cache = _build_path_samples_cache(result.paths, pts_per_segment=16)
+    # Distance threshold for strict (>=1) crossing suppression:
+    # bridges shorter than this use the lenient (>=2) threshold.
+    crossing_long_threshold = max(120.0, result.diagonal * 0.05)
 
     # Same-path near-closure candidates (critical for broken circles/loops).
     for path_idx, path in enumerate(result.paths):
@@ -1045,25 +1121,50 @@ def generate_candidates(
             
             if strict_direction_ok and (good_cont or parallel_offset):
                 bridge_segs = _build_continuation_bridge(ep_a, ep_b)
-                candidates.append(ConnectionCandidate(
-                    id=cid,
-                    ep_a=ep_a, ep_b=ep_b,
-                    scenario="continuation",
-                    bridge_points=_sample_bridge(bridge_segs),
-                    bridge_bezier=bridge_segs,
-                    distance=dist,
-                    tier=tier,
-                    bilateral_alignment=bilateral,
-                    misalignment_deg=misalignment_deg,
-                    spur_involved=spur_involved,
-                    extension_quality=0.0,
-                ))
-                cid += 1
-                ep_candidate_count[i] += 1
-                ep_candidate_count[j] += 1
-                seen_pairs.add(pair_key)
-                if cross_diag is not None:
-                    cross_diag["generated_pairs"] = int(cross_diag.get("generated_pairs", 0)) + 1
+                bridge_pts = _sample_bridge(bridge_segs)
+
+                # Bridge-body crossing filter.
+                # Long bridges are suppressed if they cross even 1 path body,
+                # since legitimate connections rarely span that far across other shapes.
+                # Short bridges tolerate 1 crossing (junction proximity).
+                exclude_indices = {ep_a.path_index, ep_b.path_index}
+                n_crossed = _bridge_crosses_paths(bridge_pts, path_samples_cache, exclude_indices)
+                crossing_limit = 1 if dist > crossing_long_threshold else 2
+                if n_crossed >= crossing_limit:
+                    if cross_diag is not None:
+                        _diag_increment_reason(cross_diag, "cross_bridge_body_crossing")
+                        _diag_record_rejection(
+                            cross_diag,
+                            _diag_pair_payload(
+                                ep_a, ep_b, dist,
+                                reasons=["cross_bridge_body_crossing"],
+                                tier=tier,
+                                forward_a=fwd_a, forward_b=fwd_b,
+                                bilateral=bilateral,
+                                misalignment_deg=misalignment_deg,
+                            ),
+                            max_records=max_diag_records,
+                        )
+                else:
+                    candidates.append(ConnectionCandidate(
+                        id=cid,
+                        ep_a=ep_a, ep_b=ep_b,
+                        scenario="continuation",
+                        bridge_points=bridge_pts,
+                        bridge_bezier=bridge_segs,
+                        distance=dist,
+                        tier=tier,
+                        bilateral_alignment=bilateral,
+                        misalignment_deg=misalignment_deg,
+                        spur_involved=spur_involved,
+                        extension_quality=0.0,
+                    ))
+                    cid += 1
+                    ep_candidate_count[i] += 1
+                    ep_candidate_count[j] += 1
+                    seen_pairs.add(pair_key)
+                    if cross_diag is not None:
+                        cross_diag["generated_pairs"] = int(cross_diag.get("generated_pairs", 0)) + 1
                 continue  # prefer continuation over intersection
 
             # --- Scenario 2: Extension Intersection ---
@@ -1085,27 +1186,52 @@ def generate_candidates(
                     ep_a, ep_b, intersection, path_a, path_b,
                 )
                 if bridge_segs:
-                    candidates.append(ConnectionCandidate(
-                        id=cid,
-                        ep_a=ep_a, ep_b=ep_b,
-                        scenario="extension_intersection",
-                        bridge_points=_sample_bridge(bridge_segs),
-                        bridge_bezier=bridge_segs,
-                        distance=dist,
-                        tier=tier,
-                        bilateral_alignment=bilateral,
-                        misalignment_deg=misalignment_deg,
-                        spur_involved=spur_involved,
-                        intersection_point=intersection.copy(),
-                        extension_quality=_extension_alignment_quality(ep_a, ep_b, intersection),
-                        relaxed_tier2_extension=relaxed_tier2_extension,
-                    ))
-                    cid += 1
-                    ep_candidate_count[i] += 1
-                    ep_candidate_count[j] += 1
-                    seen_pairs.add(pair_key)
-                    if cross_diag is not None:
-                        cross_diag["generated_pairs"] = int(cross_diag.get("generated_pairs", 0)) + 1
+                    bridge_pts = _sample_bridge(bridge_segs)
+
+                    # Bridge-body crossing filter.
+                    # Long bridges are suppressed if they cross even 1 path body.
+                    exclude_indices = {ep_a.path_index, ep_b.path_index}
+                    n_crossed = _bridge_crosses_paths(bridge_pts, path_samples_cache, exclude_indices)
+                    crossing_limit = 1 if dist > crossing_long_threshold else 2
+                    if n_crossed >= crossing_limit:
+                        if cross_diag is not None:
+                            _diag_increment_reason(cross_diag, "cross_bridge_body_crossing")
+                            _diag_record_rejection(
+                                cross_diag,
+                                _diag_pair_payload(
+                                    ep_a, ep_b, dist,
+                                    reasons=["cross_bridge_body_crossing"],
+                                    tier=tier,
+                                    forward_a=fwd_a, forward_b=fwd_b,
+                                    bilateral=bilateral,
+                                    misalignment_deg=misalignment_deg,
+                                    extension_pregate_pass=extension_pregate_ok,
+                                    intersection_available=True,
+                                ),
+                                max_records=max_diag_records,
+                            )
+                    else:
+                        candidates.append(ConnectionCandidate(
+                            id=cid,
+                            ep_a=ep_a, ep_b=ep_b,
+                            scenario="extension_intersection",
+                            bridge_points=bridge_pts,
+                            bridge_bezier=bridge_segs,
+                            distance=dist,
+                            tier=tier,
+                            bilateral_alignment=bilateral,
+                            misalignment_deg=misalignment_deg,
+                            spur_involved=spur_involved,
+                            intersection_point=intersection.copy(),
+                            extension_quality=_extension_alignment_quality(ep_a, ep_b, intersection),
+                            relaxed_tier2_extension=relaxed_tier2_extension,
+                        ))
+                        cid += 1
+                        ep_candidate_count[i] += 1
+                        ep_candidate_count[j] += 1
+                        seen_pairs.add(pair_key)
+                        if cross_diag is not None:
+                            cross_diag["generated_pairs"] = int(cross_diag.get("generated_pairs", 0)) + 1
                 elif cross_diag is not None:
                     _diag_increment_reason(cross_diag, "cross_extension_bridge_empty")
                     _diag_record_rejection(

@@ -165,14 +165,14 @@ def _multiscale_context_tangent(
     sampled: np.ndarray, end: str, outward_ref: np.ndarray
 ) -> Tuple[np.ndarray, float]:
     """Run PCA at 4 different window sizes and return circular mean of directions."""
-    fractions = [0.08, 0.12, 0.16, 0.20]
+    fractions = [0.10, 0.15, 0.20, 0.25]
     directions = []
     weights = []
     n_pts = len(sampled)
     
     for frac in fractions:
         window = int(round(n_pts * frac))
-        window = max(6, min(28, max(2, n_pts - 1), window))
+        window = max(8, min(28, max(2, n_pts - 1), window))
         
         if end == "start":
             local = sampled[: window + 1]

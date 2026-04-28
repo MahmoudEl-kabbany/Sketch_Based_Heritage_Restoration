@@ -119,8 +119,13 @@ def _chord_length_parameterize(points: np.ndarray) -> np.ndarray:
     return cumlen / total
 
 
-def _estimate_tangent(points: np.ndarray, end: str, lookahead: int = 5) -> np.ndarray:
-    """Estimate a robust unit tangent at the start or end of a point sequence."""
+def _estimate_tangent(points: np.ndarray, end: str, lookahead: int = 10) -> np.ndarray:
+    """Estimate a robust unit tangent at the start or end of a point sequence.
+
+    Uses exponential distance weighting so nearer samples contribute more,
+    while the wider window (default 10) provides stability against pixel-level
+    jaggedness and junction artifacts.
+    """
     if len(points) < 2:
         return np.array([1.0, 0.0])
 
@@ -135,8 +140,33 @@ def _estimate_tangent(points: np.ndarray, end: str, lookahead: int = 5) -> np.nd
     if end != "start":
         vectors = -vectors
 
-    # Average local direction vectors to reduce pixel-level jaggedness.
-    tangent = np.mean(vectors, axis=0)
+    n_vecs = len(vectors)
+    if n_vecs == 0:
+        return np.array([1.0, 0.0])
+
+    # Exponential distance weighting: nearer vectors get higher weight.
+    # decay_rate chosen so the farthest vector has ~30% of the nearest's weight.
+    decay_rate = 1.2 / max(n_vecs - 1, 1)
+    weights = np.exp(-decay_rate * np.arange(n_vecs))
+
+    # Down-weight vectors at high local curvature (turning angle > 25°).
+    for i in range(n_vecs - 1):
+        a = vectors[i]
+        b = vectors[i + 1]
+        na = np.linalg.norm(a)
+        nb = np.linalg.norm(b)
+        if na > 1e-12 and nb > 1e-12:
+            dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
+            angle = float(np.degrees(np.arccos(dot)))
+            if angle > 25.0:
+                # Reduce influence of vectors around the turning point.
+                weights[i] *= 0.3
+                weights[i + 1] *= 0.3
+
+    tangent = np.zeros(2, dtype=np.float64)
+    for vec, w in zip(vectors, weights):
+        tangent += vec * w
+
     norm = np.linalg.norm(tangent)
     if norm < 1e-12:
         # Fallback to first non-degenerate direction in the local window.
@@ -1096,11 +1126,11 @@ def _merge_connected_paths(paths: List[BezierPath], merge_radius: float) -> List
 def fit_from_image_skeleton(
     image_path: str,
     max_error: float = 2.0,
-    tangent_lookahead: int = 5,
+    tangent_lookahead: int = 8,
     straightness_scale: float = 0.75,
     merge_radius: float = 5.0,
     follow_junction_continuation: bool = True,
-    junction_min_alignment: float = -0.30,
+    junction_min_alignment: float = -0.15,
     spur_threshold: float = 12.0,
 ) -> Tuple[List[BezierPath], Dict[int, set]]:
     """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths."""
