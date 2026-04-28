@@ -361,7 +361,13 @@ def merge_restored_paths(
         }
 
     endpoint_to_component = rebuild_endpoint_to_component(active)
-    ordered_connections = sorted(accepted, key=lambda c: (-c.score, c.distance, c.id))
+
+    def grid_sort_key(c: ConnectionCandidate) -> Tuple[float, float]:
+        y = min(c.ep_a.position[1], c.ep_b.position[1])
+        x = min(c.ep_a.position[0], c.ep_b.position[0])
+        return (round(y / 15.0), x)
+
+    ordered_connections = sorted(accepted, key=grid_sort_key)
 
     for c in ordered_connections:
         token_a = endpoint_token_from_info(c.ep_a)
