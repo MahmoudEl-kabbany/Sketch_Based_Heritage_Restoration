@@ -73,7 +73,18 @@ def _pair_alignment_metrics(ep_a: EndpointInfo, ep_b: EndpointInfo) -> Tuple[flo
     dir_ab = direction_ab / n
     forward_a = float(np.dot(ep_a.tangent, dir_ab))
     forward_b = float(np.dot(ep_b.tangent, -dir_ab))
-    bilateral = min(forward_a, forward_b)
+    
+    # Confidence-aware bilateral alignment: rescue noisy junctions by weighting stronger evidence.
+    conf_a = float(getattr(ep_a, "tangent_confidence", 1.0))
+    conf_b = float(getattr(ep_b, "tangent_confidence", 1.0))
+    if conf_a + conf_b > 1e-6:
+        bilateral = (conf_a * forward_a + conf_b * forward_b) / (conf_a + conf_b)
+        # Still apply a penalty if one side is negative (pointing away)
+        if forward_a < 0 or forward_b < 0:
+            bilateral = min(bilateral, min(forward_a, forward_b))
+    else:
+        bilateral = min(forward_a, forward_b)
+
     anti_parallel = float(np.clip(np.dot(ep_a.tangent, -ep_b.tangent), -1.0, 1.0))
     misalignment = float(np.degrees(np.arccos(anti_parallel)))
     return forward_a, forward_b, bilateral, misalignment

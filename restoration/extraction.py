@@ -22,8 +22,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from bezier_curves.bezier import (
     BezierPath,
     BezierSegment,
-    fit_from_image_skeleton,
 )
+from bezier_curves.medial_axis import fit_from_image_geometric
 from eliptic_fourier_descriptors.efd import (
     reconstruct_contour_efd,
     compute_efd_features,
@@ -366,10 +366,12 @@ def extract_paths(
     h, w = img.shape[:2]
     diagonal = float(np.hypot(h, w))
 
-    # Bezier path extraction via skeleton
-    paths, _ = fit_from_image_skeleton(
+    # Bezier path extraction via pure geometry (Voronoi MAT)
+    paths, _ = fit_from_image_geometric(
         image_path,
+        image_height=h,
         max_error=max_error,
+        min_area=25.0,
         spur_threshold=spur_threshold,
         merge_radius=merge_radius,
     )

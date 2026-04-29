@@ -1018,7 +1018,7 @@ def _build_path_adjacency_from_chains(chains: List[_SkeletonChain]) -> Dict[int,
 
 
 def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
-    """Remove short terminal branches (spurs) often created by corners."""
+    """Remove short terminal branches (spurs) based on Euclidean length."""
     changed = True
     while changed:
         changed = False
@@ -1036,7 +1036,14 @@ def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
                 data = edge[3] if is_multi else edge[2]
                 pts = data.get("pts", [])
 
-                if len(pts) <= threshold_length:
+                if len(pts) > 1:
+                    pts_arr = np.array(pts)
+                    diffs = np.diff(pts_arr, axis=0)
+                    length = np.sum(np.linalg.norm(diffs, axis=1))
+                else:
+                    length = 0.0
+
+                if length <= threshold_length:
                     edges_to_remove.append(edge)
 
         for edge in edges_to_remove:
@@ -1296,7 +1303,7 @@ def _visualize_paths_single_panel(
         ax.set_ylim(y_min - padding_y, y_max + padding_y)
 
     # Matplotlib uses Cartesian y-up; image-derived data is y-down.
-    if paths and paths[0].source_type in {"contour", "skeleton"}:
+    if paths and paths[0].source_type in {"contour", "skeleton", "geometric_centerline"}:
         ax.invert_yaxis()
 
     plt.tight_layout()

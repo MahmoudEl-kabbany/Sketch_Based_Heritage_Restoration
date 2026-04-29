@@ -180,6 +180,17 @@ def _gestalt_closure(
     return 0.0
 
 
+def _curvature_coherence(ep_a: EndpointInfo, ep_b: EndpointInfo) -> float:
+    """Score how well the endpoint curvatures match (normalized)."""
+    k_a = abs(float(ep_a.curvature))
+    k_b = abs(float(ep_b.curvature))
+    denom = k_a + k_b
+    if denom < 1e-8:
+        return 1.0
+    # Higher score = more similar curvature
+    return 1.0 - abs(k_a - k_b) / denom
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Normalization
 # ═══════════════════════════════════════════════════════════════════════════
@@ -301,6 +312,7 @@ def score_candidates(
         direction_ab = c.ep_b.position - c.ep_a.position
         cont = _gestalt_continuation(c.ep_a.tangent, direction_ab)
         clos = _gestalt_closure(c.ep_a, c.ep_b, paths, endpoints)
+        curv = _curvature_coherence(c.ep_a, c.ep_b)
 
         c.score = (
             weights["proximity"] * prox
@@ -308,6 +320,7 @@ def score_candidates(
             + weights["closure"] * clos
             - weights["dtw"] * norm_dtw[idx]
             - weights["jerk"] * norm_jerk[idx]
+            + 0.10 * curv  # Small boost for curvature consistency
         )
 
         # PR2 tie-break refinements: prioritize robust local closure, suppress spur links.
