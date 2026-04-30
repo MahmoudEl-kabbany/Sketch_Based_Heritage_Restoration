@@ -803,7 +803,7 @@ def restore(
     # Phase 5: Synthesis
     print("  Phase 5: Synthesizing bridges...")
     t_phase = time.perf_counter()
-    bridges = synthesize_bridges(accepted)
+    bridges = synthesize_bridges(accepted, original_paths=extraction.paths)
     restored_paths = merge_restored_paths(
         extraction.paths, bridges, accepted,
     )

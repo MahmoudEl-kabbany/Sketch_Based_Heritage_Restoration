@@ -679,8 +679,21 @@ def generate_candidates(
 
     positions = np.array([ep.position for ep in endpoints])
     tree = cKDTree(positions)
-    radius_t1 = result.diagonal * lookahead_fraction
-    radius_t2 = result.diagonal * lookahead_fraction * 2.0
+
+    # Phase C: Auto-increase search radius for sparse scenes with many small paths.
+    # When the image has many open paths with short average length, fragments
+    # need a wider search to find their nearby endpoints.
+    open_path_count = sum(1 for p in result.paths if not p.is_closed)
+    open_path_lengths = [
+        _path_length(p) for p in result.paths if not p.is_closed
+    ]
+    avg_open_path_len = float(np.mean(open_path_lengths)) if open_path_lengths else 0.0
+    effective_lookahead = lookahead_fraction
+    if open_path_count > 6 and avg_open_path_len < 50.0:
+        effective_lookahead = max(lookahead_fraction, 0.22)
+
+    radius_t1 = result.diagonal * effective_lookahead
+    radius_t2 = result.diagonal * effective_lookahead * 2.0
     continuation_tolerance = max(10.0, radius_t1 * 0.15)
     convergence_threshold = max(8.0, radius_t1 * 0.12)
 
@@ -711,11 +724,44 @@ def generate_candidates(
         few_segments = len(path.segments) <= 2
         is_spur_path[idx] = (plen <= spur_length_soft) or (few_segments and plen <= spur_length_hard)
 
-    open_path_count = sum(1 for p in result.paths if not p.is_closed)
     sparse_scene = len(endpoints) <= 8 and open_path_count <= 3
+
+    # Phase E: Detect near-closed paths — suppress their endpoints from
+    # cross-path candidate generation to prevent false interior-exterior bridges.
+    near_closed_path_indices: Set[int] = set()
+    for path_idx, path in enumerate(result.paths):
+        if path.is_closed or not path.segments:
+            continue
+        plen = path_lengths.get(path_idx, 0.0)
+        if plen < 100.0:
+            continue
+        idx_start = endpoint_idx_by_key.get((path_idx, "start"))
+        idx_end = endpoint_idx_by_key.get((path_idx, "end"))
+        if idx_start is None or idx_end is None:
+            continue
+        ep_s = endpoints[idx_start]
+        ep_e = endpoints[idx_end]
+        gap = float(np.linalg.norm(ep_e.position - ep_s.position))
+        gap_ratio = gap / max(plen, 1e-6)
+        if gap_ratio < 0.08:
+            near_closed_path_indices.add(path_idx)
 
     # Pre-sample all path bodies for bridge-crossing checks.
     path_samples_cache = _build_path_samples_cache(result.paths, pts_per_segment=16)
+
+    # Phase E: Build convex hulls for containment checks
+    path_hulls: Dict[int, Optional[np.ndarray]] = {}
+    for idx, pts in path_samples_cache.items():
+        if len(pts) >= 4:
+            try:
+                from scipy.spatial import ConvexHull
+                hull = ConvexHull(pts)
+                path_hulls[idx] = pts[hull.vertices]
+            except Exception:
+                path_hulls[idx] = None
+        else:
+            path_hulls[idx] = None
+
     # Distance threshold for strict (>=1) crossing suppression:
     # bridges shorter than this use the lenient (>=2) threshold.
     crossing_long_threshold = max(120.0, result.diagonal * 0.05)
@@ -945,6 +991,34 @@ def generate_candidates(
             if ep_a.path_index == ep_b.path_index:
                 continue
 
+            # Phase E: Skip if either endpoint belongs to a near-closed path
+            # (those paths should only participate in self-closure, not cross-connections).
+            if ep_a.path_index in near_closed_path_indices or ep_b.path_index in near_closed_path_indices:
+                if cross_diag is not None:
+                    _diag_increment_reason(cross_diag, "cross_near_closed_suppressed")
+                continue
+
+            # Phase E: Containment-based suppression — if one endpoint is inside
+            # the convex hull of the other path, require much stronger alignment.
+            def _point_in_hull(point: np.ndarray, hull_pts: Optional[np.ndarray]) -> bool:
+                """Check if point is inside a convex hull using cross products."""
+                if hull_pts is None or len(hull_pts) < 3:
+                    return False
+                n = len(hull_pts)
+                for k in range(n):
+                    edge = hull_pts[(k + 1) % n] - hull_pts[k]
+                    to_pt = point - hull_pts[k]
+                    cross = edge[0] * to_pt[1] - edge[1] * to_pt[0]
+                    if cross < 0:
+                        return False
+                return True
+
+            hull_a = path_hulls.get(ep_a.path_index)
+            hull_b = path_hulls.get(ep_b.path_index)
+            a_inside_b = _point_in_hull(ep_a.position, hull_b)
+            b_inside_a = _point_in_hull(ep_b.position, hull_a)
+            containment_flag = a_inside_b or b_inside_a
+
             # Skip duplicate pairs
             pair_key = (min(i, j), max(i, j))
             if pair_key in seen_pairs:
@@ -997,6 +1071,12 @@ def generate_candidates(
                 tangent_confidence_a=float(getattr(ep_a, "tangent_confidence", 1.0)),
                 tangent_confidence_b=float(getattr(ep_b, "tangent_confidence", 1.0)),
             )
+
+            # Phase E: Containment tightening — if an endpoint is inside the other
+            # path's convex hull, require much stronger bilateral alignment to prevent
+            # false interior-to-exterior connections (e.g., damaged_eye R6).
+            if containment_flag and bilateral < 0.65:
+                strict_direction_ok = False
             min_conf = min(
                 float(getattr(ep_a, "tangent_confidence", 1.0)),
                 float(getattr(ep_b, "tangent_confidence", 1.0)),

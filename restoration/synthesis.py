@@ -70,6 +70,151 @@ def _is_straight(curvature_a: float, curvature_b: float,
     return both_flat and aligned
 
 
+def _is_strongly_straight(curvature_a: float, curvature_b: float,
+                           tangent_a: np.ndarray, tangent_b: np.ndarray) -> bool:
+    """Phase D: Stricter straight detection for bridge enforcement."""
+    both_flat = curvature_a < 0.003 and curvature_b < 0.003
+    aligned = abs(float(np.dot(tangent_a, -tangent_b))) > 0.92
+    return both_flat and aligned
+
+
+def _re_estimate_tangent_from_path(path: Optional['BezierPath'], end: str,
+                                    fraction: float = 0.15) -> Optional[np.ndarray]:
+    """Phase D: Re-estimate endpoint tangent from sampled path body using PCA.
+
+    Uses the last `fraction` of the path's sampled polyline, weighted by
+    distance from the endpoint, to get a cleaner tangent than the raw
+    Voronoi-derived one.
+    """
+    if path is None or not path.segments:
+        return None
+    pts = path.sample(pts_per_segment=20)
+    if len(pts) < 6:
+        return None
+
+    n = len(pts)
+    window = max(3, int(n * fraction))
+
+    if end == "end":
+        local = pts[-window:]
+        direction_sign = 1.0
+    else:
+        local = pts[:window][::-1]
+        direction_sign = 1.0
+
+    if len(local) < 3:
+        return None
+
+    # Distance weights: closer to endpoint = higher weight
+    dists_from_end = np.linalg.norm(local - local[0], axis=1)
+    max_d = max(float(np.max(dists_from_end)), 1e-6)
+    weights = np.exp(-2.0 * dists_from_end / max_d)
+
+    # Weighted PCA for dominant direction
+    centroid = np.average(local, axis=0, weights=weights)
+    centered = local - centroid
+    weighted = centered * weights[:, np.newaxis]
+    cov = weighted.T @ centered
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    principal = eigvecs[:, -1]  # largest eigenvalue
+
+    # Orient along the path direction (endpoint toward interior)
+    chord = local[-1] - local[0]
+    if np.dot(principal, chord) < 0:
+        principal = -principal
+
+    n = np.linalg.norm(principal)
+    if n < 1e-12:
+        return None
+    return (principal / n).astype(np.float64) * direction_sign
+
+
+def _build_arc_fitted_bridge(ep_a: EndpointInfo, ep_b: EndpointInfo,
+                              path_a: Optional['BezierPath'] = None,
+                              path_b: Optional['BezierPath'] = None) -> BezierSegment:
+    """Phase D: Arc-fitted bridge using osculating circle interpolation.
+
+    For curved endpoints, estimates the osculating circle from endpoint
+    position, tangent and curvature, then samples points along the arc
+    and fits a Bezier through them. This produces bridges that naturally
+    follow the shape's curvature (e.g., oval gaps).
+    """
+    p0 = ep_a.position.copy()
+    p3 = ep_b.position.copy()
+    chord = float(np.linalg.norm(p3 - p0))
+    if chord < 1e-6:
+        chord = 1.0
+
+    # Use re-estimated tangents if available (Phase D.3)
+    tan_a = ep_a.tangent.copy()
+    tan_b = ep_b.tangent.copy()
+    re_tan_a = _re_estimate_tangent_from_path(path_a, ep_a.end)
+    re_tan_b = _re_estimate_tangent_from_path(path_b, ep_b.end)
+    if re_tan_a is not None:
+        # Blend: 60% re-estimated, 40% original
+        blended = 0.6 * re_tan_a + 0.4 * tan_a
+        n = np.linalg.norm(blended)
+        if n > 1e-12:
+            tan_a = blended / n
+    if re_tan_b is not None:
+        blended = 0.6 * re_tan_b + 0.4 * tan_b
+        n = np.linalg.norm(blended)
+        if n > 1e-12:
+            tan_b = blended / n
+
+    curv_a = max(ep_a.curvature, 1e-8)
+    curv_b = max(ep_b.curvature, 1e-8)
+    avg_curv = (curv_a + curv_b) / 2.0
+    radius = 1.0 / avg_curv if avg_curv > 1e-6 else chord * 5.0
+
+    # Estimate center of osculating circle from endpoint A
+    # Normal is perpendicular to tangent, pointing toward center
+    normal_a = np.array([-tan_a[1], tan_a[0]], dtype=np.float64)
+    # Decide which side the center is on
+    to_b = _safe_normalize(p3 - p0)
+    if np.dot(normal_a, to_b) < 0:
+        normal_a = -normal_a
+
+    center = p0 + radius * normal_a
+
+    # Sample arc points from center
+    angle_a = float(np.arctan2(p0[1] - center[1], p0[0] - center[0]))
+    angle_b = float(np.arctan2(p3[1] - center[1], p3[0] - center[0]))
+
+    # Ensure we go the short way around
+    diff = angle_b - angle_a
+    if diff > np.pi:
+        diff -= 2 * np.pi
+    elif diff < -np.pi:
+        diff += 2 * np.pi
+
+    # If the arc subtends too large an angle, fall back to G1
+    if abs(diff) > np.pi * 0.9:
+        return _build_g1_bridge(ep_a, ep_b)
+
+    n_samples = max(5, int(abs(diff) * radius / 3.0))
+    n_samples = min(n_samples, 20)
+    arc_pts = []
+    for i in range(n_samples + 1):
+        t = i / float(n_samples)
+        angle = angle_a + t * diff
+        arc_pts.append(center + radius * np.array([np.cos(angle), np.sin(angle)]))
+    arc_pts = np.array(arc_pts, dtype=np.float64)
+
+    # Fit a G1-continuous Bezier using the arc tangents at endpoints
+    # Handle lengths based on arc length
+    arc_len = float(np.sum(np.linalg.norm(np.diff(arc_pts, axis=0), axis=1)))
+    alpha = arc_len / 3.0
+
+    p1 = p0 + alpha * tan_a
+    p2 = p3 + alpha * tan_b  # tan_b is outward, so this goes backward
+
+    cp = np.vstack([p0, p1, p2, p3])
+    cp = _stabilize_bridge_control_points(cp)
+
+    return BezierSegment(control_points=cp, source_type="bridge")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Bridge construction — production quality
 # ═══════════════════════════════════════════════════════════════════════════
@@ -218,15 +363,40 @@ def _build_intersection_bridge_curved(
 # Synthesis dispatcher
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _synthesize_single(candidate: ConnectionCandidate) -> List[BezierSegment]:
-    """Build the final bridge segment(s) for one accepted candidate."""
+def _synthesize_single(candidate: ConnectionCandidate,
+                       paths: Optional[List['BezierPath']] = None) -> List[BezierSegment]:
+    """Build the final bridge segment(s) for one accepted candidate.
+    
+    Phase D enhancements:
+    - Arc-fitted bridges for curved endpoints (osculating circle interpolation)
+    - Straight bridge enforcement for angular shapes
+    - Tangent re-estimation from path body via PCA
+    """
     ep_a = candidate.ep_a
     ep_b = candidate.ep_b
+    
+    # Resolve source paths for tangent re-estimation
+    path_a = paths[ep_a.path_index] if paths and ep_a.path_index < len(paths) else None
+    path_b = paths[ep_b.path_index] if paths and ep_b.path_index < len(paths) else None
+
+    # Phase D: Straight bridge enforcement for angular shapes
+    if _is_strongly_straight(ep_a.curvature, ep_b.curvature,
+                              ep_a.tangent, ep_b.tangent):
+        return [_build_straight_bridge(ep_a, ep_b)]
+
+    # Phase D: Arc-fitted bridge for curved endpoints
+    both_curved = ep_a.curvature > 0.005 and ep_b.curvature > 0.005
+    curvature_consistent = (
+        both_curved and
+        min(ep_a.curvature, ep_b.curvature) / max(ep_a.curvature, ep_b.curvature) > 0.3
+    )
 
     if candidate.scenario == "continuation":
         if _is_straight(ep_a.curvature, ep_b.curvature,
                         ep_a.tangent, ep_b.tangent):
             return [_build_straight_bridge(ep_a, ep_b)]
+        if curvature_consistent:
+            return [_build_arc_fitted_bridge(ep_a, ep_b, path_a, path_b)]
         return [_build_g1_bridge(ep_a, ep_b)]
 
     if candidate.scenario == "extension_intersection":
@@ -234,6 +404,8 @@ def _synthesize_single(candidate: ConnectionCandidate) -> List[BezierSegment]:
         if intersection_obj is None:
             bridge_pts = candidate.bridge_points
             if len(bridge_pts) < 2:
+                if curvature_consistent:
+                    return [_build_arc_fitted_bridge(ep_a, ep_b, path_a, path_b)]
                 return [_build_g1_bridge(ep_a, ep_b)]
             mid = len(bridge_pts) // 2
             intersection = bridge_pts[mid].copy()
@@ -247,14 +419,19 @@ def _synthesize_single(candidate: ConnectionCandidate) -> List[BezierSegment]:
         ):
             return _build_intersection_bridge_linear(ep_a, ep_b, intersection)
 
+        # Same-path closure with curvature: use arc-fitted bridge
+        if getattr(candidate, "same_path_closure", False) and curvature_consistent:
+            return [_build_arc_fitted_bridge(ep_a, ep_b, path_a, path_b)]
+
         # If the intersection point is very close to the chord midpoint,
         # a 2-segment bridge through it would create an unnecessary kink.
-        # Fall back to a smooth single-segment G1 bridge instead.
         chord = float(np.linalg.norm(ep_b.position - ep_a.position))
         if chord > 1e-6:
             midpoint = (ep_a.position + ep_b.position) / 2.0
             dist_to_mid = float(np.linalg.norm(intersection - midpoint))
             if dist_to_mid < 0.15 * chord:
+                if curvature_consistent:
+                    return [_build_arc_fitted_bridge(ep_a, ep_b, path_a, path_b)]
                 return [_build_g1_bridge(ep_a, ep_b)]
 
         if _is_straight(ep_a.curvature, ep_b.curvature,
@@ -263,16 +440,19 @@ def _synthesize_single(candidate: ConnectionCandidate) -> List[BezierSegment]:
         return _build_intersection_bridge_curved(ep_a, ep_b, intersection)
 
     # Fallback
+    if curvature_consistent:
+        return [_build_arc_fitted_bridge(ep_a, ep_b, path_a, path_b)]
     return [_build_g1_bridge(ep_a, ep_b)]
 
 
 def synthesize_bridges(
     accepted: List[ConnectionCandidate],
+    original_paths: Optional[List[BezierPath]] = None,
 ) -> List[BezierSegment]:
     """Build all bridge segments for the accepted candidates."""
     all_bridges: List[BezierSegment] = []
     for c in accepted:
-        c.bridge_bezier = _synthesize_single(c)
+        c.bridge_bezier = _synthesize_single(c, paths=original_paths)
         all_bridges.extend(c.bridge_bezier)
     return all_bridges
 

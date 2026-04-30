@@ -18,7 +18,7 @@ import json
 import os
 import subprocess
 import tempfile
-from typing import List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Set, Tuple, Any, Union
 
 import cv2
 import networkx as nx
@@ -58,8 +58,85 @@ def _clean_polygon_holes(poly: Polygon, min_hole_area: float = 50.0) -> Polygon:
     return Polygon(poly.exterior, new_interiors)
 
 
+def _detect_corners(points: np.ndarray, angle_threshold_deg: float = 70.0) -> Set[int]:
+    """Detect sharp corner indices in a polyline."""
+    corners: Set[int] = set()
+    if len(points) < 3:
+        return corners
+    for i in range(1, len(points) - 1):
+        v1 = points[i] - points[i - 1]
+        v2 = points[i + 1] - points[i]
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+        if n1 < 1e-6 or n2 < 1e-6:
+            continue
+        cos_theta = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+        angle = float(np.degrees(np.arccos(cos_theta)))
+        if angle > angle_threshold_deg:
+            corners.add(i)
+    return corners
+
+
+def _chaikin_smooth(points: np.ndarray, iterations: int = 2,
+                    corner_threshold_deg: float = 65.0) -> np.ndarray:
+    """Chaikin corner-cutting smoothing with sharp-corner pinning.
+
+    Applies Chaikin subdivision to smooth noisy Voronoi centerline polylines
+    while preserving sharp corners (detected by angle threshold). Endpoints
+    are always preserved.
+    """
+    if len(points) < 3:
+        return points
+
+    for _ in range(iterations):
+        pinned = _detect_corners(points, corner_threshold_deg)
+        # Always pin first and last
+        pinned.add(0)
+        pinned.add(len(points) - 1)
+
+        new_pts = []
+        for i in range(len(points) - 1):
+            p0 = points[i]
+            p1 = points[i + 1]
+            if i in pinned:
+                new_pts.append(p0)
+                if (i + 1) in pinned:
+                    # Both pinned — keep the segment as-is
+                    pass
+                else:
+                    # Only start pinned: add the 3/4 point
+                    new_pts.append(0.25 * p0 + 0.75 * p1)
+            else:
+                if (i + 1) in pinned:
+                    # Only end pinned: add the 1/4 point
+                    new_pts.append(0.75 * p0 + 0.25 * p1)
+                else:
+                    # Neither pinned: standard Chaikin subdivision
+                    new_pts.append(0.75 * p0 + 0.25 * p1)
+                    new_pts.append(0.25 * p0 + 0.75 * p1)
+
+        # Always add the last point
+        new_pts.append(points[-1])
+        points = np.array(new_pts, dtype=np.float64)
+
+    return points
+
+
+def _estimate_stroke_half_width(polygon: Polygon) -> float:
+    """Estimate the stroke half-width from the polygon area/perimeter ratio.
+
+    For a long thin stroke: area ≈ width × length, perimeter ≈ 2 × (width + length).
+    So width ≈ area / (perimeter/2 - width) ≈ 2 × area / perimeter for thin strokes.
+    """
+    area = polygon.area
+    perim = polygon.length
+    if perim < 1e-6:
+        return 1.0
+    return max(0.5, float(area / perim))
+
+
 def _extract_vector_boundaries(
-    image_path: str, image_height: int, min_area: float = 100.0
+    image_path: str, image_height: int, min_area: float = 50.0
 ) -> List[Polygon]:
     """Convert raster sketch to smooth vector polygons using Potrace."""
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
@@ -116,7 +193,7 @@ def _extract_vector_boundaries(
                 clean_poly = _clean_polygon_holes(transformed_geom)
                 polygons.append(clean_poly)
 
-    smoothed = [p.simplify(0.2, preserve_topology=True) for p in polygons]
+    smoothed = [p.simplify(0.15, preserve_topology=True) for p in polygons]
     return smoothed
 
 
@@ -231,7 +308,7 @@ def _split_at_corners(points: np.ndarray, threshold_deg: float = 75.0) -> List[n
 def fit_from_image_geometric(
     image_path: str,
     image_height: int,
-    min_area: float = 100.0,
+    min_area: float = 50.0,
     max_error: float = 2.0,
     tangent_lookahead: int = 8,
     straightness_scale: float = 0.75,
@@ -244,12 +321,29 @@ def fit_from_image_geometric(
     """End-to-end geometric extraction: raster -> boundary -> voronoi -> bezier."""
     polygons = _extract_vector_boundaries(image_path, image_height=image_height, min_area=min_area)
     
-    # Compute a safe densify factor so large images don't freeze PyGeoOps
-    densify_factor = max(3.0, image_height * 0.0025)
-    centerlines = _compute_voronoi_centerlines(polygons, densify_factor=densify_factor, min_branch_factor=0.0)
+    # Per-polygon adaptive densification: smaller polygons need denser Voronoi sampling
+    # to produce accurate centerlines for thin/short strokes.
+    diagonal = float(np.hypot(image_height, image_height))  # approximate
+    min_chain_length = max(3.0, diagonal * 0.003)
+
+    all_centerlines: List[MultiLineString] = []
+    stroke_widths: Dict[int, float] = {}  # polygon index -> estimated half-width
+    for poly_idx, poly in enumerate(polygons):
+        half_w = _estimate_stroke_half_width(poly)
+        stroke_widths[poly_idx] = half_w
+        # Adaptive densify: smaller polygons get finer sampling
+        adaptive_densify = max(2.0, min(half_w * 1.5, float(np.sqrt(poly.area)) * 0.01))
+        # But never exceed a safe upper bound to prevent hangs
+        adaptive_densify = min(adaptive_densify, max(3.0, image_height * 0.003))
+        cls = _compute_voronoi_centerlines(
+            [poly],
+            densify_factor=adaptive_densify,
+            min_branch_factor=0.0,
+        )
+        all_centerlines.extend(cls)
 
     # Reconstruct the graph to maintain continuous strokes through junctions
-    graph = _multilinestring_to_sknw_graph(centerlines, image_height=image_height)
+    graph = _multilinestring_to_sknw_graph(all_centerlines, image_height=image_height)
     
     # Prune topological spurs to prevent path fragmentation
     _prune_skeleton_spurs(graph, threshold_length=spur_threshold)
@@ -268,15 +362,33 @@ def fit_from_image_geometric(
         if len(pts) < 2:
             continue
 
+        # Discard chains shorter than the minimum length threshold
+        chain_len = float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+        if chain_len < min_chain_length:
+            continue
+
+        # Adaptive simplification tolerance based on estimated stroke width.
+        # Thin strokes get tighter tolerance; thick strokes get more aggressive simplification.
+        avg_half_width = np.mean(list(stroke_widths.values())) if stroke_widths else 2.0
+        adaptive_simp = max(0.2, min(simplification_tolerance, avg_half_width * 0.3))
+
         # Downsample extremely dense Voronoi points to prevent deep recursion/hangs
-        if len(pts) > 10 and simplification_tolerance > 0.0:
-            ls = LineString(pts).simplify(simplification_tolerance, preserve_topology=True)
+        if len(pts) > 10 and adaptive_simp > 0.0:
+            ls = LineString(pts).simplify(adaptive_simp, preserve_topology=True)
             if ls.is_simple:
                 pts = np.array(ls.coords)
         
         if len(pts) < 2:
             continue
-            
+
+        # Phase A: Chaikin smoothing with corner pinning to clean Voronoi noise
+        # while preserving sharp corners (critical for bolt, star, shape geometries)
+        if len(pts) >= 4:
+            pts = _chaikin_smooth(pts, iterations=2, corner_threshold_deg=65.0)
+
+        if len(pts) < 2:
+            continue
+
         left_tangent = _estimate_tangent(pts, "start", lookahead=lookahead)
         right_tangent = _estimate_tangent(pts, "end", lookahead=lookahead)
         cps_list = _fit_cubic_single(

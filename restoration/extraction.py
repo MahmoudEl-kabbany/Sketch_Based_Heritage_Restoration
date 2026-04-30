@@ -372,11 +372,13 @@ def extract_paths(
     adaptive_merge_radius = max(3.0, merge_radius * scale_factor)
 
     # Bezier path extraction via pure geometry (Voronoi MAT)
+    # Use lowered min_area (80) for fragment preservation with stronger
+    # downstream filtering (spur pruning + candidate gates handle noise).
     paths, _ = fit_from_image_geometric(
         image_path,
         image_height=h,
         max_error=max_error,
-        min_area=150.0,
+        min_area=80.0,
         spur_threshold=adaptive_spur_threshold,
         merge_radius=adaptive_merge_radius,
     )

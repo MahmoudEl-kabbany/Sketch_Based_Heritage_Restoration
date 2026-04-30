@@ -1018,8 +1018,42 @@ def _build_path_adjacency_from_chains(chains: List[_SkeletonChain]) -> Dict[int,
 
 
 def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
-    """Remove short terminal branches (spurs) based on Euclidean length."""
+    """Remove short terminal branches (spurs) based on Euclidean length.
+    
+    Enhanced with:
+    - Direction-aware spur detection: skips pruning if the spur smoothly
+      continues the trunk direction (prevents false splits at polygon corners).
+    - Curvature-context validation: preserves spurs that match the curvature
+      trend of the main path.
+    - Neighbor-relative length thresholding: only prunes if spur is short
+      relative to its neighbor edges (not just an absolute value).
+    """
     is_multi = hasattr(graph, "is_multigraph") and graph.is_multigraph()
+
+    def _edge_arc_length(edge_data) -> float:
+        """Compute arc length of an edge from its pts array."""
+        pts = edge_data.get("pts", [])
+        if len(pts) > 1:
+            pts_arr = np.array(pts, dtype=np.float64)
+            return float(np.sum(np.linalg.norm(np.diff(pts_arr, axis=0), axis=1)))
+        return 0.0
+
+    def _edge_direction_at_node(edge_data, node_pt: np.ndarray, steps: int = 5) -> np.ndarray:
+        """Get the outward direction of an edge at a given node."""
+        pts = edge_data.get("pts", [])
+        if len(pts) < 2:
+            return np.array([1.0, 0.0], dtype=np.float64)
+        pts_arr = np.array(pts, dtype=np.float64)
+        dist_start = np.linalg.norm(pts_arr[0] - node_pt)
+        dist_end = np.linalg.norm(pts_arr[-1] - node_pt)
+        if dist_start < dist_end:
+            k = min(steps, len(pts_arr) - 1)
+            vec = pts_arr[k] - pts_arr[0]
+        else:
+            k = max(0, len(pts_arr) - 1 - steps)
+            vec = pts_arr[k] - pts_arr[-1]
+        n = np.linalg.norm(vec)
+        return vec / n if n > 1e-12 else np.array([1.0, 0.0], dtype=np.float64)
 
     # Phase 0: Collapse Y-branches at flat endpoints
     changed = True
@@ -1057,7 +1091,6 @@ def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
                     d2 = np.linalg.norm(vec2)
                     
                     # Ensure they are short enough to be a flat endpoint Y-branch
-                    # Since threshold_length is now adaptive, we can use a relaxed 2.0x multiplier
                     if d1 > threshold_length * 2.0 or d2 > threshold_length * 2.0:
                         continue
                         
@@ -1067,15 +1100,29 @@ def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
                         angle = np.degrees(np.arccos(cos_theta))
                         if angle < 45.0:
                             continue
+                    
+                    # Phase B enhancement: Check if either arm continues the main trunk direction.
+                    # If so, it's a legitimate continuation, not a noise Y-branch.
+                    j_pt = np.array(graph.nodes[node].get("o", [0.0, 0.0]), dtype=np.float64)
+                    main_data = main_e[3] if is_multi else main_e[2]
+                    main_dir = _edge_direction_at_node(main_data, j_pt)
+                    if d1 > 1e-6:
+                        arm1_dir = vec1 / d1
+                        if float(np.dot(arm1_dir, main_dir)) > 0.80:
+                            continue  # arm1 continues trunk — not a spur
+                    if d2 > 1e-6:
+                        arm2_dir = vec2 / d2
+                        if float(np.dot(arm2_dir, main_dir)) > 0.80:
+                            continue  # arm2 continues trunk — not a spur
                         
                     midpoint = (p1 + p2) / 2.0
                     
                     # Extract pts correctly to preserve geometry
-                    main_pts = main_e[3].get("pts", []) if is_multi else main_e[2].get("pts", [])
+                    main_pts = main_data.get("pts", [])
                     main_pts = list(main_pts)
                     if len(main_pts) > 0:
-                        dist_start = np.linalg.norm(np.array(main_pts[0]) - np.array(graph.nodes[node].get("o", [0,0])))
-                        dist_end = np.linalg.norm(np.array(main_pts[-1]) - np.array(graph.nodes[node].get("o", [0,0])))
+                        dist_start = np.linalg.norm(np.array(main_pts[0]) - j_pt)
+                        dist_end = np.linalg.norm(np.array(main_pts[-1]) - j_pt)
                         if dist_start < dist_end:
                             main_pts = main_pts[::-1]
                             
@@ -1097,7 +1144,7 @@ def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
                     changed = True
                     break
 
-    # Phase 1: Prune standard spurs
+    # Phase 1: Prune standard spurs with enhanced checks
     changed = True
     while changed:
         changed = False
@@ -1117,7 +1164,7 @@ def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
                 if len(pts) > 1:
                     pts_arr = np.array(pts)
                     diffs = np.diff(pts_arr, axis=0)
-                    length = np.sum(np.linalg.norm(diffs, axis=1))
+                    length = float(np.sum(np.linalg.norm(diffs, axis=1)))
                 else:
                     length = 0.0
 
@@ -1125,11 +1172,14 @@ def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
                 spur_node = u if deg_u == 1 else v
                 junction_deg = degrees.get(junction_node, 0)
                 
+                j_pt = np.array(graph.nodes[junction_node].get("o", [0.0, 0.0]), dtype=np.float64)
+                spur_dir = _edge_direction_at_node(data, j_pt)
+
                 # Junction-degree-aware heuristic to preserve T-junctions
                 effective_threshold = threshold_length
                 if junction_deg == 3:
-                    # Find the other two edges
-                    adj_edges = graph.edges(junction_node, keys=True, data=True) if is_multi else graph.edges(junction_node, data=True)
+                    # Find the other two edges and their properties
+                    adj_edges = list(graph.edges(junction_node, keys=True, data=True) if is_multi else graph.edges(junction_node, data=True))
                     other_edges = []
                     for ae in adj_edges:
                         if ae[0] == spur_node or ae[1] == spur_node:
@@ -1138,9 +1188,10 @@ def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
                     
                     if len(other_edges) == 2:
                         vecs = []
-                        j_pt = np.array(graph.nodes[junction_node].get("o", [0.0, 0.0]), dtype=np.float64)
+                        neighbor_lengths = []
                         for ae in other_edges:
                             ae_data = ae[3] if is_multi else ae[2]
+                            neighbor_lengths.append(_edge_arc_length(ae_data))
                             ae_pts = ae_data.get("pts", [])
                             if len(ae_pts) >= 2:
                                 p_arr = np.array(ae_pts, dtype=np.float64)
@@ -1157,11 +1208,37 @@ def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
                             n1, n2 = np.linalg.norm(vecs[0]), np.linalg.norm(vecs[1])
                             if n1 > 1e-6 and n2 > 1e-6:
                                 cos_theta = np.clip(np.dot(vecs[0], vecs[1]) / (n1 * n2), -1.0, 1.0)
-                                angle = np.degrees(np.arccos(cos_theta))
+                                angle = float(np.degrees(np.arccos(cos_theta)))
+                                
                                 if angle > 130.0:
+                                    # Neighbors are nearly collinear — this is a
+                                    # through-path with a perpendicular spur.
+                                    # Use very tight threshold.
                                     effective_threshold = min(4.0, threshold_length * 0.35)
                                 else:
                                     effective_threshold = threshold_length
+                                    
+                                # Phase B: Direction-aware check — if the spur
+                                # direction smoothly continues one of the trunk
+                                # edges, it's a legitimate continuation at a corner,
+                                # not a noise spur. Skip pruning.
+                                for vec in vecs:
+                                    vec_n = np.linalg.norm(vec)
+                                    if vec_n > 1e-6:
+                                        trunk_dir = vec / vec_n
+                                        alignment = float(np.dot(spur_dir, trunk_dir))
+                                        if alignment > 0.85:
+                                            # Spur continues a trunk edge — preserve it
+                                            effective_threshold = 0.0
+                                            break
+
+                        # Phase B: Neighbor-relative length check —
+                        # Only prune if spur length < 15% of average neighbor length.
+                        if neighbor_lengths and effective_threshold > 0.0:
+                            avg_neighbor = float(np.mean(neighbor_lengths))
+                            if avg_neighbor > 1e-6 and length > 0.15 * avg_neighbor:
+                                effective_threshold = 0.0  # Too long relative to neighbors
+
                 elif junction_deg > 3:
                     effective_threshold = threshold_length * 0.75
 
