@@ -218,8 +218,8 @@ def _estimate_endpoint_context_tangent(
     """Estimate endpoint tangent from local sampled context and return confidence."""
     sampled = path.sample(pts_per_segment=24)
     sampled = _dedupe_polyline(sampled)
-    # Sway stripping removed to avoid tangent misalignments
-    # sampled = _strip_sway_prefix(sampled, end)
+    # Sway stripping enabled to avoid tangent misalignments
+    sampled = _strip_sway_prefix(sampled, end)
     
     if len(sampled) < 3:
         return np.array([1.0, 0.0], dtype=np.float64), 0.0
@@ -365,15 +365,20 @@ def extract_paths(
         raise FileNotFoundError(f"Cannot read image: {image_path}")
     h, w = img.shape[:2]
     diagonal = float(np.hypot(h, w))
+    
+    # Scale-invariant thresholding: normalize relative to a 1000px diagonal baseline
+    scale_factor = diagonal / 1000.0
+    adaptive_spur_threshold = max(8.0, spur_threshold * scale_factor)
+    adaptive_merge_radius = max(3.0, merge_radius * scale_factor)
 
     # Bezier path extraction via pure geometry (Voronoi MAT)
     paths, _ = fit_from_image_geometric(
         image_path,
         image_height=h,
         max_error=max_error,
-        min_area=25.0,
-        spur_threshold=spur_threshold,
-        merge_radius=merge_radius,
+        min_area=150.0,
+        spur_threshold=adaptive_spur_threshold,
+        merge_radius=adaptive_merge_radius,
     )
 
     # Endpoint extraction

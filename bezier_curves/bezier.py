@@ -1019,13 +1019,91 @@ def _build_path_adjacency_from_chains(chains: List[_SkeletonChain]) -> Dict[int,
 
 def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
     """Remove short terminal branches (spurs) based on Euclidean length."""
+    is_multi = hasattr(graph, "is_multigraph") and graph.is_multigraph()
+
+    # Phase 0: Collapse Y-branches at flat endpoints
+    changed = True
+    while changed:
+        changed = False
+        degrees = dict(graph.degree())
+        for node, deg in degrees.items():
+            if deg == 3:
+                adj_edges = list(graph.edges(node, keys=True, data=True) if is_multi else graph.edges(node, data=True))
+                deg1_edges = []
+                other_edges = []
+                for ae in adj_edges:
+                    other = ae[1] if ae[0] == node else ae[0]
+                    if degrees.get(other, 0) == 1:
+                        deg1_edges.append(ae)
+                    else:
+                        other_edges.append(ae)
+                
+                if len(deg1_edges) == 2 and len(other_edges) == 1:
+                    e1, e2 = deg1_edges[0], deg1_edges[1]
+                    main_e = other_edges[0]
+                    
+                    n1 = e1[1] if e1[0] == node else e1[0]
+                    n2 = e2[1] if e2[0] == node else e2[0]
+                    main_node = main_e[1] if main_e[0] == node else main_e[0]
+                    
+                    p1 = np.array(graph.nodes[n1].get("o", [0.0, 0.0]))
+                    p2 = np.array(graph.nodes[n2].get("o", [0.0, 0.0]))
+                    
+                    # Calculate outward vectors from the junction node
+                    vec1 = p1 - np.array(graph.nodes[node].get("o", [0.0, 0.0]))
+                    vec2 = p2 - np.array(graph.nodes[node].get("o", [0.0, 0.0]))
+                    
+                    d1 = np.linalg.norm(vec1)
+                    d2 = np.linalg.norm(vec2)
+                    
+                    # Ensure they are short enough to be a flat endpoint Y-branch
+                    # Since threshold_length is now adaptive, we can use a relaxed 2.0x multiplier
+                    if d1 > threshold_length * 2.0 or d2 > threshold_length * 2.0:
+                        continue
+                        
+                    # Geometric check: ensure the arms point outward from each other (angle > 45 deg)
+                    if d1 > 1e-6 and d2 > 1e-6:
+                        cos_theta = np.clip(np.dot(vec1, vec2) / (d1 * d2), -1.0, 1.0)
+                        angle = np.degrees(np.arccos(cos_theta))
+                        if angle < 45.0:
+                            continue
+                        
+                    midpoint = (p1 + p2) / 2.0
+                    
+                    # Extract pts correctly to preserve geometry
+                    main_pts = main_e[3].get("pts", []) if is_multi else main_e[2].get("pts", [])
+                    main_pts = list(main_pts)
+                    if len(main_pts) > 0:
+                        dist_start = np.linalg.norm(np.array(main_pts[0]) - np.array(graph.nodes[node].get("o", [0,0])))
+                        dist_end = np.linalg.norm(np.array(main_pts[-1]) - np.array(graph.nodes[node].get("o", [0,0])))
+                        if dist_start < dist_end:
+                            main_pts = main_pts[::-1]
+                            
+                    new_pts = np.array(main_pts + [midpoint])
+                    
+                    graph.remove_node(n1)
+                    graph.remove_node(n2)
+                    graph.remove_node(node)
+                    
+                    new_nodes = list(graph.nodes())
+                    new_node = max(new_nodes) + 1 if new_nodes else 0
+                    graph.add_node(new_node, o=midpoint)
+                    
+                    if is_multi:
+                        graph.add_edge(main_node, new_node, pts=new_pts)
+                    else:
+                        graph.add_edge(main_node, new_node, pts=new_pts)
+                        
+                    changed = True
+                    break
+
+    # Phase 1: Prune standard spurs
     changed = True
     while changed:
         changed = False
         degrees = dict(graph.degree())
         edges_to_remove = []
 
-        is_multi = hasattr(graph, "is_multigraph") and graph.is_multigraph()
         edges = graph.edges(keys=True, data=True) if is_multi else graph.edges(data=True)
 
         for edge in edges:
@@ -1043,7 +1121,51 @@ def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
                 else:
                     length = 0.0
 
-                if length <= threshold_length:
+                junction_node = v if deg_u == 1 else u
+                spur_node = u if deg_u == 1 else v
+                junction_deg = degrees.get(junction_node, 0)
+                
+                # Junction-degree-aware heuristic to preserve T-junctions
+                effective_threshold = threshold_length
+                if junction_deg == 3:
+                    # Find the other two edges
+                    adj_edges = graph.edges(junction_node, keys=True, data=True) if is_multi else graph.edges(junction_node, data=True)
+                    other_edges = []
+                    for ae in adj_edges:
+                        if ae[0] == spur_node or ae[1] == spur_node:
+                            continue
+                        other_edges.append(ae)
+                    
+                    if len(other_edges) == 2:
+                        vecs = []
+                        j_pt = np.array(graph.nodes[junction_node].get("o", [0.0, 0.0]), dtype=np.float64)
+                        for ae in other_edges:
+                            ae_data = ae[3] if is_multi else ae[2]
+                            ae_pts = ae_data.get("pts", [])
+                            if len(ae_pts) >= 2:
+                                p_arr = np.array(ae_pts, dtype=np.float64)
+                                dist_start = np.linalg.norm(p_arr[0] - j_pt)
+                                dist_end = np.linalg.norm(p_arr[-1] - j_pt)
+                                if dist_start < dist_end:
+                                    k = min(5, len(p_arr) - 1)
+                                    vecs.append(p_arr[k] - p_arr[0])
+                                else:
+                                    k = max(0, len(p_arr) - 1 - 5)
+                                    vecs.append(p_arr[k] - p_arr[-1])
+                        
+                        if len(vecs) == 2:
+                            n1, n2 = np.linalg.norm(vecs[0]), np.linalg.norm(vecs[1])
+                            if n1 > 1e-6 and n2 > 1e-6:
+                                cos_theta = np.clip(np.dot(vecs[0], vecs[1]) / (n1 * n2), -1.0, 1.0)
+                                angle = np.degrees(np.arccos(cos_theta))
+                                if angle > 130.0:
+                                    effective_threshold = min(4.0, threshold_length * 0.35)
+                                else:
+                                    effective_threshold = threshold_length
+                elif junction_deg > 3:
+                    effective_threshold = threshold_length * 0.75
+
+                if length <= effective_threshold:
                     edges_to_remove.append(edge)
 
         for edge in edges_to_remove:
@@ -1059,46 +1181,67 @@ def _merge_connected_paths(paths: List[BezierPath], merge_radius: float) -> List
     if not paths:
         return []
 
+    from scipy.spatial import cKDTree
+
     merged = list(paths)
     changed = True
 
     while changed:
         changed = False
+        n = len(merged)
+        if n < 2:
+            break
+
+        # Collect all endpoints
+        endpoints = []
+        path_indices = []
+        is_start = []
+        
+        for i, p in enumerate(merged):
+            if not p.segments or p.is_closed:
+                continue
+            endpoints.append(p.segments[0].control_points[0])
+            path_indices.append(i)
+            is_start.append(True)
+            
+            endpoints.append(p.segments[-1].control_points[3])
+            path_indices.append(i)
+            is_start.append(False)
+            
+        if not endpoints:
+            break
+            
+        pts = np.array(endpoints)
+        tree = cKDTree(pts)
+        # Find pairs within merge_radius
+        pairs = tree.query_pairs(merge_radius)
+        
         best_pair = None
         best_dist = float('inf')
         best_config = None
-
-        n = len(merged)
-        for i in range(n):
-            for j in range(i + 1, n):
-                p_i = merged[i]
-                p_j = merged[j]
-
-                if not p_i.segments or not p_j.segments:
-                    continue
-                if p_i.is_closed or p_j.is_closed:
-                    continue
-
-                i_start = p_i.segments[0].control_points[0]
-                i_end = p_i.segments[-1].control_points[3]
-                j_start = p_j.segments[0].control_points[0]
-                j_end = p_j.segments[-1].control_points[3]
-
-                configs = [
-                    (np.linalg.norm(i_end - j_start), False, False),
-                    (np.linalg.norm(i_end - j_end), False, True),
-                    (np.linalg.norm(i_start - j_start), True, False),
-                    (np.linalg.norm(i_start - j_end), True, True)
-                ]
-
-                for dist, rev_i, rev_j in configs:
-                    if dist <= merge_radius and dist < best_dist:
-                        best_dist = dist
-                        best_pair = (i, j)
-                        best_config = (rev_i, rev_j)
+        
+        for u, v in pairs:
+            idx_i, idx_j = path_indices[u], path_indices[v]
+            if idx_i == idx_j:
+                continue
+                
+            dist = float(np.linalg.norm(pts[u] - pts[v]))
+            if dist < best_dist:
+                best_dist = dist
+                best_pair = (idx_i, idx_j)
+                # u_start is True if pts[u] is the start of path idx_i
+                rev_i = is_start[u]  # If start, we need to reverse so it becomes the end
+                rev_j = not is_start[v] # If end, we need to reverse so it becomes the start
+                best_config = (rev_i, rev_j)
 
         if best_pair is not None:
             i, j = best_pair
+            # Ensure i < j for safe popping
+            if i > j:
+                i, j = j, i
+                rev_i, rev_j = best_config
+                best_config = (rev_j, rev_i)
+                
             rev_i, rev_j = best_config
             p_i, p_j = merged[i], merged[j]
 

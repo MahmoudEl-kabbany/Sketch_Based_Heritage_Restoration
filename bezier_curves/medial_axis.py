@@ -78,10 +78,10 @@ def _extract_vector_boundaries(
         
         potrace_exe = get_potrace_path()
         # -i inverts the image. 
-        # -a 1.0 (default) or lower makes corners sharper. 1.34 was too round.
+        # -a 0.0 prevents Potrace from preemptively rounding off sharp corners
         # -t turdsize: suppress speckles.
         turdsize = max(2, int(image_height * 0.002))
-        cmd = [potrace_exe, bmp_path, "-i", "-b", "geojson", "-a", "0.95", "-t", str(turdsize), "-o", json_path]
+        cmd = [potrace_exe, bmp_path, "-i", "-b", "geojson", "-a", "0.0", "-t", str(turdsize), "-o", json_path]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         except subprocess.CalledProcessError as e:
@@ -147,22 +147,38 @@ def _compute_voronoi_centerlines(
     return centerlines
 
 
-def _multilinestring_to_sknw_graph(centerlines: List[MultiLineString]) -> nx.MultiGraph:
-    """Convert fragmented MultiLineStrings into a continuous skeleton network graph."""
+def _multilinestring_to_sknw_graph(centerlines: Union[MultiLineString, List[LineString]], image_height: float = 1000.0) -> nx.MultiGraph:
+    """Convert fragmented PyGeoOps linestrings into a connected NetworkX graph.
+    Uses a spatial grid to robustly merge nearby endpoints.
+    """
     graph = nx.MultiGraph()
+    graph.is_multigraph = lambda: True
     node_coords_to_id = {}
     next_node_id = 0
 
+    grid_tolerance = max(1.5, image_height * 0.002)
+    grid_size = grid_tolerance * 2.0  # Grid-based spatial lookup to fix fragmentation
+    
     def get_node_id(pt):
         nonlocal next_node_id
-        # Round to 2 decimal places to merge junctions accurately
-        key = (round(pt[0], 2), round(pt[1], 2))
-        if key not in node_coords_to_id:
-            node_coords_to_id[key] = next_node_id
-            # Add node with "o" data in [y, x] format for `_node_xy`
+        if not node_coords_to_id:
+            node_coords_to_id[next_node_id] = pt
             graph.add_node(next_node_id, o=np.array([pt[1], pt[0]], dtype=np.float64))
             next_node_id += 1
-        return node_coords_to_id[key]
+            return 0
+            
+        # Find nearest
+        existing_pts = np.array(list(node_coords_to_id.values()))
+        dists = np.linalg.norm(existing_pts - pt, axis=1)
+        best_idx = np.argmin(dists)
+        if dists[best_idx] <= grid_tolerance:
+            return list(node_coords_to_id.keys())[best_idx]
+            
+        node_coords_to_id[next_node_id] = pt
+        graph.add_node(next_node_id, o=np.array([pt[1], pt[0]], dtype=np.float64))
+        ret_id = next_node_id
+        next_node_id += 1
+        return ret_id
 
     for cl_multi in centerlines:
         for line in cl_multi.geoms:
@@ -223,15 +239,17 @@ def fit_from_image_geometric(
     follow_junction_continuation: bool = True,
     junction_min_alignment: float = -0.15,
     spur_threshold: float = 12.0,
-    simplification_tolerance: float = 1.0,
+    simplification_tolerance: float = 0.5,
 ) -> Tuple[List[BezierPath], Dict[int, set]]:
     """End-to-end geometric extraction: raster -> boundary -> voronoi -> bezier."""
     polygons = _extract_vector_boundaries(image_path, image_height=image_height, min_area=min_area)
     
-    centerlines = _compute_voronoi_centerlines(polygons, densify_factor=-1.0, min_branch_factor=0.0)
+    # Compute a safe densify factor so large images don't freeze PyGeoOps
+    densify_factor = max(3.0, image_height * 0.0025)
+    centerlines = _compute_voronoi_centerlines(polygons, densify_factor=densify_factor, min_branch_factor=0.0)
 
     # Reconstruct the graph to maintain continuous strokes through junctions
-    graph = _multilinestring_to_sknw_graph(centerlines)
+    graph = _multilinestring_to_sknw_graph(centerlines, image_height=image_height)
     
     # Prune topological spurs to prevent path fragmentation
     _prune_skeleton_spurs(graph, threshold_length=spur_threshold)
@@ -252,37 +270,34 @@ def fit_from_image_geometric(
 
         # Downsample extremely dense Voronoi points to prevent deep recursion/hangs
         if len(pts) > 10 and simplification_tolerance > 0.0:
-            ls = LineString(pts).simplify(simplification_tolerance)
-            pts = np.array(ls.coords)
-
-        # Split at sharp corners to prevent rounding artifacts
-        sub_segments = _split_at_corners(pts, threshold_deg=75.0)
+            ls = LineString(pts).simplify(simplification_tolerance, preserve_topology=True)
+            if ls.is_simple:
+                pts = np.array(ls.coords)
         
-        for sub_pts in sub_segments:
-            if len(sub_pts) < 2:
-                continue
-                
-            left_tangent = _estimate_tangent(sub_pts, "start", lookahead=lookahead)
-            right_tangent = _estimate_tangent(sub_pts, "end", lookahead=lookahead)
-            cps_list = _fit_cubic_single(
-                sub_pts,
-                left_tangent,
-                right_tangent,
-                max_error ** 2,
-                straightness_scale=straightness_scale,
-            )
+        if len(pts) < 2:
+            continue
+            
+        left_tangent = _estimate_tangent(pts, "start", lookahead=lookahead)
+        right_tangent = _estimate_tangent(pts, "end", lookahead=lookahead)
+        cps_list = _fit_cubic_single(
+            pts,
+            left_tangent,
+            right_tangent,
+            max_error ** 2,
+            straightness_scale=straightness_scale,
+        )
 
-            segments = [BezierSegment(cps, source_type="geometric_centerline") for cps in cps_list]
-            if not segments:
-                continue
+        segments = [BezierSegment(cps, source_type="geometric_centerline") for cps in cps_list]
+        if not segments:
+            continue
 
-            paths.append(
-                BezierPath(
-                    segments=segments,
-                    is_closed=False if len(sub_segments) > 1 else chain.is_closed,
-                    source_type="geometric_centerline",
-                )
+        paths.append(
+            BezierPath(
+                segments=segments,
+                is_closed=chain.is_closed,
+                source_type="geometric_centerline",
             )
+        )
 
     merged_paths = _merge_connected_paths(paths, merge_radius=merge_radius)
 
