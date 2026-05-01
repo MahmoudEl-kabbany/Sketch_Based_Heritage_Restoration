@@ -134,18 +134,11 @@ def _build_intersection_bridge_linear(
     # Segment A → I
     p0 = ep_a.position.copy()
     p3 = I
-    chord_vec = p3 - p0
-    chord = float(np.linalg.norm(chord_vec))
+    chord = float(np.linalg.norm(p3 - p0))
     if chord > 1e-6:
-        chord_dir = chord_vec / chord
-        tang_a = ep_a.tangent
-        # Snap tangent to chord if nearly aligned (within ~11 deg)
-        if np.dot(tang_a, chord_dir) > 0.98:
-            tang_a = chord_dir
-            
         alpha = chord / 3.0
-        p1 = p0 + alpha * tang_a
-        p2 = p3 - alpha * chord_dir
+        p1 = p0 + alpha * ep_a.tangent
+        p2 = p3 - alpha * _safe_normalize(p3 - p0)
         cp = np.vstack([p0, p1, p2, p3])
         cp = _stabilize_bridge_control_points(cp)
         segments.append(BezierSegment(
@@ -156,21 +149,12 @@ def _build_intersection_bridge_linear(
     # Segment I → B
     p0 = I
     p3 = ep_b.position.copy()
-    chord_vec = p3 - p0
-    chord = float(np.linalg.norm(chord_vec))
+    chord = float(np.linalg.norm(p3 - p0))
     if chord > 1e-6:
-        chord_dir = chord_vec / chord
-        tang_b = ep_b.tangent
-        # ep_b.tangent is outward; we compare -tang_b with chord_dir
-        if np.dot(-tang_b, chord_dir) > 0.98:
-            tang_b = -chord_dir
-        else:
-            tang_b = ep_b.tangent
-            
         alpha = chord / 3.0
-        p1 = p0 + alpha * chord_dir
-        # incoming derivative at p3 should align with -tang_b.
-        p2 = p3 + alpha * tang_b
+        p1 = p0 + alpha * _safe_normalize(p3 - p0)
+        # ep_b.tangent is outward; incoming derivative at p3 should align with -ep_b.tangent.
+        p2 = p3 + alpha * ep_b.tangent
         cp = np.vstack([p0, p1, p2, p3])
         cp = _stabilize_bridge_control_points(cp)
         segments.append(BezierSegment(
