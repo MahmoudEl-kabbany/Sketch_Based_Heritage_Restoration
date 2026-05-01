@@ -696,7 +696,7 @@ def _build_report(
 def restore(
     image_path: str,
     lookahead_fraction: float = 0.15,
-    max_candidates_per_endpoint: int = 5,
+    max_candidates_per_endpoint: int = 12,
     efd_gap_threshold: float = 0.30,
     efd_validity_check_enabled: bool = True,
     efd_plausibility_threshold: float = 0.50,

@@ -96,12 +96,18 @@ def _passes_direction_gates(
         max_misalignment = 120.0
     elif tier == 1:
         min_forward = 0.05
-        min_bilateral = 0.02
+        min_bilateral = 0.20
         max_misalignment = 90.0
+        if misalignment_deg < 25.0:
+            min_forward = -0.80
+            min_bilateral = -0.80
     else:
         min_forward = 0.15
-        min_bilateral = 0.10
+        min_bilateral = 0.25
         max_misalignment = 72.0
+        if misalignment_deg < 25.0:
+            min_forward = -0.80
+            min_bilateral = -0.80
 
     if forward_a < min_forward or forward_b < min_forward:
         return False
@@ -654,7 +660,7 @@ def _sample_bridge(segments: List[BezierSegment], n: int = 50) -> np.ndarray:
 def generate_candidates(
     result: ExtractionResult,
     lookahead_fraction: float = 0.15,
-    max_per_endpoint: int = 5,
+    max_per_endpoint: int = 12,
     self_closure_gap_ratio: float = 0.22,
     diagnostics: Optional[Dict[str, Any]] = None,
 ) -> List[ConnectionCandidate]:

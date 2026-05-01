@@ -437,8 +437,8 @@ def _evaluate_closure_validity(
         effective_threshold = min(effective_threshold, 0.24)
 
     # Symmetry can rescue a borderline case, but not highly implausible tangent geometry.
-    if has_symmetry and bilateral >= 0.05 and misalignment <= 132.0:
-        if score >= max(0.35, effective_threshold * 0.70):
+    if has_symmetry and bilateral >= 0.20 and misalignment <= 110.0:
+        if score >= max(0.45, effective_threshold * 0.80):
             return True, "symmetry_supported"
 
     if score >= effective_threshold:

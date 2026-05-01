@@ -254,13 +254,16 @@ def _synthesize_single(candidate: ConnectionCandidate) -> List[BezierSegment]:
         if chord > 1e-6:
             midpoint = (ep_a.position + ep_b.position) / 2.0
             dist_to_mid = float(np.linalg.norm(intersection - midpoint))
-            if dist_to_mid < 0.15 * chord:
+            # Force smooth bridges for highly curved endpoints or distant intersections
+            if dist_to_mid < 0.45 * chord or (ep_a.curvature >= 0.005 and ep_b.curvature >= 0.005):
                 return [_build_g1_bridge(ep_a, ep_b)]
 
-        if _is_straight(ep_a.curvature, ep_b.curvature,
-                        ep_a.tangent, ep_b.tangent):
+        # If both paths are straight lines, they must form a sharp corner regardless of their intersection angle
+        if ep_a.curvature < 0.008 and ep_b.curvature < 0.008:
             return _build_intersection_bridge_linear(ep_a, ep_b, intersection)
-        return _build_intersection_bridge_curved(ep_a, ep_b, intersection)
+        
+        # Default to a smooth G1 bridge for all organic curves
+        return [_build_g1_bridge(ep_a, ep_b)]
 
     # Fallback
     return [_build_g1_bridge(ep_a, ep_b)]
