@@ -112,9 +112,9 @@ def _dedupe_polyline(points: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     return points[keep]
 
 
-def _strip_sway_prefix(points: np.ndarray, end: str, max_strip_fraction: float = 0.15) -> np.ndarray:
-    """Walk inward from the endpoint and drop high-curvature sway segments."""
-    if len(points) < 10:
+def _strip_sway_prefix(points: np.ndarray, end: str, max_strip_fraction: float = 0.20) -> np.ndarray:
+    """Walk inward from the endpoint and drop high-curvature sway segments (hooks)."""
+    if len(points) < 8:
         return points
 
     n_strip_max = int(round(len(points) * max_strip_fraction))
@@ -124,34 +124,42 @@ def _strip_sway_prefix(points: np.ndarray, end: str, max_strip_fraction: float =
     diffs = np.diff(points, axis=0)
     strip_count = 0
     
+    # Track the "average" angle change to detect outliers (sway)
+    angles = []
+    
     if end == "start":
+        for i in range(min(len(diffs) - 1, n_strip_max + 10)):
+            a, b = diffs[i], diffs[i+1]
+            na, nb = np.linalg.norm(a), np.linalg.norm(b)
+            if na > 1e-12 and nb > 1e-12:
+                dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
+                angles.append(float(np.degrees(np.arccos(dot))))
+        
+        avg_angle = np.mean(angles) if angles else 0.0
+        
         for i in range(n_strip_max):
-            a = diffs[i]
-            b = diffs[i + 1]
-            na = np.linalg.norm(a)
-            nb = np.linalg.norm(b)
-            if na < 1e-12 or nb < 1e-12:
-                continue
-            dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
-            angle = float(np.degrees(np.arccos(dot)))
-            if angle > 25.0:
+            if i >= len(angles): break
+            # Sway is a sharp turn (>25 deg) OR a turn much sharper than the average trend
+            if angles[i] > 25.0 or (angles[i] > 12.0 and angles[i] > 2.5 * avg_angle):
                 strip_count = i + 1
             elif i > strip_count + 1:
                 break
         if strip_count > 0:
             return points[strip_count:]
     else:
-        for i in range(n_strip_max):
+        for i in range(min(len(diffs) - 1, n_strip_max + 10)):
             idx = len(diffs) - 1 - i
-            a = diffs[idx - 1]
-            b = diffs[idx]
-            na = np.linalg.norm(a)
-            nb = np.linalg.norm(b)
-            if na < 1e-12 or nb < 1e-12:
-                continue
-            dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
-            angle = float(np.degrees(np.arccos(dot)))
-            if angle > 25.0:
+            a, b = diffs[idx - 1], diffs[idx]
+            na, nb = np.linalg.norm(a), np.linalg.norm(b)
+            if na > 1e-12 and nb > 1e-12:
+                dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
+                angles.append(float(np.degrees(np.arccos(dot))))
+        
+        avg_angle = np.mean(angles) if angles else 0.0
+        
+        for i in range(n_strip_max):
+            if i >= len(angles): break
+            if angles[i] > 25.0 or (angles[i] > 12.0 and angles[i] > 2.5 * avg_angle):
                 strip_count = i + 1
             elif i > strip_count + 1:
                 break
@@ -159,6 +167,69 @@ def _strip_sway_prefix(points: np.ndarray, end: str, max_strip_fraction: float =
             return points[:-strip_count]
 
     return points
+
+
+def _point_curvature(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
+    """Menger curvature of three points."""
+    a = np.linalg.norm(p2 - p1)
+    b = np.linalg.norm(p3 - p2)
+    c = np.linalg.norm(p3 - p1)
+    if a < 1e-6 or b < 1e-6 or c < 1e-6:
+        return 0.0
+    # Area via cross product
+    area = 0.5 * abs((p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0]))
+    return float(4.0 * area / (a * b * c + 1e-12))
+
+
+def _estimate_path_curvature(points: np.ndarray, end: str, window_px: float = 40.0) -> float:
+    """Estimate average curvature by measuring total angle change over a spatial window."""
+    if len(points) < 5:
+        return 0.0
+    
+    # Measure total arc length to define the window
+    diffs = np.diff(points, axis=0)
+    dists = np.linalg.norm(diffs, axis=1)
+    
+    if end == "start":
+        accum = 0.0
+        indices = [0]
+        for i, d in enumerate(dists):
+            accum += d
+            indices.append(i + 1)
+            if accum >= window_px:
+                break
+        window = points[indices]
+    else:
+        accum = 0.0
+        indices = [len(points) - 1]
+        for i in range(len(dists)-1, -1, -1):
+            accum += dists[i]
+            indices.append(i)
+            if accum >= window_px:
+                break
+        window = points[indices[::-1]]
+    
+    if len(window) < 3 or accum < 1.0:
+        return 0.0
+    
+    # Calculate local tangents
+    w_diffs = np.diff(window, axis=0)
+    w_dists = np.linalg.norm(w_diffs, axis=1)
+    tangents = []
+    for i in range(len(w_diffs)):
+        if w_dists[i] > 1e-6:
+            tangents.append(w_diffs[i] / w_dists[i])
+    
+    if len(tangents) < 2:
+        return 0.0
+    
+    total_angle = 0.0
+    for i in range(len(tangents) - 1):
+        dot = float(np.clip(np.dot(tangents[i], tangents[i+1]), -1.0, 1.0))
+        total_angle += abs(float(np.arccos(dot)))
+    
+    # Curvature κ = dθ / ds
+    return float(total_angle / accum)
 
 
 def _multiscale_context_tangent(
@@ -202,7 +273,7 @@ def _multiscale_context_tangent(
         
     norm = np.linalg.norm(mean_dir)
     if norm < 1e-12:
-        return outward_ref, 0.0
+        return outward_ref, 0.0, 0.0
         
     final_tangent = mean_dir / norm
     R = norm / sum(weights) if sum(weights) > 0 else 0.0
@@ -218,8 +289,8 @@ def _estimate_endpoint_context_tangent(
     """Estimate endpoint tangent from local sampled context and return confidence."""
     sampled = path.sample(pts_per_segment=24)
     sampled = _dedupe_polyline(sampled)
-    # Sway stripping removed to avoid tangent misalignments
-    # sampled = _strip_sway_prefix(sampled, end)
+    # Sway stripping re-enabled to clean up endpoint tangents
+    sampled = _strip_sway_prefix(sampled, end)
     
     if len(sampled) < 3:
         return np.array([1.0, 0.0], dtype=np.float64), 0.0
@@ -227,9 +298,23 @@ def _estimate_endpoint_context_tangent(
     if end == "start":
         path_dir = sampled[min(2, len(sampled)-1)] - sampled[0]
         outward_ref = _safe_normalize(-path_dir)
+        # Hook detection: compare tip direction to stable direction
+        n = len(sampled)
+        if n >= 15:
+            stable_vec = sampled[int(0.25*n)] - sampled[int(0.45*n)] # Outward
+            stable_dir = _safe_normalize(stable_vec)
+            # If tip is hooked (>15 deg), use stable dir
+            if np.dot(outward_ref, stable_dir) < 0.96:
+                outward_ref = stable_dir
     else:
         path_dir = sampled[-1] - sampled[max(0, len(sampled)-3)]
         outward_ref = _safe_normalize(path_dir)
+        n = len(sampled)
+        if n >= 15:
+            stable_vec = sampled[int(0.75*n)] - sampled[int(0.55*n)] # Outward
+            stable_dir = _safe_normalize(-stable_vec) # Flip to outward
+            if np.dot(outward_ref, stable_dir) < 0.96:
+                outward_ref = stable_dir
 
     return _multiscale_context_tangent(sampled, end, outward_ref)
 
@@ -269,13 +354,26 @@ def _compute_endpoint_tangent(path: BezierPath, end: str) -> Tuple[np.ndarray, f
 
 
 def _compute_endpoint_curvature(path: BezierPath, end: str) -> float:
-    """Unsigned curvature at the given end of the path."""
+    """Robust unsigned curvature near the given end of the path.
+    
+    Blends segment-based curvature with point-based path curvature.
+    """
     if end == "start":
         cp = path.segments[0].control_points
-        return _curvature_at(cp, 0.0)
+        base_curv = _curvature_at(cp, 0.0)
     else:
         cp = path.segments[-1].control_points
-        return _curvature_at(cp, 1.0)
+        base_curv = _curvature_at(cp, 1.0)
+    
+    sampled = path.sample(pts_per_segment=24)
+    sampled = _dedupe_polyline(sampled)
+    path_curv = _estimate_path_curvature(sampled, end)
+    
+    # If the segment is suspiciously flat (common in piecewise linear fits),
+    # trust the point-based path curvature more.
+    if base_curv < 0.001:
+        return float(max(base_curv, path_curv))
+    return float(0.4 * base_curv + 0.6 * path_curv)
 
 
 def _extract_endpoints(paths: List[BezierPath]) -> List[EndpointInfo]:
@@ -286,11 +384,21 @@ def _extract_endpoints(paths: List[BezierPath]) -> List[EndpointInfo]:
         if path.is_closed or not path.segments:
             continue
         for end in ("start", "end"):
-            pos = (
-                path.segments[0].control_points[0]
-                if end == "start"
-                else path.segments[-1].control_points[3]
-            )
+            # Sample and strip sway to find the 'true' endpoint
+            sampled = path.sample(pts_per_segment=24)
+            sampled = _dedupe_polyline(sampled)
+            stripped = _strip_sway_prefix(sampled, end)
+            
+            # If sway was stripped, use the new first/last point as position
+            if len(stripped) < len(sampled):
+                pos = stripped[0] if end == "start" else stripped[-1]
+            else:
+                pos = (
+                    path.segments[0].control_points[0]
+                    if end == "start"
+                    else path.segments[-1].control_points[3]
+                )
+                
             tangent, tangent_confidence = _compute_endpoint_tangent(path, end)
             endpoints.append(EndpointInfo(
                 endpoint_id=next_endpoint_id,
