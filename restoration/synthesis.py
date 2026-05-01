@@ -247,6 +247,12 @@ def _synthesize_single(candidate: ConnectionCandidate) -> List[BezierSegment]:
         ):
             return _build_intersection_bridge_linear(ep_a, ep_b, intersection)
 
+        # --- FIX APPLIED HERE ---
+        # If both paths are straight lines, they must form a sharp corner regardless of their intersection angle.
+        # This check must happen BEFORE the dist_to_mid kink check to prevent curved fallbacks on straight lines.
+        if ep_a.curvature < 0.008 and ep_b.curvature < 0.008:
+            return _build_intersection_bridge_linear(ep_a, ep_b, intersection)
+
         # If the intersection point is very close to the chord midpoint,
         # a 2-segment bridge through it would create an unnecessary kink.
         # Fall back to a smooth single-segment G1 bridge instead.
@@ -258,14 +264,7 @@ def _synthesize_single(candidate: ConnectionCandidate) -> List[BezierSegment]:
             if dist_to_mid < 0.45 * chord or (ep_a.curvature >= 0.005 and ep_b.curvature >= 0.005):
                 return [_build_g1_bridge(ep_a, ep_b)]
 
-        # If both paths are straight lines, they must form a sharp corner regardless of their intersection angle
-        if ep_a.curvature < 0.008 and ep_b.curvature < 0.008:
-            return _build_intersection_bridge_linear(ep_a, ep_b, intersection)
-        
-        # Default to a smooth G1 bridge for all organic curves
-        return [_build_g1_bridge(ep_a, ep_b)]
-
-    # Fallback
+    # Default to a smooth G1 bridge for all organic curves
     return [_build_g1_bridge(ep_a, ep_b)]
 
 
