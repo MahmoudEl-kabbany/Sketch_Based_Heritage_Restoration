@@ -660,7 +660,7 @@ def _sample_bridge(segments: List[BezierSegment], n: int = 50) -> np.ndarray:
 def generate_candidates(
     result: ExtractionResult,
     lookahead_fraction: float = 0.15,
-    max_per_endpoint: int = 12,
+    max_per_endpoint: int = 5,
     self_closure_gap_ratio: float = 0.22,
     diagnostics: Optional[Dict[str, Any]] = None,
 ) -> List[ConnectionCandidate]:

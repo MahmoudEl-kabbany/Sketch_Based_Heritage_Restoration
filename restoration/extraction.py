@@ -374,6 +374,15 @@ def extract_paths(
         merge_radius=merge_radius,
     )
 
+    # Ensure visual discovery order (top-down, left-right)
+    def path_sort_key(p: BezierPath):
+        pts = p.sample(5)
+        min_y = np.min(pts[:, 1])
+        min_x = np.min(pts[:, 0])
+        return (round(min_y / 12.0), min_x)
+    
+    paths.sort(key=path_sort_key)
+
     # Endpoint extraction
     endpoints = _extract_endpoints(paths)
 

@@ -58,12 +58,7 @@ def _sanitize_accepted_candidates(
     if not accepted:
         return [], 0
 
-    def grid_sort_key(c: ConnectionCandidate) -> Tuple[float, float]:
-        y = min(c.ep_a.position[1], c.ep_b.position[1])
-        x = min(c.ep_a.position[0], c.ep_b.position[0])
-        return (round(y / 15.0), x)
-
-    ordered = sorted(accepted, key=grid_sort_key)
+    ordered = sorted(accepted, key=lambda c: (-c.score, c.distance, c.id))
     used_tokens: Set[Tuple[str, int]] = set()
     sanitized: List[ConnectionCandidate] = []
     dropped = 0
@@ -696,7 +691,7 @@ def _build_report(
 def restore(
     image_path: str,
     lookahead_fraction: float = 0.15,
-    max_candidates_per_endpoint: int = 12,
+    max_candidates_per_endpoint: int = 5,
     efd_gap_threshold: float = 0.30,
     efd_validity_check_enabled: bool = True,
     efd_plausibility_threshold: float = 0.50,
@@ -829,6 +824,15 @@ def restore(
 
     # Phase 7: Output
     t_phase = time.perf_counter()
+
+    # Ensure visual order for labeling (top-down, left-right)
+    def final_path_sort_key(p: BezierPath):
+        pts = p.sample(5)
+        min_y = np.min(pts[:, 1])
+        min_x = np.min(pts[:, 0])
+        return (round(min_y / 12.0), min_x)
+    
+    final_paths.sort(key=final_path_sort_key)
 
     # Labeled overlay visualization + logs
     _, change_logs = _save_labeled_restoration(
