@@ -119,12 +119,15 @@ def _chord_length_parameterize(points: np.ndarray) -> np.ndarray:
     return cumlen / total
 
 
-def _estimate_tangent(points: np.ndarray, end: str, lookahead: int = 10) -> np.ndarray:
+def _estimate_tangent(points: np.ndarray, end: str, lookahead: int = 10, skip_tip: int = 2) -> np.ndarray:
     """Estimate a robust unit tangent at the start or end of a point sequence.
 
     Uses exponential distance weighting so nearer samples contribute more,
     while the wider window (default 10) provides stability against pixel-level
     jaggedness and junction artifacts.
+    
+    The skip_tip parameter allows ignoring the extreme terminal pixels to avoid
+    directional bias from noisy endpoints.
     """
     if len(points) < 2:
         return np.array([1.0, 0.0])
@@ -132,9 +135,9 @@ def _estimate_tangent(points: np.ndarray, end: str, lookahead: int = 10) -> np.n
     window = max(1, min(int(lookahead), len(points) - 1))
 
     if end == "start":
-        local_points = points[: window + 1]
+        local_points = points[skip_tip : skip_tip + window + 1] if len(points) > skip_tip + 1 else points[: window + 1]
     else:
-        local_points = points[-(window + 1):]
+        local_points = points[-(skip_tip + window + 1) : -skip_tip] if len(points) > skip_tip + 1 else points[-(window + 1):]
 
     vectors = np.diff(local_points, axis=0)
     if end != "start":
@@ -1131,7 +1134,7 @@ def fit_from_image_skeleton(
     merge_radius: float = 5.0,
     follow_junction_continuation: bool = True,
     junction_min_alignment: float = -0.15,
-    spur_threshold: float = 12.0,
+    spur_threshold: float = 25.0,
 ) -> Tuple[List[BezierPath], Dict[int, set]]:
     """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths."""
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
@@ -1139,6 +1142,7 @@ def fit_from_image_skeleton(
         raise FileNotFoundError(f"Cannot read image: {image_path}")
 
     _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    binary = cv2.medianBlur(binary, 5)
     skeleton = skeletonize(binary / 255.0).astype(np.uint8)
     graph = sknw.build_sknw(skeleton)
 
@@ -1154,6 +1158,12 @@ def fit_from_image_skeleton(
     lookahead = max(1, int(tangent_lookahead))
     for chain in chains:
         pts = chain.points
+        
+        # Trim terminal hooks from open paths (3 pixels from each end)
+        trim_len = 3
+        if not chain.is_closed and len(pts) > (trim_len * 2) + 2:
+            pts = pts[trim_len:-trim_len]
+
         if len(pts) < 2:
             continue
 
@@ -1521,7 +1531,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--spur-threshold",
         type=float,
-        default=8.0,
+        default=25.0,
         help="Maximum length of branches to prune",
     )
     parser.set_defaults(skeleton=True)
