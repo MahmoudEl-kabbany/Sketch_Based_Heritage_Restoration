@@ -3,8 +3,8 @@ import os
 from restoration.pipeline import restore_batch
 
 images = [
-    os.path.join("test_images/damaged_sketches", f)
-    for f in sorted(os.listdir("test_images/damaged_sketches"))
+    os.path.join("test_images/difficult_test_cases", f)
+    for f in sorted(os.listdir("test_images/difficult_test_cases"))
     if f.endswith(".png")
 ]
 
