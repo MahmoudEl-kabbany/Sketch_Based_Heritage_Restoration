@@ -34,7 +34,7 @@ _CONTOUR_RETRIEVAL_MODES = {
 # EFD core helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def reconstruct_contour_efd(contour, order=10, num_points=300):
+def reconstruct_contour_efd(contour, order=40, num_points=300):
     """
     Compute EFD for a contour (Nx2 array) and reconstruct it.
 
@@ -58,7 +58,7 @@ def reconstruct_contour_efd(contour, order=10, num_points=300):
     return reconstructed, coeffs
 
 
-def compute_efd_features(contour, order=10):
+def compute_efd_features(contour, order=40):
     """
     Compute a flat, normalized EFD feature vector (rotation/size-invariant).
 
@@ -262,7 +262,7 @@ def _process_contours(significant, total_count, order, colors):
 
 def process_image(
     image_path,
-    order=10,
+    order=40,
     min_contour_area=100,
     use_skeleton=True,
     contour_retrieval="tree",
@@ -290,7 +290,7 @@ def process_image(
 
 def extract_efd_from_image(
     image_path,
-    order=10,
+    order=40,
     min_contour_area=100,
     use_skeleton=True,
     contour_retrieval="tree",
@@ -328,7 +328,7 @@ def extract_efd_from_image(
 
 def visualize_efd(
     image_path,
-    order=10,
+    order=40,
     save_path=None,
     min_contour_area=100,
     use_skeleton=True,

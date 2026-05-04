@@ -312,7 +312,7 @@ def _extract_endpoints(paths: List[BezierPath]) -> List[EndpointInfo]:
 def _extract_efd_contours(
     image_path: str,
     min_contour_area: float = 100.0,
-    order: int = 10,
+    order: int = 40,
 ) -> List[dict]:
     """Extract EFD coefficients for closed contours in the image."""
     import pyefd
