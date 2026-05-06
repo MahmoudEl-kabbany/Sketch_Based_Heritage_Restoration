@@ -76,6 +76,43 @@ def _sanitize_accepted_candidates(
     return sanitized, dropped
 
 
+def _bridge_crosses_image_mask(
+    bridge_points: np.ndarray,
+    dist_map: Optional[np.ndarray],
+    ep_a: Any,
+    ep_b: Any,
+    proximity_px: float = 4.0,
+    exclusion_radius: float = 12.0,
+) -> bool:
+    """Return True if the bridge passes too close to original image lines.
+
+    Ignores bridge points that are within *exclusion_radius* of either endpoint.
+    If dist_map is None, falls back to returning False.
+    """
+    if dist_map is None or len(bridge_points) < 2:
+        return False
+
+    h, w = dist_map.shape
+
+    for pt in bridge_points:
+        x, y = pt
+        if x < 0 or y < 0 or x >= w - 1 or y >= h - 1:
+            continue
+
+        dist_a = float(np.linalg.norm(pt - ep_a.position))
+        if dist_a < exclusion_radius:
+            continue
+        dist_b = float(np.linalg.norm(pt - ep_b.position))
+        if dist_b < exclusion_radius:
+            continue
+
+        iy, ix = int(round(y)), int(round(x))
+        if dist_map[iy, ix] < proximity_px:
+            return True
+
+    return False
+
+
 def _safe_unit(v: np.ndarray) -> np.ndarray:
     """Return a unit vector with robust fallback for degenerate vectors."""
     n = float(np.linalg.norm(v))
@@ -794,6 +831,23 @@ def restore(
     print(f"    {len(accepted)} connections accepted")
     if dropped_after_sanitize:
         print(f"    {dropped_after_sanitize} conflicting connection(s) dropped")
+
+    # Phase 4.5: Post-processing Image Mask Filtering
+    if hasattr(extraction, "dist_map") and extraction.dist_map is not None:
+        exclusion_radius = max(12.0, extraction.diagonal * 0.015)
+        filtered_accepted = []
+        for c in accepted:
+            crosses = _bridge_crosses_image_mask(
+                c.bridge_points, extraction.dist_map, c.ep_a, c.ep_b,
+                proximity_px=4.0, exclusion_radius=exclusion_radius
+            )
+            if not crosses:
+                filtered_accepted.append(c)
+
+        dropped_by_mask = len(accepted) - len(filtered_accepted)
+        if dropped_by_mask > 0:
+            print(f"    {dropped_by_mask} connection(s) dropped by strict image mask post-processing")
+            accepted = filtered_accepted
 
     # Phase 5: Synthesis
     print("  Phase 5: Synthesizing bridges...")

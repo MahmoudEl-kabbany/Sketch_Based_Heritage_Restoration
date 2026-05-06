@@ -56,6 +56,7 @@ class ExtractionResult:
     efd_contours: List[dict]       # per-contour EFD data
     image_shape: Tuple[int, int]   # (h, w)
     diagonal: float                # sqrt(h² + w²)
+    dist_map: Optional[np.ndarray] = None  # distance map from lines
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -389,10 +390,15 @@ def extract_paths(
     # EFD extraction
     efd_contours = _extract_efd_contours(image_path)
 
+    # Compute distance map from the original image (lines=0, background=255)
+    _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    dist_map = cv2.distanceTransform((255 - binary).astype(np.uint8), cv2.DIST_L2, 5)
+
     return ExtractionResult(
         paths=paths,
         endpoints=endpoints,
         efd_contours=efd_contours,
         image_shape=(h, w),
         diagonal=diagonal,
+        dist_map=dist_map,
     )
