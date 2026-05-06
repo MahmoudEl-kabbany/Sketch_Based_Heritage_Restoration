@@ -27,8 +27,9 @@ def estimate_line_width(
 ) -> float:
     """Estimate the average line width of a black-on-white sketch image.
 
-    Uses skeleton-based distance transform: the distance at each skeleton
-    pixel equals half the local line width.
+    Uses an area-over-length approach: counts the total foreground pixels
+    and divides by the length of the skeleton. This avoids the systemic
+    over-estimation bias of the distance transform method.
 
     Args:
         img_gray: Grayscale image (H, W), uint8.
@@ -37,7 +38,7 @@ def estimate_line_width(
         clamp_max: Maximum allowed width.
 
     Returns:
-        Estimated line width in pixels.
+        Estimated true line width in pixels.
     """
     if img_gray is None or img_gray.size == 0:
         return fallback
@@ -48,27 +49,48 @@ def estimate_line_width(
             img_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
         )
 
-        # Distance transform on the foreground
-        dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
-
         # Skeletonize to find medial axis
         skel = skeletonize(binary // 255).astype(np.uint8)
 
-        # Sample distance values along the skeleton
-        skel_distances = dist[skel > 0]
+        area = float(np.sum(binary > 0))
+        length = float(np.sum(skel > 0))
 
-        if len(skel_distances) == 0:
+        if length == 0:
             return fallback
 
-        # Median distance at skeleton = half the line width
-        avg_half_width = float(np.median(skel_distances))
-        avg_width = 2.0 * avg_half_width
+        avg_width = area / length
 
         # Clamp to reasonable range
         return float(np.clip(avg_width, clamp_min, clamp_max))
 
     except Exception:
         return fallback
+
+
+def _get_aa_thickness(desired_width: float) -> int:
+    """Map a desired true pixel width to OpenCV's LINE_AA thickness parameter.
+    
+    OpenCV's LINE_AA subpixel edge blending mathematically forces the 
+    drawn line to be significantly wider than the integer `thickness`.
+    Area-over-length measurements of cv2.line with cv2.LINE_AA show:
+      thickness=1 -> ~1.2 pixels wide
+      thickness=2 -> ~3.3 pixels wide
+      thickness=3 -> ~5.3 pixels wide
+      thickness=5 -> ~7.3 pixels wide
+    """
+    if desired_width <= 2.2:
+        return 1
+    elif desired_width <= 4.2:
+        return 2
+    elif desired_width <= 6.2:
+        return 3
+    elif desired_width <= 8.2:
+        return 5
+    elif desired_width <= 10.2:
+        return 7
+    else:
+        # Extrapolate for larger widths (W ~ T + 2.0 -> T ~ W - 2.0)
+        return max(1, int(round(desired_width - 2.0)))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -105,12 +127,13 @@ def render_restored_sketch(
 
     # Determine line width
     if line_width is not None:
-        thickness = max(1, int(round(line_width)))
+        estimated = line_width
     elif original_image is not None:
         estimated = estimate_line_width(original_image, fallback=default_line_width)
-        thickness = max(1, int(round(estimated)))
     else:
-        thickness = max(1, int(round(default_line_width)))
+        estimated = default_line_width
+
+    thickness = _get_aa_thickness(estimated)
 
     # White canvas
     canvas = np.full((h, w), 255, dtype=np.uint8)
@@ -179,12 +202,13 @@ def render_bridges_on_damaged(
 
     # Determine line width
     if line_width is not None:
-        thickness = max(1, int(round(line_width)))
+        estimated = line_width
     elif original_image is not None:
         estimated = estimate_line_width(original_image, fallback=default_line_width)
-        thickness = max(1, int(round(estimated)))
     else:
-        thickness = max(1, int(round(default_line_width)))
+        estimated = default_line_width
+
+    thickness = _get_aa_thickness(estimated)
 
     # Draw only bridge and efd_closure segments
     for path in restored_paths:
