@@ -1,13 +1,13 @@
 """
 Bezier Curve Extraction Module
 ==============================
-Contours (OpenCV Nx1x2 arrays) → corner detection → Schneider fit → cubic Bezier
+Skeleton image -> graph edges -> Schneider fit -> cubic Bezier
 
 All segments are normalized to cubic Bezier for uniformity.
 
 Output:
-  - Python objects (BezierSegment / BezierPath with control points)
-  - Visualization on blank canvas with control point overlays
+    - Python objects (BezierSegment / BezierPath with control points)
+    - Visualization on blank canvas with control point overlays
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.spatial.distance import cdist
 from skimage.morphology import skeletonize
 import sknw
 
@@ -37,7 +36,7 @@ class BezierSegment:
     """A single cubic Bezier segment (4 control points)."""
 
     control_points: np.ndarray  # shape (4, 2) — P0, P1, P2, P3
-    source_type: str = "unknown"  # "svg" | "contour"
+    source_type: str = "unknown"  # "svg" | "skeleton"
 
     @property
     def start(self) -> np.ndarray:
@@ -540,201 +539,6 @@ def _fit_cubic_single(
         line_preference_improvement=line_preference_improvement,
     )
     return left_curves + right_curves
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Contour → Bezier  (Phase 2)
-# ═══════════════════════════════════════════════════════════════════════════
-
-class ContourBezierFitter:
-    """Fit cubic Bezier curves to OpenCV contours.
-
-    Pipeline:
-      1. Reshape contour to (N, 2)
-      2. Simplify with RDP (``cv2.approxPolyDP``) to find corners
-      3. Split contour at corners
-      4. Fit each sub-segment with Schneider's algorithm
-    """
-
-    def __init__(
-        self,
-        corner_threshold: float = 2.0,
-        max_error: float = 2.0,
-        tangent_lookahead: int = 5,
-        straightness_scale: float = 0.75,
-    ):
-        self.corner_threshold = corner_threshold
-        self.max_error_sq = max_error ** 2  # Schneider uses squared error
-        self.tangent_lookahead = max(1, int(tangent_lookahead))
-        self.straightness_scale = float(straightness_scale)
-
-    def fit(self, contours: list) -> List[BezierPath]:
-        """Fit Bezier paths to a list of OpenCV contours (Nx1x2 arrays)."""
-        paths: List[BezierPath] = []
-        for contour in contours:
-            path = self._fit_single_contour(contour)
-            if path is not None:
-                paths.append(path)
-        return paths
-
-    def _fit_single_contour(self, contour: np.ndarray) -> Optional[BezierPath]:
-        points = np.squeeze(contour).astype(np.float64)
-        if points.ndim != 2 or len(points) < 2:
-            return None
-
-        # Detect if contour is closed
-        is_closed = np.allclose(points[0], points[-1], atol=1.0)
-        if is_closed and len(points) > 2:
-            points = points[:-1]  # remove duplicate closing point
-
-        # Find corner indices via RDP simplification
-        corner_indices = self._find_corners(points, is_closed)
-
-        # Split into segments at the corners and fit each
-        segments: List[BezierSegment] = []
-        n = len(corner_indices)
-
-        if n < 2:
-            # No meaningful corners — fit the entire contour as one
-            cps_list = self._fit_segment(points, is_closed)
-            for cps in cps_list:
-                segments.append(BezierSegment(cps, source_type="contour"))
-        else:
-            for i in range(n - 1):
-                start_idx = corner_indices[i]
-                end_idx = corner_indices[i + 1]
-                seg_points = points[start_idx: end_idx + 1]
-                if len(seg_points) < 2:
-                    continue
-                cps_list = self._fit_segment(seg_points, closed=False)
-                for cps in cps_list:
-                    segments.append(BezierSegment(cps, source_type="contour"))
-
-            # Close the loop if needed
-            if is_closed and n >= 2:
-                start_idx = corner_indices[-1]
-                end_idx = corner_indices[0]
-                seg_points = np.vstack([points[start_idx:], points[: end_idx + 1]])
-                if len(seg_points) >= 2:
-                    cps_list = self._fit_segment(seg_points, closed=False)
-                    for cps in cps_list:
-                        segments.append(BezierSegment(cps, source_type="contour"))
-
-        if not segments:
-            return None
-        return BezierPath(segments, is_closed=is_closed, source_type="contour")
-
-    def _find_corners(self, points: np.ndarray, is_closed: bool) -> List[int]:
-        """Use RDP to find corner indices in the contour."""
-        # approxPolyDP needs (N, 1, 2)
-        contour_cv = points.reshape(-1, 1, 2).astype(np.float32)
-        approx = cv2.approxPolyDP(contour_cv, self.corner_threshold, is_closed)
-        approx_pts = np.squeeze(approx).astype(np.float64)
-        if approx_pts.ndim == 1:
-            approx_pts = approx_pts.reshape(1, -1)
-
-        # Compute all distances at once using cdist
-        D = cdist(approx_pts, points, metric='euclidean')  # shape (K, N)
-        corner_indices = list(np.argmin(D, axis=1))  # shape (K,)
-
-        # Sort and deduplicate
-        corner_indices = sorted(set(corner_indices))
-        return corner_indices
-
-    def _fit_segment(
-        self, points: np.ndarray, closed: bool = False
-    ) -> List[np.ndarray]:
-        """Fit cubic Beziers to *points* using Schneider's method."""
-        if len(points) < 2:
-            return []
-
-        left_tangent = _estimate_tangent(points, "start", lookahead=self.tangent_lookahead)
-        right_tangent = _estimate_tangent(points, "end", lookahead=self.tangent_lookahead)
-
-        if closed and len(points) > 2:
-            # For closed segments make tangents consistent at junction
-            wrap_tangent = points[1] - points[-2]
-            norm = np.linalg.norm(wrap_tangent)
-            if norm > 1e-12:
-                wrap_tangent = wrap_tangent / norm
-                left_tangent = wrap_tangent
-                right_tangent = -wrap_tangent
-
-        return _fit_cubic_single(
-            points,
-            left_tangent,
-            right_tangent,
-            self.max_error_sq,
-            straightness_scale=self.straightness_scale,
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Raster image → contour extraction  (mirrors efd.py approach)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _extract_raster_contours(
-    image_path: str, min_contour_area: float = 100.0
-) -> Tuple[list, Optional[np.ndarray]]:
-    """Load a raster image, binarize, and return OpenCV contours."""
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise FileNotFoundError(f"Cannot read image: {image_path}")
-
-    denoised = cv2.fastNlMeansDenoising(img, h=10, templateWindowSize=7, searchWindowSize=21)
-    binary = cv2.adaptiveThreshold(
-        denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 11, 2,
-    )
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-    contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_TC89_KCOS)
-
-    # Filter by area
-    contours = [c for c in contours if cv2.contourArea(c) >= min_contour_area]
-    return contours, img
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Convenience API
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def fit_from_contours(
-    contours: list,
-    corner_threshold: float = 2.0,
-    max_error: float = 2.0,
-    tangent_lookahead: int = 5,
-    straightness_scale: float = 0.75,
-) -> List[BezierPath]:
-    """Fit cubic Bezier paths to a list of OpenCV contours."""
-    fitter = ContourBezierFitter(
-        corner_threshold=corner_threshold,
-        max_error=max_error,
-        tangent_lookahead=tangent_lookahead,
-        straightness_scale=straightness_scale,
-    )
-    return fitter.fit(contours)
-
-
-def fit_from_image(
-    image_path: str,
-    min_contour_area: float = 100.0,
-    corner_threshold: float = 2.0,
-    max_error: float = 2.0,
-    tangent_lookahead: int = 5,
-    straightness_scale: float = 0.75,
-) -> List[BezierPath]:
-    """End-to-end: raster image → contours → fitted cubic Bezier paths."""
-    contours, _ = _extract_raster_contours(image_path, min_contour_area)
-    return fit_from_contours(
-        contours,
-        corner_threshold,
-        max_error,
-        tangent_lookahead,
-        straightness_scale,
-    )
 
 
 @dataclass
@@ -1306,7 +1110,7 @@ def _visualize_paths_single_panel(
         ax.set_ylim(y_min - padding_y, y_max + padding_y)
 
     # Matplotlib uses Cartesian y-up; image-derived data is y-down.
-    if paths and paths[0].source_type in {"contour", "skeleton"}:
+    if paths and paths[0].source_type in {"skeleton"}:
         ax.invert_yaxis()
 
     plt.tight_layout()
@@ -1495,15 +1299,10 @@ def _print_summary(paths: List[BezierPath], label: str) -> None:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Fit cubic Bezier curves from raster plans.")
-    parser.add_argument("image_path", help="Path to input image")
-    parser.add_argument("--no-skeleton", action="store_false", dest="skeleton", help="Disable skeleton-based fitting")
-    parser.add_argument(
-        "--min-area",
-        type=float,
-        default=100.0,
-        help="Minimum contour area for contour extraction",
+    parser = argparse.ArgumentParser(
+        description="Fit cubic Bezier curves from raster images using skeleton fitting."
     )
+    parser.add_argument("image_path", help="Path to input image")
     parser.add_argument(
         "--tangent-lookahead",
         type=int,
@@ -1534,28 +1333,17 @@ if __name__ == "__main__":
         default=25.0,
         help="Maximum length of branches to prune",
     )
-    parser.set_defaults(skeleton=True)
     args = parser.parse_args()
 
-    if args.skeleton:
-        paths, _adjacency = fit_from_image_skeleton(
-            args.image_path,
-            max_error=args.max_error,
-            tangent_lookahead=args.tangent_lookahead,
-            straightness_scale=args.straightness_scale,
-            merge_radius=args.merge_radius,
-            spur_threshold=args.spur_threshold,
-        )
-        label = f"Skeleton fitting: {args.image_path}"
-    else:
-        paths = fit_from_image(
-            args.image_path,
-            min_contour_area=args.min_area,
-            max_error=args.max_error,
-            tangent_lookahead=args.tangent_lookahead,
-            straightness_scale=args.straightness_scale,
-        )
-        label = f"Contour fitting: {args.image_path}"
+    paths, _adjacency = fit_from_image_skeleton(
+        args.image_path,
+        max_error=args.max_error,
+        tangent_lookahead=args.tangent_lookahead,
+        straightness_scale=args.straightness_scale,
+        merge_radius=args.merge_radius,
+        spur_threshold=args.spur_threshold,
+    )
+    label = f"Skeleton fitting: {args.image_path}"
 
     _print_summary(paths, label)
 

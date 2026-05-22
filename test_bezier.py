@@ -1,11 +1,10 @@
 """Bezier curve extraction and visualization.
 
-Main function: process_image(image_path, use_skeleton=False)
-  Returns: List[BezierPath] and saves visualization
+Main function: process_image(image_path)
+    Returns: List[BezierPath] and saves visualization
 """
 
 from bezier_curves.bezier import (
-    fit_from_image,
     fit_from_image_skeleton,
     visualize_paths,
     BezierPath,
@@ -20,8 +19,6 @@ os.makedirs(OUTPUT, exist_ok=True)
 
 def process_image(
     image_path: str,
-    use_skeleton: bool = False,
-    min_contour_area: float = 100.0,
     max_error: float = 5.0,
     follow_junction_continuation: bool = True,
     junction_min_alignment: float = -0.30,
@@ -32,8 +29,6 @@ def process_image(
 
     Args:
         image_path: Path to the input image file
-        use_skeleton: If True, use skeleton fitting; else use contour fitting
-        min_contour_area: Minimum contour area to process (contour mode only)
         max_error: Maximum fitting error threshold for Bezier approximation
         follow_junction_continuation: Continue through junction using best direction
         junction_min_alignment: Minimum dot-product alignment for junction continuation
@@ -52,21 +47,13 @@ def process_image(
         raise FileNotFoundError(f"Image file not found: {image_path}")
 
     # Extract Bezier curves
-    if use_skeleton:
-        paths, _adjacency = fit_from_image_skeleton(
-            image_path,
-            max_error=max_error,
-            follow_junction_continuation=follow_junction_continuation,
-            junction_min_alignment=junction_min_alignment,
-        )
-        mode = "skeleton"
-    else:
-        paths = fit_from_image(
-            image_path,
-            min_contour_area=min_contour_area,
-            max_error=max_error,
-        )
-        mode = "contour"
+    paths, _adjacency = fit_from_image_skeleton(
+        image_path,
+        max_error=max_error,
+        follow_junction_continuation=follow_junction_continuation,
+        junction_min_alignment=junction_min_alignment,
+    )
+    mode = "skeleton"
 
     # Print summary
     total_segs = sum(p.num_segments for p in paths)
@@ -98,7 +85,6 @@ if __name__ == "__main__":
     # Example usage
     print("Running bezier extraction tests...\n")
 
-    # Test 1: Contour mode
     test_image = "test_images/restoration_test_damaged.png"
     test_images = [
         "test_images/restoration_small_gaps.png",
@@ -109,18 +95,12 @@ if __name__ == "__main__":
         "test_images/damaged_oval.png",
         "test_images/damaged_bolt.png" 
                    ]
-    # if os.path.exists(test_image):
-    #     print("▶ Test 1: Contour mode fitting")
-    #     paths = process_image(test_image, use_skeleton=False)
-    # else:
-    #     print(f"⚠ Test image not found: {test_image}")
 
-    # Test 2: Skeleton mode
+    # Skeleton mode
     if os.path.exists(test_image):
         print("\n▶ Test 2: Skeleton mode fitting")
-        # paths = process_image(test_image, use_skeleton=True)
         for img in test_images:
             print(f"\nProcessing {img} with skeleton fitting...")
-            paths = process_image(img, use_skeleton=True)
+            paths = process_image(img)
     else:
         print(f"⚠ Test image not found for skeleton test: {test_image}")
