@@ -824,34 +824,124 @@ def _build_path_adjacency_from_chains(chains: List[_SkeletonChain]) -> Dict[int,
     return adjacency
 
 
-def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
-    """Remove short terminal branches (spurs) often created by corners."""
+def _cluster_and_collapse_junctions(graph: Any, cluster_radius: float) -> None:
+    """Collapse nodes that are close to each other into a single junction."""
+    changed = True
+    while changed:
+        changed = False
+        nodes = list(graph.nodes(data=True))
+        n_nodes = len(nodes)
+        
+        for i in range(n_nodes):
+            u, u_data = nodes[i]
+            if not graph.has_node(u): continue
+            u_pt = np.array(u_data.get('o', [0, 0]))
+            
+            for j in range(i + 1, n_nodes):
+                v, v_data = nodes[j]
+                if not graph.has_node(v): continue
+                
+                v_pt = np.array(v_data.get('o', [0, 0]))
+                dist = np.linalg.norm(u_pt - v_pt)
+                
+                if dist <= cluster_radius:
+                    v_edges = list(graph.edges(v, data=True, keys=True)) if graph.is_multigraph() else list(graph.edges(v, data=True))
+                    
+                    for edge in v_edges:
+                        target = edge[1] if edge[0] == v else edge[0]
+                        if target == u:
+                            continue
+                        
+                        data = edge[3] if graph.is_multigraph() else edge[2]
+                        pts = data.get('pts', None)
+                        
+                        if pts is not None and len(pts) > 0:
+                            pts_copy = pts.copy()
+                            d_start = np.linalg.norm(pts_copy[0] - v_pt)
+                            d_end = np.linalg.norm(pts_copy[-1] - v_pt)
+                            if d_start < d_end:
+                                pts_copy = np.vstack([u_pt, pts_copy])
+                            else:
+                                pts_copy = np.vstack([pts_copy, u_pt])
+                            data['pts'] = pts_copy
+                            
+                        if graph.is_multigraph():
+                            graph.add_edge(u, target, **data)
+                        else:
+                            graph.add_edge(u, target, **data)
+                            
+                    graph.remove_node(v)
+                    changed = True
+                    break
+            if changed:
+                break
+
+
+def _prune_graph_recursively(graph: Any, spur_threshold: float, bubble_threshold: float) -> None:
+    """Recursively remove short spurs and small bubbles (self loops/multi-edges)."""
+    is_multi = hasattr(graph, "is_multigraph") and graph.is_multigraph()
+    
     changed = True
     while changed:
         changed = False
         degrees = dict(graph.degree())
+        edges = list(graph.edges(keys=True, data=True)) if is_multi else list(graph.edges(data=True))
+        
         edges_to_remove = []
-
-        is_multi = hasattr(graph, "is_multigraph") and graph.is_multigraph()
-        edges = graph.edges(keys=True, data=True) if is_multi else graph.edges(data=True)
-
+        nodes_to_remove = []
+        
         for edge in edges:
             u, v = edge[0], edge[1]
+            data = edge[3] if is_multi else edge[2]
+            pts = data.get("pts", [])
+            length = len(pts)
+            
             deg_u, deg_v = degrees.get(u, 0), degrees.get(v, 0)
-
             if (deg_u == 1 and deg_v > 1) or (deg_v == 1 and deg_u > 1):
-                data = edge[3] if is_multi else edge[2]
-                pts = data.get("pts", [])
-
-                if len(pts) <= threshold_length:
+                if length <= spur_threshold:
                     edges_to_remove.append(edge)
-
+            
+            if u == v and length <= bubble_threshold:
+                edges_to_remove.append(edge)
+                
+            if is_multi and u != v:
+                if graph.number_of_edges(u, v) > 1:
+                    if length <= bubble_threshold:
+                        edges_to_remove.append(edge)
+                        
         for edge in edges_to_remove:
             if is_multi:
-                graph.remove_edge(edge[0], edge[1], key=edge[2])
+                if graph.has_edge(edge[0], edge[1], key=edge[2]):
+                    graph.remove_edge(edge[0], edge[1], key=edge[2])
+                    changed = True
             else:
-                graph.remove_edge(edge[0], edge[1])
-            changed = True
+                if graph.has_edge(edge[0], edge[1]):
+                    graph.remove_edge(edge[0], edge[1])
+                    changed = True
+                    
+        degrees = dict(graph.degree())
+        for node, deg in degrees.items():
+            if deg == 0:
+                nodes_to_remove.append(node)
+                
+        for node in nodes_to_remove:
+            if graph.has_node(node):
+                graph.remove_node(node)
+                changed = True
+
+
+def _smooth_pts(pts: np.ndarray, window: int = 5) -> np.ndarray:
+    """Apply a simple moving average filter to smooth jagged pixel paths."""
+    if len(pts) < window or window < 3:
+        return pts
+    kernel = np.ones(window) / window
+    pad = window // 2
+    padded_x = np.pad(pts[:, 0], (pad, pad), mode='edge')
+    padded_y = np.pad(pts[:, 1], (pad, pad), mode='edge')
+    sx = np.convolve(padded_x, kernel, mode='valid')
+    sy = np.convolve(padded_y, kernel, mode='valid')
+    return np.column_stack((sx, sy))
+
 
 
 def _merge_connected_paths(paths: List[BezierPath], merge_radius: float) -> List[BezierPath]:
@@ -946,11 +1036,22 @@ def fit_from_image_skeleton(
         raise FileNotFoundError(f"Cannot read image: {image_path}")
 
     _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Distance transform to estimate line thickness for dynamic thresholds
+    dist_map = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    mean_thickness = float(np.mean(dist_map[binary > 0])) * 2.0 if np.any(binary > 0) else 5.0
+    max_thickness = float(np.max(dist_map)) * 2.0 if np.any(dist_map > 0) else 5.0
+    
+    cluster_radius = max(3.0, mean_thickness * 1.5)
+    dynamic_spur_threshold = max(spur_threshold, max_thickness * 1.5)
+
     binary = cv2.medianBlur(binary, 5)
     skeleton = skeletonize(binary / 255.0).astype(np.uint8)
     graph = sknw.build_sknw(skeleton)
 
-    _prune_skeleton_spurs(graph, threshold_length=spur_threshold)
+    # Overhaul: Clean up the graph topology before extracting paths
+    _cluster_and_collapse_junctions(graph, cluster_radius=cluster_radius)
+    _prune_graph_recursively(graph, spur_threshold=dynamic_spur_threshold, bubble_threshold=dynamic_spur_threshold * 2.0)
 
     chains = _build_skeleton_chains(
         graph,
@@ -970,6 +1071,9 @@ def fit_from_image_skeleton(
 
         if len(pts) < 2:
             continue
+            
+        # Overhaul: Smooth the pixel path before bezier fitting
+        pts = _smooth_pts(pts, window=5)
 
         left_tangent = _estimate_tangent(pts, "start", lookahead=lookahead)
         right_tangent = _estimate_tangent(pts, "end", lookahead=lookahead)
