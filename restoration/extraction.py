@@ -219,8 +219,11 @@ def _estimate_endpoint_context_tangent(
     """Estimate endpoint tangent from local sampled context and return confidence."""
     sampled = path.sample(pts_per_segment=24)
     sampled = _dedupe_polyline(sampled)
-    # Sway stripping removed to avoid tangent misalignments
-    # sampled = _strip_sway_prefix(sampled, end)
+    # Endpoint sway is now stripped upstream in fit_from_image_skeleton, on
+    # the raw skeleton pixels before curve fitting. Stripping again here
+    # would operate on already-fitted/resampled points and can't correct
+    # control points that were already bent by sway, so it's intentionally
+    # left out at this stage.
     
     if len(sampled) < 3:
         return np.array([1.0, 0.0], dtype=np.float64), 0.0

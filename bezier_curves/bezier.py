@@ -877,8 +877,69 @@ def _cluster_and_collapse_junctions(graph: Any, cluster_radius: float) -> None:
                 break
 
 
-def _prune_graph_recursively(graph: Any, spur_threshold: float, bubble_threshold: float) -> None:
-    """Recursively remove short spurs and small bubbles (self loops/multi-edges)."""
+def _spur_branch_angle_deg(graph: Any, branch_node: int, trunk_node: int, pts: np.ndarray) -> float:
+    """Angle between a candidate spur and the trunk edges already at trunk_node.
+
+    Returns the smallest angle (degrees) between the spur's outgoing direction
+    at trunk_node and any other edge incident to trunk_node. A small angle
+    means the spur roughly continues an existing line (more likely a real,
+    deliberate short stroke); a large angle means it juts off sideways (more
+    likely a skeletonization artifact at a junction).
+    """
+    if len(pts) < 2:
+        return 0.0
+
+    is_multi = hasattr(graph, "is_multigraph") and graph.is_multigraph()
+    pts_arr = np.asarray(pts, dtype=np.float64)
+
+    d_start = np.linalg.norm(pts_arr[0] - pts_arr[-1])
+    # Orient so index 0 is at trunk_node, if we can tell from existing edges.
+    other_edges = (
+        list(graph.edges(trunk_node, keys=True, data=True))
+        if is_multi
+        else list(graph.edges(trunk_node, data=True))
+    )
+    if not other_edges:
+        return 180.0
+
+    k = min(3, len(pts_arr) - 1)
+    spur_dir = _safe_normalize_vector(pts_arr[k] - pts_arr[0])
+
+    best_angle = 180.0
+    for oe in other_edges:
+        other_data = oe[3] if is_multi else oe[2]
+        other_pts = other_data.get("pts", None)
+        if other_pts is None or len(other_pts) < 2:
+            continue
+        other_pts = np.asarray(other_pts, dtype=np.float64)
+        ok = min(3, len(other_pts) - 1)
+        # Skip comparing the spur edge against itself when pts arrays match.
+        if other_pts.shape == pts_arr.shape and np.allclose(other_pts, pts_arr):
+            continue
+        other_dir = _safe_normalize_vector(other_pts[ok] - other_pts[0])
+        dot = float(np.clip(np.dot(spur_dir, other_dir), -1.0, 1.0))
+        angle = float(np.degrees(np.arccos(dot)))
+        # An aligned continuation means the trunk edge points roughly
+        # opposite to the spur's outgoing direction (180 deg = collinear).
+        best_angle = min(best_angle, abs(180.0 - angle))
+
+    return best_angle
+
+
+def _prune_graph_recursively(
+    graph: Any,
+    spur_threshold: float,
+    bubble_threshold: float,
+    aligned_spur_angle_deg: float = 20.0,
+    aligned_spur_length_scale: float = 0.4,
+) -> None:
+    """Recursively remove short spurs and small bubbles (self loops/multi-edges).
+
+    Spurs that continue roughly in line with an existing edge at their
+    junction get a stricter (smaller) length cutoff than sharply-angled
+    spurs, since collinear short spurs are more likely real strokes
+    (serifs, tick marks, short deliberate lines) than skeletonization noise.
+    """
     is_multi = hasattr(graph, "is_multigraph") and graph.is_multigraph()
     
     changed = True
@@ -898,7 +959,15 @@ def _prune_graph_recursively(graph: Any, spur_threshold: float, bubble_threshold
             
             deg_u, deg_v = degrees.get(u, 0), degrees.get(v, 0)
             if (deg_u == 1 and deg_v > 1) or (deg_v == 1 and deg_u > 1):
-                if length <= spur_threshold:
+                trunk_node = v if deg_u == 1 else u
+                effective_threshold = spur_threshold
+                try:
+                    angle = _spur_branch_angle_deg(graph, u if deg_u == 1 else v, trunk_node, pts)
+                    if angle <= aligned_spur_angle_deg:
+                        effective_threshold = spur_threshold * aligned_spur_length_scale
+                except Exception:
+                    pass
+                if length <= effective_threshold:
                     edges_to_remove.append(edge)
             
             if u == v and length <= bubble_threshold:
@@ -928,6 +997,64 @@ def _prune_graph_recursively(graph: Any, spur_threshold: float, bubble_threshold
             if graph.has_node(node):
                 graph.remove_node(node)
                 changed = True
+
+
+def _strip_endpoint_sway(
+    pts: np.ndarray,
+    end: str,
+    max_strip_fraction: float = 0.12,
+    min_strip_pixels: int = 2,
+    angle_threshold_deg: float = 28.0,
+) -> np.ndarray:
+    """Adaptively trim a high-curvature run at one end of a raw pixel polyline.
+
+    Skeleton tips and near-junction pixels often wobble before settling into
+    the line's true direction. A fixed pixel trim either leaves wobble in
+    (thick/noisy strokes) or eats real geometry (thin clean strokes). This
+    walks inward from the endpoint while the local turning angle stays above
+    threshold, and stops as soon as it sees two consecutive calm steps, so a
+    single noisy stroke region doesn't get a blanket trim applied everywhere.
+    """
+    if len(pts) < 8:
+        return pts
+
+    n_strip_max = max(min_strip_pixels, int(round(len(pts) * max_strip_fraction)))
+    n_strip_max = min(n_strip_max, len(pts) // 3)
+    if n_strip_max < min_strip_pixels:
+        return pts
+
+    diffs = np.diff(pts, axis=0)
+    if end == "start":
+        local_diffs = diffs[: n_strip_max + 1]
+    else:
+        local_diffs = diffs[-(n_strip_max + 1):][::-1]
+
+    strip_count = 0
+    calm_streak = 0
+    for i in range(len(local_diffs) - 1):
+        a = local_diffs[i]
+        b = local_diffs[i + 1]
+        na = np.linalg.norm(a)
+        nb = np.linalg.norm(b)
+        if na < 1e-9 or nb < 1e-9:
+            continue
+        dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
+        angle = float(np.degrees(np.arccos(dot)))
+        if angle > angle_threshold_deg:
+            strip_count = i + 1
+            calm_streak = 0
+        else:
+            calm_streak += 1
+            if calm_streak >= 2:
+                break
+
+    strip_count = max(0, min(strip_count, n_strip_max))
+    if strip_count < min_strip_pixels:
+        return pts
+
+    if end == "start":
+        return pts[strip_count:]
+    return pts[:-strip_count] if strip_count > 0 else pts
 
 
 def _smooth_pts(pts: np.ndarray, window: int = 5) -> np.ndarray:
@@ -1037,13 +1164,20 @@ def fit_from_image_skeleton(
 
     _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # Distance transform to estimate line thickness for dynamic thresholds
+    # Distance transform to estimate line thickness for dynamic thresholds.
+    # Use a high percentile rather than the global max: max picks up a single
+    # thick blob/intersection anywhere in the drawing and lets it set the
+    # spur threshold for everything else, which is what was pruning short
+    # but legitimate strokes (hatching, eyelashes, small details) elsewhere
+    # in the image. A percentile is robust to that one outlier region while
+    # still scaling up correctly for genuinely thick-lined drawings.
     dist_map = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
-    mean_thickness = float(np.mean(dist_map[binary > 0])) * 2.0 if np.any(binary > 0) else 5.0
-    max_thickness = float(np.max(dist_map)) * 2.0 if np.any(dist_map > 0) else 5.0
-    
+    stroke_radii = dist_map[binary > 0]
+    mean_thickness = float(np.mean(stroke_radii)) * 2.0 if stroke_radii.size else 5.0
+    robust_thickness = float(np.percentile(stroke_radii, 90)) * 2.0 if stroke_radii.size else 5.0
+
     cluster_radius = max(3.0, mean_thickness * 1.5)
-    dynamic_spur_threshold = max(spur_threshold, max_thickness * 1.5)
+    dynamic_spur_threshold = max(spur_threshold, robust_thickness * 1.5)
 
     binary = cv2.medianBlur(binary, 5)
     skeleton = skeletonize(binary / 255.0).astype(np.uint8)
@@ -1064,10 +1198,12 @@ def fit_from_image_skeleton(
     for chain in chains:
         pts = chain.points
         
-        # Trim terminal hooks from open paths (3 pixels from each end)
-        trim_len = 3
-        if not chain.is_closed and len(pts) > (trim_len * 2) + 2:
-            pts = pts[trim_len:-trim_len]
+        # Adaptively trim sway/hooks from open path endpoints. Unlike a fixed
+        # pixel count, this only strips as much as the local curvature
+        # actually warrants at each end, independently.
+        if not chain.is_closed and len(pts) >= 8:
+            pts = _strip_endpoint_sway(pts, "start")
+            pts = _strip_endpoint_sway(pts, "end")
 
         if len(pts) < 2:
             continue
