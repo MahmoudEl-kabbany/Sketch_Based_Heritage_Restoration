@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import numpy as np
+import matplotlib.pyplot as plt
 from dtaidistance import dtw
 from scipy.spatial import cKDTree
 
@@ -250,6 +251,52 @@ Rejected Candidates & {mean_dmg_mjerk_rej/mjerk_scale:.2f} & {mean_dmg_mdtw_rej:
 \\end{{table}}
 """
     print(latex)
+    # Plotting the results as two separate subplots side-by-side
+    categories = ['Ground Truth', 'Chosen Bridges', 'Rejected Candidates']
+    mjerk_values = [mean_orig_mjerk/mjerk_scale, mean_dmg_mjerk/mjerk_scale, mean_dmg_mjerk_rej/mjerk_scale]
+    mdtw_values = [mean_orig_mdtw, mean_dmg_mdtw, mean_dmg_mdtw_rej]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5), dpi=300)
+    fig.suptitle('Bridge Metrics: Mean MDTW and Mjerk', fontsize=16, fontweight='bold', y=1.05)
+
+    # Colors: Ground Truth (grey), Chosen Bridges (green), Rejected (red/orange)
+    colors = ['#95a5a6', '#2ecc71', '#e74c3c']
+
+    # Subplot 1: MDTW
+    bars1 = ax1.bar(categories, mdtw_values, color=colors, width=0.6)
+    ax1.set_title('Mean MDTW (Lower is better)', fontsize=13)
+    ax1.set_ylim(0, max(mdtw_values) * 1.15)
+    ax1.grid(axis='y', linestyle='-', alpha=0.3)
+    ax1.set_axisbelow(True)
+    ax1.tick_params(axis='x', rotation=15)
+    
+    for bar in bars1:
+        height = bar.get_height()
+        ax1.annotate(f'{height:.2f}',
+                     xy=(bar.get_x() + bar.get_width() / 2, height),
+                     xytext=(0, 2),
+                     textcoords="offset points",
+                     ha='center', va='bottom')
+
+    # Subplot 2: Mjerk
+    bars2 = ax2.bar(categories, mjerk_values, color=colors, width=0.6)
+    ax2.set_title('Mean Mjerk (Lower is better)', fontsize=13)
+    ax2.set_ylim(0, max(mjerk_values) * 1.15)
+    ax2.grid(axis='y', linestyle='-', alpha=0.3)
+    ax2.set_axisbelow(True)
+    ax2.tick_params(axis='x', rotation=15)
+    
+    for bar in bars2:
+        height = bar.get_height()
+        ax2.annotate(f'{height:.2f}',
+                     xy=(bar.get_x() + bar.get_width() / 2, height),
+                     xytext=(0, 2),
+                     textcoords="offset points",
+                     ha='center', va='bottom')
+
+    fig.tight_layout()
+    plt.savefig('bridge_vs_original_metrics.png', dpi=300, bbox_inches='tight')
+    print("Saved evaluation graph to 'bridge_vs_original_metrics.png'")
 
 if __name__ == "__main__":
     main()
