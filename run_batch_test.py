@@ -1,10 +1,17 @@
 """Run full batch restoration on all damaged sketches."""
 import os
+import sys
 from restoration.pipeline import restore_batch
 
+dataset_dir = os.path.join("test_images", "difficult_test_cases")
+if not os.path.isdir(dataset_dir):
+    print(f"\nError: Dataset directory not found at '{dataset_dir}'.")
+    print("Please download the test dataset from the link in the README and extract it correctly.")
+    sys.exit(1)
+
 images = [
-    os.path.join("test_images/difficult_test_cases", f)
-    for f in sorted(os.listdir("test_images/difficult_test_cases"))
+    os.path.join(dataset_dir, f)
+    for f in sorted(os.listdir(dataset_dir))
     if f.endswith(".png")
 ]
 

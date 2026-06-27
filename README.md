@@ -128,7 +128,11 @@ Heritage sketches often suffer from physical deterioration. This project provide
 **Dataset Setup:** Test images are not included in the repository. Please use your own images for testing, or download the sample dataset from:
 [Google Drive Dataset](https://drive.google.com/drive/folders/1HUMwwl-PoMKwqtJaFARf6tktfA22Sm9w?usp=sharing)
 
-Once downloaded, extract the images and place them in a `test_images/` directory at the root of the project so that the default scripts run correctly.
+Once downloaded, extract the images and place them in the `test_images/` directory at the root of the project. Make sure the structure looks exactly like this:
+- `test_images/difficult_test_cases/`
+- `test_images/difficult_test_cases_original/`
+
+This structure is required for the default evaluation scripts to run correctly.
 
 place original images in test_images/difficult_test_cases_original and damaged images in test_images/difficult_test_cases
 

@@ -94,9 +94,13 @@ def discover_pairs(
         List of (name, original_path, damaged_path) tuples, sorted by name.
     """
     if not os.path.isdir(original_dir):
-        raise FileNotFoundError(f"Original directory not found: {original_dir}")
+        print(f"\nError: Original dataset directory not found at '{original_dir}'.")
+        print("Please download the test dataset from the link in the README and extract it correctly.")
+        sys.exit(1)
     if not os.path.isdir(damaged_dir):
-        raise FileNotFoundError(f"Damaged directory not found: {damaged_dir}")
+        print(f"\nError: Damaged dataset directory not found at '{damaged_dir}'.")
+        print("Please download the test dataset from the link in the README and extract it correctly.")
+        sys.exit(1)
 
     originals = {}
     for f in os.listdir(original_dir):

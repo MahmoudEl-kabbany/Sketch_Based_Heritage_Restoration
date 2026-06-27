@@ -169,10 +169,18 @@ def evaluate_image(damaged_path: str, orig_path: str, tail_len=20):
 def discover_pairs():
     orig_dir = os.path.join("test_images", "difficult_test_cases_original")
     dmg_dir = os.path.join("test_images", "difficult_test_cases")
+    
+    if not os.path.isdir(orig_dir):
+        print(f"\nError: Original dataset directory not found at '{orig_dir}'.")
+        print("Please download the test dataset from the link in the README and extract it correctly.")
+        sys.exit(1)
+    if not os.path.isdir(dmg_dir):
+        print(f"\nError: Damaged dataset directory not found at '{dmg_dir}'.")
+        print("Please download the test dataset from the link in the README and extract it correctly.")
+        sys.exit(1)
+        
     pairs = []
     origs = {}
-    if not os.path.isdir(orig_dir):
-        return []
     for f in os.listdir(orig_dir):
         base, ext = os.path.splitext(f)
         origs[base] = os.path.join(orig_dir, f)
