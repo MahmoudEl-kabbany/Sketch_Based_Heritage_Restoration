@@ -134,9 +134,6 @@ Once downloaded, extract the images and place them in the `test_images/` directo
 
 This structure is required for the default evaluation scripts to run correctly.
 
-place original images in test_images/difficult_test_cases_original and damaged images in test_images/difficult_test_cases
-
-
 ```
 Sketch_Based_Heritage_Restoration/
 │
