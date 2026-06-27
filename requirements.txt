@@ -1,0 +1,9 @@
+opencv-python
+numpy
+scipy
+scikit-image
+matplotlib
+pyefd
+clingo
+dtaidistance
+sknw

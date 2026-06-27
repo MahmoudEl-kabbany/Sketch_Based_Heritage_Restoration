@@ -125,8 +125,13 @@ Heritage sketches often suffer from physical deterioration. This project provide
 
 ## Project Structure
 
-"Test images are not included in repository please include your own for testing, or use the following dataset:"
-https://drive.google.com/drive/folders/1HUMwwl-PoMKwqtJaFARf6tktfA22Sm9w?usp=sharing
+**Dataset Setup:** Test images are not included in the repository. Please use your own images for testing, or download the sample dataset from:
+[Google Drive Dataset](https://drive.google.com/drive/folders/1HUMwwl-PoMKwqtJaFARf6tktfA22Sm9w?usp=sharing)
+
+Once downloaded, extract the images and place them in a `test_images/` directory at the root of the project so that the default scripts run correctly.
+
+place original images in test_images/difficult_test_cases_original and damaged images in test_images/difficult_test_cases
+
 
 ```
 Sketch_Based_Heritage_Restoration/
@@ -167,7 +172,13 @@ Sketch_Based_Heritage_Restoration/
 ### Prerequisites
 
 - **Python 3.10+**
-- A C/C++ compiler (required for building `clingo` and `dtaidistance`)
+- A **C/C++ compiler** (required for building `clingo` and `dtaidistance` via `pip`). Depending on your OS:
+  - **Windows:** Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (select the "Desktop development with C++" workload).
+  - **macOS:** Run `xcode-select --install` in your terminal.
+  - **Linux (Ubuntu/Debian):** Run `sudo apt install build-essential cmake`.
+
+> **💡 Tip for Conda Users (Recommended):** Installing `clingo` from source via `pip` can be error-prone on some systems. If you use Conda, it is highly recommended to install `clingo` using Conda instead:
+> `conda install -c potassco clingo`
 
 ### Setup
 
@@ -176,7 +187,7 @@ Sketch_Based_Heritage_Restoration/
 git clone https://github.com/MahmoudEl-kabbany/Sketch_Based_Heritage_Restoration.git
 cd Sketch_Based_Heritage_Restoration
 
-# Create a virtual environment
+# Create and activate a virtual environment
 python -m venv .venv
 source .venv/bin/activate      # Linux/macOS
 # .venv\Scripts\activate       # Windows
@@ -185,11 +196,11 @@ source .venv/bin/activate      # Linux/macOS
 pip install -r requirements.txt
 ```
 
-> **Note:** If a `requirements.txt` is not yet provided, install the core dependencies manually:
->
-> ```bash
-> pip install opencv-python numpy scipy scikit-image matplotlib pyefd clingo dtaidistance sknw
-> ```
+Alternatively, you can install the core dependencies directly via pip:
+
+```bash
+pip install opencv-python numpy scipy scikit-image matplotlib pyefd clingo dtaidistance sknw
+```
 
 ---
 
