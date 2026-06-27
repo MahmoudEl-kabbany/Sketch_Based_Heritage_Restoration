@@ -513,8 +513,9 @@ if __name__ == "__main__":
     print("OpenCV version:", cv2.__version__)
 
     # Process a raster image
-    process_image(
-        r"C:\Users\Mahmoud\Documents\GitHub\Sketch_Based_Heritage_Restoration\test_images\sketches.jpg"
-    )
+    import os
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    test_img = os.path.join(base_dir, "test_images", "sketches.jpg")
+    process_image(test_img)
 
     print("\n[OK]  All tests complete. Check the 'contour_outputs' folder for results.")
