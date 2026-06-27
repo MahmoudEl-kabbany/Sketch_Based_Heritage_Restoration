@@ -441,13 +441,13 @@ def _process_raster(
             cv2.drawContours(cmp_right, [recon_pts], -1, colors_bgr[idx], 2)
     cv2.putText(cmp_left, "Detected Tree Contours", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-    cv2.putText(cmp_right, f"EFD Contours order={best_order}", (10, 30),
+    cv2.putText(cmp_right, f"EFD Contours order={order}", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
     cv2.imwrite(os.path.join(OUTPUT_DIR, "efd_comparison.png"),
                 np.hstack([cmp_left, cmp_right]))
 
     # Matplotlib visualization
-    _visualize_raster(image_path, significant, colors, best_order)
+    _visualize_raster(image_path, significant, colors, order)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -455,7 +455,7 @@ def _process_raster(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _visualize_raster(image_path, significant, colors, best_order):
+def _visualize_raster(image_path, significant, colors, order):
     """
     3-panel matplotlib visualization for raster images:
     Panel 1 — Original image
@@ -488,14 +488,14 @@ def _visualize_raster(image_path, significant, colors, best_order):
     # Panel 3 — EFD reconstruction (contour-only)
     recon_vis = np.zeros((h, w, 3), dtype=np.uint8)
     for idx, (i, cnt) in enumerate(significant):
-        recon, _ = reconstruct_contour_efd(cnt, order=best_order)
+        recon, _ = reconstruct_contour_efd(cnt, order=order)
         if recon is None:
             continue
         color_bgr = tuple(int(c * 255) for c in colors[idx][:3])
         recon_pts = recon.astype(np.int32).reshape((-1, 1, 2))
         cv2.drawContours(recon_vis, [recon_pts], -1, color_bgr, 2)
     axes[2].imshow(cv2.cvtColor(recon_vis, cv2.COLOR_BGR2RGB))
-    axes[2].set_title(f"EFD Contours Only (order={best_order})")
+    axes[2].set_title(f"EFD Contours Only (order={order})")
     axes[2].axis("off")
 
     plt.tight_layout()
