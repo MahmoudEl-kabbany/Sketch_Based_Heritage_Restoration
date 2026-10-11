@@ -1,27 +1,27 @@
 """
 Elliptic Fourier Descriptor (EFD) Extraction
 =============================================
-Raster-only EFD extraction and contour reconstruction.
+Standalone demo of raster-only EFD extraction and contour reconstruction.
+The restoration pipeline does not use this module.
 
 Raster pipeline:  image → denoise → threshold → findContours → EFD
 
 Demonstrates:
-    1. Loading & binarizing a raster image
+  1. Loading & binarizing a raster image
   2. Extracting contours & properties (area, perimeter, bounding box)
   3. Computing EFD coefficients (raw and normalized)
-  4. Reconstructing contours from EFD at multiple harmonic orders
+  4. Reconstructing contours from EFD
   5. Matplotlib 3-panel visualization
 """
 
-import cv2
-import numpy as np
-import pyefd
-from pyefd import normalize_efd
-import matplotlib.pyplot as plt
 import os
 
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import pyefd
+
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "contour_outputs")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 _CONTOUR_RETRIEVAL_MODES = {
     "tree": cv2.RETR_TREE,
@@ -91,6 +91,29 @@ def _contour_perimeter(contour):
     return float(np.sum(np.linalg.norm(diffs, axis=1)))
 
 
+def _compute_efd_results(significant, order):
+    """Per-contour EFD data for a list of (index, contour) tuples."""
+    efd_results = []
+    for _, cnt in significant:
+        coords = np.squeeze(cnt)
+        if coords.ndim != 2 or len(coords) < 5:
+            continue
+
+        # Translation invariance: subtract centroid
+        raw_coeffs = pyefd.elliptic_fourier_descriptors(
+            coords - coords.mean(axis=0), order=order, normalize=False
+        )
+        efd_results.append({
+            "coeffs": raw_coeffs,
+            "norm_coeffs": pyefd.normalize_efd(raw_coeffs),
+            "locus": pyefd.calculate_dc_coefficients(coords),
+            "features": compute_efd_features(cnt, order=order),
+            "area": _contour_area(cnt),
+            "perimeter": _contour_perimeter(cnt),
+        })
+    return efd_results
+
+
 def print_efd_summary(significant, total_count, efd_results):
     """
     Print a structured summary of the EFD extraction results.
@@ -141,24 +164,24 @@ def _morphological_skeleton(binary):
 
     return skel
 
-def _extract_raster_contours(
-    image_path,
-    min_contour_area=100,
-    use_skeleton=False,
-    contour_retrieval="tree",
-):
+
+def _extract_raster_contours(image_path, use_skeleton=False, contour_retrieval="tree"):
     """
     Load a raster image, denoise, binarize, and extract contours.
 
-    Returns:
-        contours:   list of OpenCV contours (Nx1x2 arrays)
-        hierarchy:  OpenCV hierarchy array
-        img:        original grayscale image
-        binary:     the binary image used for detection
+    Returns (contours, hierarchy, binary), or (None, None, None) if the image
+    cannot be read. Intermediate images are saved to OUTPUT_DIR.
     """
+    retrieval_key = contour_retrieval.lower()
+    if retrieval_key not in _CONTOUR_RETRIEVAL_MODES:
+        raise ValueError(
+            f"contour_retrieval must be one of {tuple(_CONTOUR_RETRIEVAL_MODES.keys())}, "
+            f"got {contour_retrieval!r}"
+        )
+
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
-        return None, None, None, None
+        return None, None, None
 
     # Denoise
     denoised = cv2.fastNlMeansDenoising(
@@ -167,16 +190,13 @@ def _extract_raster_contours(
     cv2.imwrite(os.path.join(OUTPUT_DIR, "real_denoised.png"), denoised)
     print(f"  ->  Denoised image saved to {OUTPUT_DIR}/real_denoised.png")
 
-    # Adaptive threshold
+    # Adaptive threshold, then morphological closing
     binary = cv2.adaptiveThreshold(
         denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV, 11, 2
     )
-
-    # Morphological closing
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
     cv2.imwrite(os.path.join(OUTPUT_DIR, "real_binary.png"), cv2.bitwise_not(binary))
 
     if use_skeleton:
@@ -184,75 +204,19 @@ def _extract_raster_contours(
         cv2.imwrite(os.path.join(OUTPUT_DIR, "real_skeleton.png"), cv2.bitwise_not(binary))
         print(f"  ->  Skeleton image saved to {OUTPUT_DIR}/real_skeleton.png")
 
-    retrieval_key = contour_retrieval.lower()
-    if retrieval_key not in _CONTOUR_RETRIEVAL_MODES:
-        raise ValueError(
-            f"contour_retrieval must be one of {tuple(_CONTOUR_RETRIEVAL_MODES.keys())}, "
-            f"got {contour_retrieval!r}"
-        )
-
-    # Find contours using selected retrieval mode.
     contours, hierarchy = cv2.findContours(
         binary.copy(), _CONTOUR_RETRIEVAL_MODES[retrieval_key], cv2.CHAIN_APPROX_SIMPLE
     )
+    return contours, hierarchy, binary
 
-    return contours, hierarchy, img, binary
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Shared EFD processing pipeline
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _process_contours(significant, total_count, order, colors):
-    """
-    Run the shared EFD pipeline on a list of (index, contour_Nx2) tuples.
-
-    Returns:
-        efd_results: list of per-contour result dicts
-    """
-    efd_results = []
-
-    for idx, (i, cnt) in enumerate(significant):
-        coords = np.squeeze(cnt)
-        if coords.ndim != 2 or len(coords) < 5:
-            continue
-
-        # Translation invariance: subtract centroid
-        centroid = coords.mean(axis=0)
-        centered_coords = coords - centroid
-
-        raw_coeffs = pyefd.elliptic_fourier_descriptors(
-            centered_coords, order=order, normalize=False
-        )
-        norm_coeffs = normalize_efd(raw_coeffs)
-        a0, c0 = pyefd.calculate_dc_coefficients(coords)
-        features = compute_efd_features(cnt, order=order)
-
-        efd_results.append({
-            "coeffs": raw_coeffs,
-            "norm_coeffs": norm_coeffs,
-            "locus": (a0, c0),
-            "features": features,
-            "area": _contour_area(cnt),
-            "perimeter": _contour_perimeter(cnt),
-        })
-
-    # Print structured summary
-    print_efd_summary(significant, total_count, efd_results)
-
-    # EFD reconstruction
-    print(f"\n{'-' * 60}")
-    print(f"  EFD Reconstruction  —  order = {order}")
-    print(f"{'-' * 60}")
-
-    for idx, (i, cnt) in enumerate(significant):
-        recon, coeffs = reconstruct_contour_efd(cnt, order=order)
-        if recon is None:
-            continue
-        print(f"    Contour {i:>2d} -> {len(recon)} pts reconstructed "
-              f"({coeffs.shape[0]} harmonics × {coeffs.shape[1]} coeffs)")
-
-    return efd_results
+def _draw_contours(shape, contours, colors):
+    """Draw each contour (None entries are skipped) in its colour on a black BGR canvas."""
+    canvas = np.zeros((shape[0], shape[1], 3), dtype=np.uint8)
+    for cnt, color in zip(contours, colors):
+        if cnt is not None:
+            cv2.drawContours(canvas, [cnt.astype(np.int32).reshape((-1, 1, 2))], -1, color, 2)
+    return canvas
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -267,63 +231,39 @@ def process_image(
     contour_retrieval="tree",
 ):
     """
-    Process a raster image through the full EFD pipeline.
+    Process a raster image through the full EFD pipeline:
+    denoise → threshold → contours → EFD → reconstruction → visualization.
 
     Args:
-        image_path:       path to the input raster image (PNG, JPG, BMP, etc.)
-        efd_orders:       tuple of harmonic orders to compare
-        min_contour_area: minimum contour area
+        image_path:        path to the input raster image (PNG, JPG, BMP, etc.)
+        order:             number of Fourier harmonics
+        min_contour_area:  minimum contour area
+        use_skeleton:      skeletonize the binary image before contour extraction
         contour_retrieval: contour retrieval mode: "tree" or "external"
+
+    Returns the list of per-contour EFD result dicts (None if the image cannot be read).
     """
-    if image_path.lower().endswith(".svg"):
-        raise ValueError("SVG parsing has been removed from EFD. Use a raster image instead.")
-
-    _process_raster(
-        image_path,
-        order,
-        min_contour_area,
-        use_skeleton,
-        contour_retrieval,
-    )
-
-
-def _process_raster(
-    image_path,
-    order,
-    min_contour_area,
-    use_skeleton=True,
-    contour_retrieval="tree",
-):
-    """Raster processing pipeline: denoise → threshold → contours → EFD."""
-    contours, hierarchy, img, binary = _extract_raster_contours(
-        image_path,
-        min_contour_area,
-        use_skeleton=use_skeleton,
-        contour_retrieval=contour_retrieval,
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    contours, hierarchy, binary = _extract_raster_contours(
+        image_path, use_skeleton=use_skeleton, contour_retrieval=contour_retrieval,
     )
     if contours is None:
         print(f"  !  Could not load image: {image_path}")
-        return
+        return None
 
     retrieval_key = contour_retrieval.lower()
 
     # Keep all contours from the selected hierarchy, filtered only by area.
     significant = [(i, cnt) for i, cnt in enumerate(contours)
                    if cv2.contourArea(cnt) >= min_contour_area]
+    raw_contours = [cnt for _, cnt in significant]
 
     print(f"\n{'=' * 60}")
     print(f"  Raster Image ({retrieval_key})  —  {len(contours)} total contours, "
           f"{len(significant)} with area ≥ {min_contour_area}")
     print(f"{'=' * 60}")
 
-        # Draw extracted contours on a standalone canvas.
-    canvas_orig = np.zeros((binary.shape[0], binary.shape[1], 3), dtype=np.uint8)
-
-    colors_bgr = [tuple(int(c) for c in np.random.randint(60, 255, 3))
-                  for _ in significant]
-
-    for idx, (i, cnt) in enumerate(significant):
-        cv2.drawContours(canvas_orig, [cnt], -1, colors_bgr[idx], 2)
+    for i, cnt in significant:
         area = cv2.contourArea(cnt)
         perimeter = cv2.arcLength(cnt, closed=True)
         x, y, w, h = cv2.boundingRect(cnt)
@@ -332,43 +272,33 @@ def _process_raster(
               f"  bbox=({x},{y},{w},{h})"
               f"  hierarchy(N={hier[0]}, P={hier[1]}, C={hier[2]}, Par={hier[3]})")
 
-    cv2.imwrite(os.path.join(OUTPUT_DIR, "contours_real.png"), canvas_orig)
+    # Detected contours on a standalone canvas, one random colour each.
+    colors_bgr = [tuple(int(c) for c in np.random.randint(60, 255, 3))
+                  for _ in significant]
+    canvas_orig = _draw_contours(binary.shape, raw_contours, colors_bgr)
     cv2.imwrite(os.path.join(OUTPUT_DIR, f"contours_{retrieval_key}.png"), canvas_orig)
 
-    # Matplotlib-compatible colours
-    cmap = plt.cm.tab10(np.linspace(0, 1, max(len(significant), 1)))
-    colors = [cmap[i % len(cmap)] for i in range(len(significant))]
+    efd_results = _compute_efd_results(significant, order)
+    print_efd_summary(significant, len(contours), efd_results)
 
-    # Run shared EFD pipeline
-    efd_results = _process_contours(
-        significant, len(contours), order, colors
-    )
-
-    # OpenCV-based contour-only EFD reconstruction images
-    best_canvas_efd = np.zeros((binary.shape[0], binary.shape[1], 3), dtype=np.uint8)
-    canvas_efd = np.zeros((binary.shape[0], binary.shape[1], 3), dtype=np.uint8)
-    for idx, (i, cnt) in enumerate(significant):
+    # EFD reconstruction (None for contours too short to describe)
+    print(f"\n{'-' * 60}")
+    print(f"  EFD Reconstruction  —  order = {order}")
+    print(f"{'-' * 60}")
+    reconstructions = []
+    for i, cnt in significant:
         recon, coeffs = reconstruct_contour_efd(cnt, order=order)
-        if recon is None:
-            continue
-        recon_pts = recon.astype(np.int32).reshape((-1, 1, 2))
-        cv2.drawContours(canvas_efd, [recon_pts], -1, colors_bgr[idx], 2)
-    cv2.imwrite(os.path.join(OUTPUT_DIR, f"efd_order_{order}.png"), canvas_efd)
-    best_canvas_efd = canvas_efd.copy()
+        reconstructions.append(recon)
+        if recon is not None:
+            print(f"    Contour {i:>2d} -> {len(recon)} pts reconstructed "
+                  f"({coeffs.shape[0]} harmonics × {coeffs.shape[1]} coeffs)")
 
-    cv2.imwrite(
-        os.path.join(OUTPUT_DIR, "efd_reconstructed_contours_only.png"),
-        best_canvas_efd
-    )
+    canvas_efd = _draw_contours(binary.shape, reconstructions, colors_bgr)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, f"efd_order_{order}.png"), canvas_efd)
 
     # Side-by-side comparison on contour-only canvases
     cmp_left = canvas_orig.copy()
-    cmp_right = np.zeros((binary.shape[0], binary.shape[1], 3), dtype=np.uint8)
-    for idx, (i, cnt) in enumerate(significant):
-        recon, _ = reconstruct_contour_efd(cnt, order=order)
-        if recon is not None:
-            recon_pts = recon.astype(np.int32).reshape((-1, 1, 2))
-            cv2.drawContours(cmp_right, [recon_pts], -1, colors_bgr[idx], 2)
+    cmp_right = canvas_efd.copy()
     cv2.putText(cmp_left, "Detected Tree Contours", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
     cv2.putText(cmp_right, f"EFD Contours order={order}", (10, 30),
@@ -376,57 +306,41 @@ def _process_raster(
     cv2.imwrite(os.path.join(OUTPUT_DIR, "efd_comparison.png"),
                 np.hstack([cmp_left, cmp_right]))
 
-    # Matplotlib visualization
-    _visualize_raster(image_path, significant, colors, order)
+    _visualize_raster(image_path, raw_contours, reconstructions, order)
+    return efd_results
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Visualization (raster)
 # ═══════════════════════════════════════════════════════════════════════════
 
-
-def _visualize_raster(image_path, significant, colors, order):
+def _visualize_raster(image_path, contours, reconstructions, order):
     """
     3-panel matplotlib visualization for raster images:
     Panel 1 — Original image
-    Panel 2 — RETR_TREE contours filtered by area
+    Panel 2 — Detected contours filtered by area
     Panel 3 — EFD reconstruction on a standalone contour canvas
     """
     img_bgr = cv2.imread(image_path)
     if img_bgr is None:
         return
 
+    # One matplotlib colour per contour
+    cmap = plt.cm.tab10(np.linspace(0, 1, max(len(contours), 1)))
+    colors = [tuple(int(c * 255) for c in cmap[i % len(cmap)][:3]) for i in range(len(contours))]
+
+    shape = img_bgr.shape[:2]
+    panels = [
+        ("Original Image", img_bgr),
+        (f"Detected Contours ({len(contours)})", _draw_contours(shape, contours, colors)),
+        (f"EFD Contours Only (order={order})", _draw_contours(shape, reconstructions, colors)),
+    ]
+
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-
-    # Panel 1 — Original
-    axes[0].imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-    axes[0].set_title("Original Image")
-    axes[0].axis("off")
-
-    h, w = img_bgr.shape[:2]
-
-    # Panel 2 — Detected contours (contour-only)
-    contour_vis = np.zeros((h, w, 3), dtype=np.uint8)
-    for idx, (i, cnt) in enumerate(significant):
-        color_bgr = tuple(int(c * 255) for c in colors[idx][:3])
-        cv2.drawContours(contour_vis, [cnt.reshape(-1, 1, 2).astype(np.int32)],
-                         -1, color_bgr, 2)
-    axes[1].imshow(cv2.cvtColor(contour_vis, cv2.COLOR_BGR2RGB))
-    axes[1].set_title(f"Detected Contours ({len(significant)})")
-    axes[1].axis("off")
-
-    # Panel 3 — EFD reconstruction (contour-only)
-    recon_vis = np.zeros((h, w, 3), dtype=np.uint8)
-    for idx, (i, cnt) in enumerate(significant):
-        recon, _ = reconstruct_contour_efd(cnt, order=order)
-        if recon is None:
-            continue
-        color_bgr = tuple(int(c * 255) for c in colors[idx][:3])
-        recon_pts = recon.astype(np.int32).reshape((-1, 1, 2))
-        cv2.drawContours(recon_vis, [recon_pts], -1, color_bgr, 2)
-    axes[2].imshow(cv2.cvtColor(recon_vis, cv2.COLOR_BGR2RGB))
-    axes[2].set_title(f"EFD Contours Only (order={order})")
-    axes[2].axis("off")
+    for ax, (title, image) in zip(axes, panels):
+        ax.imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        ax.set_title(title)
+        ax.axis("off")
 
     plt.tight_layout()
     out_path = os.path.join(OUTPUT_DIR, "efd_matplotlib_overview.png")
@@ -443,9 +357,7 @@ if __name__ == "__main__":
     print("OpenCV version:", cv2.__version__)
 
     # Process a raster image
-    import os
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    test_img = os.path.join(base_dir, "test_images", "sketches.jpg")
-    process_image(test_img)
+    process_image(os.path.join(base_dir, "test_images", "sketches.jpg"))
 
     print("\n[OK]  All tests complete. Check the 'contour_outputs' folder for results.")

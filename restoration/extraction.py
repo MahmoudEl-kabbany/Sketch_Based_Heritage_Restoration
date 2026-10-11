@@ -1,7 +1,6 @@
 """Phase 1 — Extraction.
 
-Skeleton-based Bezier path extraction with endpoint tangents, curvatures,
-and EFD coefficient extraction.
+Skeleton-based Bezier path extraction with endpoint tangents and curvatures.
 """
 
 from __future__ import annotations
@@ -44,7 +43,6 @@ class ExtractionResult:
 
     paths: List[BezierPath]
     endpoints: List[EndpointInfo]
-    efd_contours: List[dict]       # per-contour EFD data
     image_shape: Tuple[int, int]   # (h, w)
     diagonal: float                # sqrt(h² + w²)
     dist_map: Optional[np.ndarray] = None  # distance map from lines
@@ -197,50 +195,6 @@ def _extract_endpoints(paths: List[BezierPath]) -> List[EndpointInfo]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# EFD extraction (wraps existing module)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _extract_efd_contours(
-    image_path: str,
-    min_contour_area: float = 100.0,
-    order: int = 40,
-) -> List[dict]:
-    """Extract EFD coefficients for closed contours in the image."""
-    import pyefd
-
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        return []
-
-    _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-    contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    results: List[dict] = []
-    for cnt in contours:
-        if cv2.contourArea(cnt) < min_contour_area:
-            continue
-        coords = np.squeeze(cnt)
-        if coords.ndim != 2 or len(coords) < 5:
-            continue
-        try:
-            coeffs = pyefd.elliptic_fourier_descriptors(
-                coords, order=order, normalize=False,
-            )
-            a0, c0 = pyefd.calculate_dc_coefficients(coords)
-            results.append({
-                "contour": coords,
-                "coeffs": coeffs,
-                "locus": (a0, c0),
-                "order": order,
-            })
-        except Exception:
-            continue
-    return results
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -250,7 +204,7 @@ def extract_paths(
     spur_threshold: float = 12.0,
     merge_radius: float = 5.0,
 ) -> ExtractionResult:
-    """Extract Bezier paths, endpoints, and EFD data from a raster image."""
+    """Extract Bezier paths, endpoints, and the line distance map from a raster image."""
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise FileNotFoundError(f"Cannot read image: {image_path}")
@@ -271,9 +225,6 @@ def extract_paths(
     # Endpoint extraction
     endpoints = _extract_endpoints(paths)
 
-    # EFD extraction
-    efd_contours = _extract_efd_contours(image_path)
-
     # Compute distance map from the original image (lines=0, background=255)
     _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     dist_map = cv2.distanceTransform((255 - binary).astype(np.uint8), cv2.DIST_L2, 5)
@@ -281,7 +232,6 @@ def extract_paths(
     return ExtractionResult(
         paths=paths,
         endpoints=endpoints,
-        efd_contours=efd_contours,
         image_shape=(h, w),
         diagonal=diagonal,
         dist_map=dist_map,

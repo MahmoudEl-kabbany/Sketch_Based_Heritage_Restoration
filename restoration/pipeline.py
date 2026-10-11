@@ -500,7 +500,6 @@ def _build_report(
                 "open_paths": extraction_open,
                 "closed_paths": extraction_closed,
                 "endpoints": len(result.endpoints),
-                "efd_contours": len(result.efd_contours),
             },
             "candidate_generation": {
                 "total": len(candidates),
