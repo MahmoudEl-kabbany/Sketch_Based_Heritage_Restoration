@@ -19,7 +19,6 @@ import pyefd
 from pyefd import normalize_efd
 import matplotlib.pyplot as plt
 import os
-import shutil
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "contour_outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -286,75 +285,6 @@ def process_image(
         use_skeleton,
         contour_retrieval,
     )
-
-
-def extract_efd_from_image(
-    image_path,
-    order=40,
-    min_contour_area=100,
-    use_skeleton=True,
-    contour_retrieval="tree",
-):
-    """
-    Backward-compatible helper to extract EFDs from a raster image.
-
-    Returns:
-        dict with keys: significant, total_count, efd_results
-    """
-    if image_path.lower().endswith(".svg"):
-        raise ValueError("SVG parsing has been removed from EFD. Use a raster image instead.")
-
-    contours, hierarchy, _img, _binary = _extract_raster_contours(
-        image_path,
-        min_contour_area,
-        use_skeleton=use_skeleton,
-        contour_retrieval=contour_retrieval,
-    )
-    if contours is None:
-        return {"significant": [], "total_count": 0, "efd_results": []}
-    significant = [(i, cnt) for i, cnt in enumerate(contours)
-                   if cv2.contourArea(cnt) >= min_contour_area]
-    total_count = len(contours)
-
-    cmap = plt.cm.tab10(np.linspace(0, 1, max(len(significant), 1)))
-    colors = [cmap[i % len(cmap)] for i in range(len(significant))]
-    efd_results = _process_contours(significant, total_count, order, colors)
-    return {
-        "significant": significant,
-        "total_count": total_count,
-        "efd_results": efd_results,
-    }
-
-
-def visualize_efd(
-    image_path,
-    order=40,
-    save_path=None,
-    min_contour_area=100,
-    use_skeleton=True,
-    contour_retrieval="tree",
-):
-    """
-    Backward-compatible visualization wrapper.
-
-    Generates plots/files via the current pipeline and optionally copies the
-    Matplotlib overview image to a custom save path.
-    """
-    process_image(
-        image_path,
-        order=order,
-        min_contour_area=min_contour_area,
-        use_skeleton=use_skeleton,
-        contour_retrieval=contour_retrieval,
-    )
-
-    if save_path:
-        generated = os.path.join(OUTPUT_DIR, "efd_matplotlib_overview.png")
-        if os.path.exists(generated):
-            save_dir = os.path.dirname(save_path)
-            if save_dir:
-                os.makedirs(save_dir, exist_ok=True)
-            shutil.copyfile(generated, save_path)
 
 
 def _process_raster(

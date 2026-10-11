@@ -349,11 +349,7 @@ def _solve_facts(
 
     ctl = clingo.Control(_build_control_args(max_solutions))
 
-    if os.path.isfile(rules_path):
-        ctl.load(rules_path)
-    else:
-        ctl.add("base", [], _fallback_rules())
-
+    ctl.load(rules_path)
     ctl.add("base", [], facts)
     ctl.ground([("base", [])])
 
@@ -453,34 +449,6 @@ def solve_partitioned(
         "control_args": list(_build_control_args(max_solutions)),
     }
     return sorted(accepted_ids), summary
-
-def solve(
-    facts: str,
-    rules_path: str = RULES_PATH,
-    max_solutions: int = 1,
-    timeout_s: float = 30.0,
-) -> List[int]:
-    """Run clingo on the encoded facts + rules and return accepted candidate IDs."""
-    return _solve_facts(facts, rules_path, max_solutions, timeout_s)
-
-
-def _fallback_rules() -> str:
-    """Minimal ASP rules in case the .lp file is missing."""
-    return """
-{ accept(Id) } :- candidate(Id, _, _, _, _, _).
-
-uses_endpoint(Id, E) :- candidate_endpoint(Id, E, _).
-uses_endpoint(Id, E) :- candidate_endpoint(Id, _, E).
-
-candidate_self_closure(-1).
-
-endpoint_key(E) :- uses_endpoint(_, E).
-:- endpoint_key(E), 2 { accept(Id) : uses_endpoint(Id, E) }.
-
-:- accept(Id), candidate(Id, P, _, P, _, _), not candidate_self_closure(Id).
-
-#maximize { Utility, Id : accept(Id), candidate_utility(Id, Utility) }.
-"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════

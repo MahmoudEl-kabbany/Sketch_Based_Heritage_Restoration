@@ -47,7 +47,7 @@ def process_image(
         raise FileNotFoundError(f"Image file not found: {image_path}")
 
     # Extract Bezier curves
-    paths, _adjacency = fit_from_image_skeleton(
+    paths = fit_from_image_skeleton(
         image_path,
         max_error=max_error,
         follow_junction_continuation=follow_junction_continuation,

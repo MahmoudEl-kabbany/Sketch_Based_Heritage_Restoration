@@ -11,19 +11,6 @@ from restoration.candidates import generate_candidates
 from restoration.scoring import score_candidates
 from restoration.asp_engine import solve_partitioned
 
-def resample_equidistant(pts, distance=1.0):
-    if len(pts) < 2: return pts
-    diffs = np.diff(pts, axis=0)
-    dists = np.linalg.norm(diffs, axis=1)
-    cum_dist = np.insert(np.cumsum(dists), 0, 0.0)
-    total_dist = cum_dist[-1]
-    if total_dist <= 0: return pts
-    num_points = int(np.ceil(total_dist / distance)) + 1
-    new_cum_dist = np.linspace(0, total_dist, num_points)
-    new_x = np.interp(new_cum_dist, cum_dist, pts[:, 0])
-    new_y = np.interp(new_cum_dist, cum_dist, pts[:, 1])
-    return np.column_stack((new_x, new_y))
-
 def calc_mjerk(combined: np.ndarray) -> float:
     if len(combined) < 5: return 0.0
     diffs = np.diff(combined, axis=0)

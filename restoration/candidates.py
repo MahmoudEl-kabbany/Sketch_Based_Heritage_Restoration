@@ -6,7 +6,7 @@ with support for both straight and curved extrapolation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np

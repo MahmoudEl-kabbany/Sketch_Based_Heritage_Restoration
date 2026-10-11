@@ -18,8 +18,8 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np

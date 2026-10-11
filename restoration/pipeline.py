@@ -10,13 +10,13 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
 
-from bezier_curves.bezier import BezierPath, BezierSegment, visualize_paths
+from bezier_curves.bezier import BezierPath, BezierSegment
 from restoration.extraction import ExtractionResult, extract_paths
 from restoration.candidates import ConnectionCandidate, generate_candidates
 from restoration.scoring import score_candidates
@@ -25,7 +25,6 @@ from restoration.synthesis import synthesize_bridges, merge_restored_paths
 from restoration.efd_closure import close_single_gaps
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -833,7 +832,7 @@ def restore(
         print(f"    {dropped_after_sanitize} conflicting connection(s) dropped")
 
     # Phase 4.5: Post-processing Image Mask Filtering
-    if hasattr(extraction, "dist_map") and extraction.dist_map is not None:
+    if extraction.dist_map is not None:
         exclusion_radius = max(12.0, extraction.diagonal * 0.015)
         filtered_accepted = []
         for c in accepted:
@@ -863,7 +862,7 @@ def restore(
     print("  Phase 6: EFD single-gap closure...")
     t_phase = time.perf_counter()
     final_paths, efd_phase_diagnostics = close_single_gaps(
-        restored_paths, extraction.efd_contours, efd_gap_threshold,
+        restored_paths, efd_gap_threshold,
         validity_check_enabled=efd_validity_check_enabled,
         plausibility_threshold=efd_plausibility_threshold,
         min_gap_for_validity_check=efd_min_gap_for_validity_check,

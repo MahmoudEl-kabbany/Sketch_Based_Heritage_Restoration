@@ -24,7 +24,6 @@ from skimage.morphology import skeletonize
 import sknw
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -45,11 +44,6 @@ class BezierSegment:
     @property
     def end(self) -> np.ndarray:
         return self.control_points[3]
-
-    def evaluate(self, t: float) -> np.ndarray:
-        """Evaluate the curve at parameter *t* ∈ [0, 1]."""
-        u = 1.0 - t
-        return (u**3) * self.control_points[0] + 3 * (u**2) * t * self.control_points[1] + 3 * u * (t**2) * self.control_points[2] + (t**3) * self.control_points[3]
 
     def sample(self, n: int = 50) -> np.ndarray:
         """Return *n* evenly-spaced (x, y) points along the curve."""
@@ -180,12 +174,6 @@ def _estimate_tangent(points: np.ndarray, end: str, lookahead: int = 10, skip_ti
     return tangent / norm
 
 
-def _bezier_point(cp: np.ndarray, t: float) -> np.ndarray:
-    """De Casteljau evaluation of a cubic Bezier at parameter *t*."""
-    u = 1.0 - t
-    return (u ** 3) * cp[0] + 3 * (u ** 2) * t * cp[1] + 3 * u * (t ** 2) * cp[2] + (t ** 3) * cp[3]
-
-
 def _generate_bezier(
     points: np.ndarray,
     params: np.ndarray,
@@ -284,30 +272,6 @@ def _reparameterize(
     new_params = np.clip(new_params, 0.0, 1.0)
 
     return new_params
-
-
-def _max_error(
-    points: np.ndarray, cp: np.ndarray, params: np.ndarray
-) -> Tuple[float, int]:
-    """Return (max squared error, index of worst point)."""
-    # Evaluate Bezier at all parameters using vectorized De Casteljau
-    u = 1.0 - params  # shape (n,)
-    t = params        # shape (n,)
-
-    # Cubic Bernstein: B(t) = (1-t)^3*P0 + 3*(1-t)^2*t*P1 + 3*(1-t)*t^2*P2 + t^3*P3
-    bezier_pts = (
-        (u**3)[:, np.newaxis] * cp[0]
-        + 3 * (u**2)[:, np.newaxis] * t[:, np.newaxis] * cp[1]
-        + 3 * u[:, np.newaxis] * (t**2)[:, np.newaxis] * cp[2]
-        + (t**3)[:, np.newaxis] * cp[3]
-    )  # shape (n, 2)
-
-    # Compute all squared errors
-    errors = np.sum((bezier_pts - points) ** 2, axis=1)  # shape (n,)
-    split_idx = int(np.argmax(errors))
-    max_err = float(errors[split_idx])
-
-    return max_err, split_idx
 
 
 def _fit_error_stats(
@@ -805,25 +769,6 @@ def _build_skeleton_chains(
     return chains
 
 
-def _build_path_adjacency_from_chains(chains: List[_SkeletonChain]) -> Dict[int, set]:
-    """Paths are adjacent if they touch the same skeleton node."""
-    node_to_path_indices: Dict[int, Set[int]] = {}
-    for path_idx, chain in enumerate(chains):
-        for node in set(chain.node_sequence):
-            node_to_path_indices.setdefault(int(node), set()).add(path_idx)
-
-    adjacency: Dict[int, set] = {}
-    for path_indices in node_to_path_indices.values():
-        idx_list = sorted(path_indices)
-        for i in range(len(idx_list)):
-            for j in range(i + 1, len(idx_list)):
-                pi, pj = idx_list[i], idx_list[j]
-                adjacency.setdefault(pi, set()).add(pj)
-                adjacency.setdefault(pj, set()).add(pi)
-
-    return adjacency
-
-
 def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
     """Remove short terminal branches (spurs) often created by corners."""
     changed = True
@@ -939,7 +884,7 @@ def fit_from_image_skeleton(
     follow_junction_continuation: bool = True,
     junction_min_alignment: float = -0.15,
     spur_threshold: float = 25.0,
-) -> Tuple[List[BezierPath], Dict[int, set]]:
+) -> List[BezierPath]:
     """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths."""
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
@@ -993,9 +938,7 @@ def fit_from_image_skeleton(
             )
         )
 
-    merged_paths = _merge_connected_paths(paths, merge_radius=merge_radius)
-
-    return merged_paths, {}
+    return _merge_connected_paths(paths, merge_radius=merge_radius)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1335,7 +1278,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    paths, _adjacency = fit_from_image_skeleton(
+    paths = fit_from_image_skeleton(
         args.image_path,
         max_error=args.max_error,
         tangent_lookahead=args.tangent_lookahead,
@@ -1348,4 +1291,5 @@ if __name__ == "__main__":
     _print_summary(paths, label)
 
     if paths:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
         visualize_paths(paths, title=label, save_path=os.path.join(OUTPUT_DIR, "bezier_vis.png"))

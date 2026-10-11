@@ -6,28 +6,13 @@ and EFD coefficient extraction.
 
 from __future__ import annotations
 
-import sys
-import os
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Project imports
-# ---------------------------------------------------------------------------
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from bezier_curves.bezier import (
-    BezierPath,
-    BezierSegment,
-    fit_from_image_skeleton,
-)
-from eliptic_fourier_descriptors.efd import (
-    reconstruct_contour_efd,
-    compute_efd_features,
-)
+from bezier_curves.bezier import BezierPath, fit_from_image_skeleton
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -113,55 +98,6 @@ def _dedupe_polyline(points: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     return points[keep]
 
 
-def _strip_sway_prefix(points: np.ndarray, end: str, max_strip_fraction: float = 0.15) -> np.ndarray:
-    """Walk inward from the endpoint and drop high-curvature sway segments."""
-    if len(points) < 10:
-        return points
-
-    n_strip_max = int(round(len(points) * max_strip_fraction))
-    if n_strip_max < 2:
-        return points
-
-    diffs = np.diff(points, axis=0)
-    strip_count = 0
-    
-    if end == "start":
-        for i in range(n_strip_max):
-            a = diffs[i]
-            b = diffs[i + 1]
-            na = np.linalg.norm(a)
-            nb = np.linalg.norm(b)
-            if na < 1e-12 or nb < 1e-12:
-                continue
-            dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
-            angle = float(np.degrees(np.arccos(dot)))
-            if angle > 25.0:
-                strip_count = i + 1
-            elif i > strip_count + 1:
-                break
-        if strip_count > 0:
-            return points[strip_count:]
-    else:
-        for i in range(n_strip_max):
-            idx = len(diffs) - 1 - i
-            a = diffs[idx - 1]
-            b = diffs[idx]
-            na = np.linalg.norm(a)
-            nb = np.linalg.norm(b)
-            if na < 1e-12 or nb < 1e-12:
-                continue
-            dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
-            angle = float(np.degrees(np.arccos(dot)))
-            if angle > 25.0:
-                strip_count = i + 1
-            elif i > strip_count + 1:
-                break
-        if strip_count > 0:
-            return points[:-strip_count]
-
-    return points
-
-
 def _multiscale_context_tangent(
     sampled: np.ndarray, end: str, outward_ref: np.ndarray
 ) -> Tuple[np.ndarray, float]:
@@ -219,9 +155,7 @@ def _estimate_endpoint_context_tangent(
     """Estimate endpoint tangent from local sampled context and return confidence."""
     sampled = path.sample(pts_per_segment=24)
     sampled = _dedupe_polyline(sampled)
-    # Sway stripping removed to avoid tangent misalignments
-    # sampled = _strip_sway_prefix(sampled, end)
-    
+
     if len(sampled) < 3:
         return np.array([1.0, 0.0], dtype=np.float64), 0.0
 
@@ -368,7 +302,7 @@ def extract_paths(
     diagonal = float(np.hypot(h, w))
 
     # Bezier path extraction via skeleton
-    paths, _ = fit_from_image_skeleton(
+    paths = fit_from_image_skeleton(
         image_path,
         max_error=max_error,
         spur_threshold=spur_threshold,

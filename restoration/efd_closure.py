@@ -192,8 +192,6 @@ def _curvature_aware_arc(
     if chord < 1e-6:
         return []
 
-    avg_k = (curvature_start + curvature_end) / 2.0
-
     # Handle lengths
     alpha_0 = chord / 3.0
     alpha_3 = chord / 3.0
@@ -465,7 +463,6 @@ def _evaluate_closure_validity(
 
 def close_single_gaps(
     paths: List[BezierPath],
-    efd_contours: List[dict],
     gap_threshold: float = 0.30,
     symmetry_hausdorff: float = 8.0,
     skip_if_bridge_present: bool = True,

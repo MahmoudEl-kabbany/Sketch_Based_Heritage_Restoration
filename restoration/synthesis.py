@@ -6,12 +6,12 @@ into the restored path set.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 
 from bezier_curves.bezier import BezierPath, BezierSegment
-from restoration.extraction import EndpointInfo, ExtractionResult
+from restoration.extraction import EndpointInfo
 from restoration.candidates import ConnectionCandidate
 
 
@@ -165,55 +165,6 @@ def _build_intersection_bridge_linear(
     return segments
 
 
-def _build_intersection_bridge_curved(
-    ep_a: EndpointInfo, ep_b: EndpointInfo, intersection: np.ndarray,
-) -> List[BezierSegment]:
-    """Two curved segments through a convergence point, preserving curvature."""
-    I = intersection.copy()
-    segments: List[BezierSegment] = []
-
-    # Segment A → I
-    p0 = ep_a.position.copy()
-    p3 = I
-    chord = float(np.linalg.norm(p3 - p0))
-    if chord > 1e-6:
-        alpha_a = chord / 3.0
-        if ep_a.curvature > 1e-6:
-            alpha_a = min(alpha_a, 1.0 / (3.0 * ep_a.curvature))
-        p1 = p0 + alpha_a * ep_a.tangent
-        # The approach handle toward I follows the chord direction
-        # but respects curvature continuity
-        approach_dir = _safe_normalize(I - p0)
-        p2 = p3 - (chord / 3.0) * approach_dir
-        cp = np.vstack([p0, p1, p2, p3])
-        cp = _stabilize_bridge_control_points(cp)
-        segments.append(BezierSegment(
-            control_points=cp,
-            source_type="bridge",
-        ))
-
-    # Segment I → B
-    p0 = I
-    p3 = ep_b.position.copy()
-    chord = float(np.linalg.norm(p3 - p0))
-    if chord > 1e-6:
-        departure_dir = _safe_normalize(p3 - I)
-        p1 = p0 + (chord / 3.0) * departure_dir
-        alpha_b = chord / 3.0
-        if ep_b.curvature > 1e-6:
-            alpha_b = min(alpha_b, 1.0 / (3.0 * ep_b.curvature))
-        # ep_b.tangent is outward; incoming derivative at p3 should align with -ep_b.tangent.
-        p2 = p3 + alpha_b * ep_b.tangent
-        cp = np.vstack([p0, p1, p2, p3])
-        cp = _stabilize_bridge_control_points(cp)
-        segments.append(BezierSegment(
-            control_points=cp,
-            source_type="bridge",
-        ))
-
-    return segments
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Synthesis dispatcher
 # ═══════════════════════════════════════════════════════════════════════════
@@ -229,42 +180,16 @@ def _synthesize_single(candidate: ConnectionCandidate) -> List[BezierSegment]:
             return [_build_straight_bridge(ep_a, ep_b)]
         return [_build_g1_bridge(ep_a, ep_b)]
 
-    if candidate.scenario == "extension_intersection":
-        intersection_obj = getattr(candidate, "intersection_point", None)
-        if intersection_obj is None:
-            bridge_pts = candidate.bridge_points
-            if len(bridge_pts) < 2:
-                return [_build_g1_bridge(ep_a, ep_b)]
-            mid = len(bridge_pts) // 2
-            intersection = bridge_pts[mid].copy()
-        else:
-            intersection = np.asarray(intersection_obj, dtype=np.float64).reshape(2)
+    # Two straight strokes that meet at an extension intersection form a sharp
+    # corner through that point; everything else gets a smooth G1 bridge.
+    if (
+        candidate.scenario == "extension_intersection"
+        and ep_a.curvature < 0.008
+        and ep_b.curvature < 0.008
+    ):
+        intersection = np.asarray(candidate.intersection_point, dtype=np.float64).reshape(2)
+        return _build_intersection_bridge_linear(ep_a, ep_b, intersection)
 
-        if (
-            getattr(candidate, "same_path_closure", False)
-            and ep_a.curvature < 0.008
-            and ep_b.curvature < 0.008
-        ):
-            return _build_intersection_bridge_linear(ep_a, ep_b, intersection)
-
-        # --- FIX APPLIED HERE ---
-        # If both paths are straight lines, they must form a sharp corner regardless of their intersection angle.
-        # This check must happen BEFORE the dist_to_mid kink check to prevent curved fallbacks on straight lines.
-        if ep_a.curvature < 0.008 and ep_b.curvature < 0.008:
-            return _build_intersection_bridge_linear(ep_a, ep_b, intersection)
-
-        # If the intersection point is very close to the chord midpoint,
-        # a 2-segment bridge through it would create an unnecessary kink.
-        # Fall back to a smooth single-segment G1 bridge instead.
-        chord = float(np.linalg.norm(ep_b.position - ep_a.position))
-        if chord > 1e-6:
-            midpoint = (ep_a.position + ep_b.position) / 2.0
-            dist_to_mid = float(np.linalg.norm(intersection - midpoint))
-            # Force smooth bridges for highly curved endpoints or distant intersections
-            if dist_to_mid < 0.45 * chord or (ep_a.curvature >= 0.005 and ep_b.curvature >= 0.005):
-                return [_build_g1_bridge(ep_a, ep_b)]
-
-    # Default to a smooth G1 bridge for all organic curves
     return [_build_g1_bridge(ep_a, ep_b)]
 
 
