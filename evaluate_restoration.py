@@ -19,7 +19,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -39,6 +39,18 @@ ORIGINAL_DIR = os.path.join("test_images", "difficult_test_cases_original")
 DAMAGED_DIR = os.path.join("test_images", "difficult_test_cases")
 OUTPUT_DIR = os.path.join("restoration", "outputs")
 
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+
+# The six reported metrics: (ImageMetrics field, console label, console format).
+METRICS = (
+    ("psnr_before", "PSNR (before)", ".2f"),
+    ("psnr_after", "PSNR (after)", ".2f"),
+    ("delta_psnr", "d PSNR", ".2f"),
+    ("ssim_before", "SSIM (before)", ".4f"),
+    ("ssim_after", "SSIM (after)", ".4f"),
+    ("delta_ssim", "d SSIM", ".4f"),
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Data classes
@@ -51,15 +63,15 @@ class ImageMetrics:
     name: str
     original_path: str
     damaged_path: str
-    estimated_line_width: float
+    estimated_line_width: float = 0.0
 
     # Baseline: damaged vs. original
-    psnr_before: float
-    ssim_before: float
+    psnr_before: float = 0.0
+    ssim_before: float = 0.0
 
     # After restoration: restored vs. original
-    psnr_after: float
-    ssim_after: float
+    psnr_after: float = 0.0
+    ssim_after: float = 0.0
 
     # Improvement
     delta_psnr: float = 0.0
@@ -71,10 +83,40 @@ class ImageMetrics:
     # Error info (if processing failed)
     error: Optional[str] = None
 
+    def as_row(self) -> Dict[str, Any]:
+        """Rounded values as written to the CSV and JSON exports."""
+        return {
+            "name": self.name,
+            "original_path": self.original_path,
+            "damaged_path": self.damaged_path,
+            "estimated_line_width": round(self.estimated_line_width, 1),
+            "psnr_before": round(self.psnr_before, 4),
+            "psnr_after": round(self.psnr_after, 4),
+            "delta_psnr": round(self.delta_psnr, 4),
+            "ssim_before": round(self.ssim_before, 6),
+            "ssim_after": round(self.ssim_after, 6),
+            "delta_ssim": round(self.delta_ssim, 6),
+            "restoration_time_s": round(self.restoration_time_s, 3),
+            "error": self.error,
+        }
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Pair discovery
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _images_by_basename(directory: str, kind: str) -> Dict[str, str]:
+    """Map basename (no extension) -> path for the images in a dataset directory."""
+    if not os.path.isdir(directory):
+        print(f"\nError: {kind} dataset directory not found at '{directory}'.")
+        print("Please download the test dataset from the link in the README and extract it correctly.")
+        sys.exit(1)
+    return {
+        os.path.splitext(f)[0]: os.path.join(directory, f)
+        for f in os.listdir(directory)
+        if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS
+    }
+
 
 def discover_pairs(
     original_dir: str = ORIGINAL_DIR,
@@ -93,36 +135,15 @@ def discover_pairs(
     Returns:
         List of (name, original_path, damaged_path) tuples, sorted by name.
     """
-    if not os.path.isdir(original_dir):
-        print(f"\nError: Original dataset directory not found at '{original_dir}'.")
-        print("Please download the test dataset from the link in the README and extract it correctly.")
-        sys.exit(1)
-    if not os.path.isdir(damaged_dir):
-        print(f"\nError: Damaged dataset directory not found at '{damaged_dir}'.")
-        print("Please download the test dataset from the link in the README and extract it correctly.")
-        sys.exit(1)
+    originals = _images_by_basename(original_dir, "Original")
+    damaged = _images_by_basename(damaged_dir, "Damaged")
 
-    originals = {}
-    for f in os.listdir(original_dir):
-        base, ext = os.path.splitext(f)
-        if ext.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
-            originals[base] = os.path.join(original_dir, f)
-
-    damaged = {}
-    for f in os.listdir(damaged_dir):
-        base, ext = os.path.splitext(f)
-        if ext.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
-            damaged[base] = os.path.join(damaged_dir, f)
-
-    pairs = []
-    for name, orig_path in sorted(originals.items()):
-        damaged_name = name + "_damaged"
-        if damaged_name in damaged:
-            if name_filter and name_filter.lower() not in name.lower():
-                continue
-            pairs.append((name, orig_path, damaged[damaged_name]))
-
-    return pairs
+    return [
+        (name, orig_path, damaged[name + "_damaged"])
+        for name, orig_path in sorted(originals.items())
+        if name + "_damaged" in damaged
+        and (not name_filter or name_filter.lower() in name.lower())
+    ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -133,14 +154,10 @@ def compute_metrics(
     original: np.ndarray,
     comparison: np.ndarray,
 ) -> Tuple[float, float]:
-    """Compute PSNR and SSIM between two grayscale images.
+    """Compute (PSNR, SSIM) between two grayscale images.
 
-    Both images must have the same shape.
-
-    Returns:
-        (psnr, ssim) tuple.
+    The comparison image is resized to the original's shape if they differ.
     """
-    # Ensure same shape
     if original.shape != comparison.shape:
         comparison = cv2.resize(
             comparison, (original.shape[1], original.shape[0]),
@@ -149,7 +166,6 @@ def compute_metrics(
 
     psnr = float(peak_signal_noise_ratio(original, comparison, data_range=255))
     ssim = float(structural_similarity(original, comparison, data_range=255))
-
     return psnr, ssim
 
 
@@ -175,49 +191,32 @@ def evaluate_single(
         ImageMetrics with before/after PSNR and SSIM.
     """
     os.makedirs(output_dir, exist_ok=True)
+    metrics = ImageMetrics(name=name, original_path=original_path, damaged_path=damaged_path)
 
     # Load images as grayscale
     original = cv2.imread(original_path, cv2.IMREAD_GRAYSCALE)
     damaged = cv2.imread(damaged_path, cv2.IMREAD_GRAYSCALE)
-
     if original is None:
-        return ImageMetrics(
-            name=name, original_path=original_path, damaged_path=damaged_path,
-            estimated_line_width=0.0,
-            psnr_before=0.0, ssim_before=0.0,
-            psnr_after=0.0, ssim_after=0.0,
-            error=f"Cannot read original image: {original_path}",
-        )
+        metrics.error = f"Cannot read original image: {original_path}"
+        return metrics
     if damaged is None:
-        return ImageMetrics(
-            name=name, original_path=original_path, damaged_path=damaged_path,
-            estimated_line_width=0.0,
-            psnr_before=0.0, ssim_before=0.0,
-            psnr_after=0.0, ssim_after=0.0,
-            error=f"Cannot read damaged image: {damaged_path}",
-        )
+        metrics.error = f"Cannot read damaged image: {damaged_path}"
+        return metrics
 
-    # Estimate line width from original
-    line_width = estimate_line_width(original)
+    metrics.estimated_line_width = estimate_line_width(original)
 
     # Baseline metrics: damaged vs. original
-    psnr_before, ssim_before = compute_metrics(original, damaged)
+    metrics.psnr_before, metrics.ssim_before = compute_metrics(original, damaged)
 
     # Run restoration
     t0 = time.perf_counter()
     try:
         result = restore(damaged_path, output_dir=output_dir)
     except Exception as e:
-        elapsed = time.perf_counter() - t0
-        return ImageMetrics(
-            name=name, original_path=original_path, damaged_path=damaged_path,
-            estimated_line_width=line_width,
-            psnr_before=psnr_before, ssim_before=ssim_before,
-            psnr_after=0.0, ssim_after=0.0,
-            restoration_time_s=elapsed,
-            error=f"Restoration failed: {e}",
-        )
-    elapsed = time.perf_counter() - t0
+        metrics.restoration_time_s = time.perf_counter() - t0
+        metrics.error = f"Restoration failed: {e}"
+        return metrics
+    metrics.restoration_time_s = time.perf_counter() - t0
 
     # Render bridges on top of the damaged image
     restored_image = render_bridges_on_damaged(
@@ -225,28 +224,12 @@ def evaluate_single(
         damaged_image=damaged,
         original_image=original,
     )
-
-    # Save restored image
-    restored_path = os.path.join(output_dir, f"{name}_restored.png")
-    cv2.imwrite(restored_path, restored_image)
+    cv2.imwrite(os.path.join(output_dir, f"{name}_restored.png"), restored_image)
 
     # Restored metrics: damaged + bridges vs. original
-    psnr_after, ssim_after = compute_metrics(original, restored_image)
-
-    metrics = ImageMetrics(
-        name=name,
-        original_path=original_path,
-        damaged_path=damaged_path,
-        estimated_line_width=line_width,
-        psnr_before=psnr_before,
-        ssim_before=ssim_before,
-        psnr_after=psnr_after,
-        ssim_after=ssim_after,
-        delta_psnr=psnr_after - psnr_before,
-        delta_ssim=ssim_after - ssim_before,
-        restoration_time_s=elapsed,
-    )
-
+    metrics.psnr_after, metrics.ssim_after = compute_metrics(original, restored_image)
+    metrics.delta_psnr = metrics.psnr_after - metrics.psnr_before
+    metrics.delta_ssim = metrics.ssim_after - metrics.ssim_before
     return metrics
 
 
@@ -284,6 +267,12 @@ def print_table_row(m: ImageMetrics) -> None:
     )
 
 
+def _improved_degraded(valid: List[ImageMetrics], field: str) -> Tuple[int, int]:
+    """Number of images whose *field* delta is positive / negative."""
+    deltas = [getattr(m, field) for m in valid]
+    return sum(1 for d in deltas if d > 0), sum(1 for d in deltas if d < 0)
+
+
 def print_aggregate_summary(results: List[ImageMetrics]) -> None:
     """Print aggregate statistics."""
     valid = [m for m in results if m.error is None]
@@ -296,16 +285,11 @@ def print_aggregate_summary(results: List[ImageMetrics]) -> None:
     print(f"  AGGREGATE SUMMARY ({len(valid)} images)")
     print(sep)
 
-    psnr_before = [m.psnr_before for m in valid]
-    psnr_after = [m.psnr_after for m in valid]
-    ssim_before = [m.ssim_before for m in valid]
-    ssim_after = [m.ssim_after for m in valid]
-    delta_psnr = [m.delta_psnr for m in valid]
-    delta_ssim = [m.delta_ssim for m in valid]
-
-    def _stat_line(label: str, values: List[float], fmt: str = ".2f") -> str:
-        arr = np.array(values)
-        return (
+    for field, label, fmt in METRICS:
+        if field == "ssim_before":
+            print()
+        arr = np.array([getattr(m, field) for m in valid])
+        print(
             f"  {label:<22s} | "
             f"Mean={np.mean(arr):{fmt}}  "
             f"Median={np.median(arr):{fmt}}  "
@@ -313,23 +297,11 @@ def print_aggregate_summary(results: List[ImageMetrics]) -> None:
             f"Max={np.max(arr):{fmt}}"
         )
 
-    print(_stat_line("PSNR (before)", psnr_before))
-    print(_stat_line("PSNR (after)", psnr_after))
-    print(_stat_line("d PSNR", delta_psnr))
     print()
-    print(_stat_line("SSIM (before)", ssim_before, fmt=".4f"))
-    print(_stat_line("SSIM (after)", ssim_after, fmt=".4f"))
-    print(_stat_line("d SSIM", delta_ssim, fmt=".4f"))
-
-    improved_psnr = sum(1 for d in delta_psnr if d > 0)
-    degraded_psnr = sum(1 for d in delta_psnr if d < 0)
-    improved_ssim = sum(1 for d in delta_ssim if d > 0)
-    degraded_ssim = sum(1 for d in delta_ssim if d < 0)
-
-    print(f"\n  PSNR: {improved_psnr} improved, {degraded_psnr} degraded, "
-          f"{len(valid) - improved_psnr - degraded_psnr} unchanged")
-    print(f"  SSIM: {improved_ssim} improved, {degraded_ssim} degraded, "
-          f"{len(valid) - improved_ssim - degraded_ssim} unchanged")
+    for metric in ("psnr", "ssim"):
+        improved, degraded = _improved_degraded(valid, f"delta_{metric}")
+        print(f"  {metric.upper()}: {improved} improved, {degraded} degraded, "
+              f"{len(valid) - improved - degraded} unchanged")
 
     total_time = sum(m.restoration_time_s for m in valid)
     print(f"\n  Total processing time: {total_time:.1f}s "
@@ -358,21 +330,10 @@ def export_csv(results: List[ImageMetrics], output_path: str) -> None:
     ]
 
     with open(output_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for m in results:
-            writer.writerow({
-                "name": m.name,
-                "estimated_line_width": round(m.estimated_line_width, 1),
-                "psnr_before": round(m.psnr_before, 4),
-                "psnr_after": round(m.psnr_after, 4),
-                "delta_psnr": round(m.delta_psnr, 4),
-                "ssim_before": round(m.ssim_before, 6),
-                "ssim_after": round(m.ssim_after, 6),
-                "delta_ssim": round(m.delta_ssim, 6),
-                "restoration_time_s": round(m.restoration_time_s, 3),
-                "error": m.error or "",
-            })
+            writer.writerow(m.as_row())
 
     print(f"\n  CSV saved -> {output_path}")
 
@@ -381,10 +342,10 @@ def export_json(results: List[ImageMetrics], output_path: str) -> None:
     """Export full evaluation report to JSON."""
     valid = [m for m in results if m.error is None]
 
-    def _stats(values: List[float]) -> Dict[str, float]:
-        if not values:
+    def stats(field: str) -> Dict[str, float]:
+        if not valid:
             return {"mean": 0.0, "median": 0.0, "min": 0.0, "max": 0.0}
-        arr = np.array(values)
+        arr = np.array([getattr(m, field) for m in valid])
         return {
             "mean": round(float(np.mean(arr)), 4),
             "median": round(float(np.median(arr)), 4),
@@ -392,40 +353,21 @@ def export_json(results: List[ImageMetrics], output_path: str) -> None:
             "max": round(float(np.max(arr)), 4),
         }
 
+    psnr_improved, psnr_degraded = _improved_degraded(valid, "delta_psnr")
+    ssim_improved, ssim_degraded = _improved_degraded(valid, "delta_ssim")
     report = {
         "evaluation_summary": {
             "total_pairs": len(results),
             "successful": len(valid),
             "failed": len(results) - len(valid),
-            "psnr_before": _stats([m.psnr_before for m in valid]),
-            "psnr_after": _stats([m.psnr_after for m in valid]),
-            "delta_psnr": _stats([m.delta_psnr for m in valid]),
-            "ssim_before": _stats([m.ssim_before for m in valid]),
-            "ssim_after": _stats([m.ssim_after for m in valid]),
-            "delta_ssim": _stats([m.delta_ssim for m in valid]),
+            **{field: stats(field) for field, _, _ in METRICS},
             "total_time_s": round(sum(m.restoration_time_s for m in valid), 3),
-            "psnr_improved_count": sum(1 for m in valid if m.delta_psnr > 0),
-            "psnr_degraded_count": sum(1 for m in valid if m.delta_psnr < 0),
-            "ssim_improved_count": sum(1 for m in valid if m.delta_ssim > 0),
-            "ssim_degraded_count": sum(1 for m in valid if m.delta_ssim < 0),
+            "psnr_improved_count": psnr_improved,
+            "psnr_degraded_count": psnr_degraded,
+            "ssim_improved_count": ssim_improved,
+            "ssim_degraded_count": ssim_degraded,
         },
-        "per_image": [
-            {
-                "name": m.name,
-                "original_path": m.original_path,
-                "damaged_path": m.damaged_path,
-                "estimated_line_width": round(m.estimated_line_width, 1),
-                "psnr_before": round(m.psnr_before, 4),
-                "psnr_after": round(m.psnr_after, 4),
-                "delta_psnr": round(m.delta_psnr, 4),
-                "ssim_before": round(m.ssim_before, 6),
-                "ssim_after": round(m.ssim_after, 6),
-                "delta_ssim": round(m.delta_ssim, 6),
-                "restoration_time_s": round(m.restoration_time_s, 3),
-                "error": m.error,
-            }
-            for m in results
-        ],
+        "per_image": [m.as_row() for m in results],
     }
 
     with open(output_path, "w") as f:
@@ -450,13 +392,6 @@ def export_graphs(results: List[ImageMetrics], output_dir: str) -> None:
         return
 
     names = [m.name for m in valid]
-    psnr_before = [m.psnr_before for m in valid]
-    psnr_after = [m.psnr_after for m in valid]
-    ssim_before = [m.ssim_before for m in valid]
-    ssim_after = [m.ssim_after for m in valid]
-    d_psnr = [m.delta_psnr for m in valid]
-    d_ssim = [m.delta_ssim for m in valid]
-
     n = len(valid)
     x = np.arange(n)
     bar_w = 0.35
@@ -464,49 +399,33 @@ def export_graphs(results: List[ImageMetrics], output_dir: str) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(max(14, n * 0.55), 10))
     fig.suptitle("Restoration Evaluation Results", fontsize=16, fontweight="bold", y=0.98)
 
-    # --- Panel 1: PSNR before / after ---
-    ax = axes[0, 0]
-    ax.bar(x - bar_w / 2, psnr_before, bar_w, label="Damaged", color="#e74c3c", alpha=0.85)
-    ax.bar(x + bar_w / 2, psnr_after, bar_w, label="Restored", color="#2ecc71", alpha=0.85)
-    ax.set_ylabel("PSNR (dB)")
-    ax.set_title("PSNR: Damaged vs Restored")
-    ax.set_xticks(x)
-    ax.set_xticklabels(names, rotation=55, ha="right", fontsize=7)
-    ax.legend(fontsize=8)
-    ax.grid(axis="y", alpha=0.3)
+    def label_images(ax) -> None:
+        ax.set_xticks(x)
+        ax.set_xticklabels(names, rotation=55, ha="right", fontsize=7)
 
-    # --- Panel 2: SSIM before / after ---
-    ax = axes[0, 1]
-    ax.bar(x - bar_w / 2, ssim_before, bar_w, label="Damaged", color="#e74c3c", alpha=0.85)
-    ax.bar(x + bar_w / 2, ssim_after, bar_w, label="Restored", color="#2ecc71", alpha=0.85)
-    ax.set_ylabel("SSIM")
-    ax.set_title("SSIM: Damaged vs Restored")
-    ax.set_xticks(x)
-    ax.set_xticklabels(names, rotation=55, ha="right", fontsize=7)
-    ax.legend(fontsize=8)
-    ax.grid(axis="y", alpha=0.3)
+    # One column per metric: before/after bars on top, the change below.
+    for col, (metric, unit) in enumerate((("PSNR", " (dB)"), ("SSIM", ""))):
+        before = [getattr(m, f"{metric.lower()}_before") for m in valid]
+        after = [getattr(m, f"{metric.lower()}_after") for m in valid]
+        delta = [getattr(m, f"delta_{metric.lower()}") for m in valid]
 
-    # --- Panel 3: Delta PSNR ---
-    ax = axes[1, 0]
-    colors_psnr = ["#2ecc71" if d >= 0 else "#e74c3c" for d in d_psnr]
-    ax.bar(x, d_psnr, color=colors_psnr, alpha=0.85)
-    ax.axhline(0, color="black", linewidth=0.8)
-    ax.set_ylabel("Delta PSNR (dB)")
-    ax.set_title("PSNR Change (Restored - Damaged)")
-    ax.set_xticks(x)
-    ax.set_xticklabels(names, rotation=55, ha="right", fontsize=7)
-    ax.grid(axis="y", alpha=0.3)
+        ax = axes[0, col]
+        ax.bar(x - bar_w / 2, before, bar_w, label="Damaged", color="#e74c3c", alpha=0.85)
+        ax.bar(x + bar_w / 2, after, bar_w, label="Restored", color="#2ecc71", alpha=0.85)
+        ax.set_ylabel(f"{metric}{unit}")
+        ax.set_title(f"{metric}: Damaged vs Restored")
+        label_images(ax)
+        ax.legend(fontsize=8)
+        ax.grid(axis="y", alpha=0.3)
 
-    # --- Panel 4: Delta SSIM ---
-    ax = axes[1, 1]
-    colors_ssim = ["#2ecc71" if d >= 0 else "#e74c3c" for d in d_ssim]
-    ax.bar(x, d_ssim, color=colors_ssim, alpha=0.85)
-    ax.axhline(0, color="black", linewidth=0.8)
-    ax.set_ylabel("Delta SSIM")
-    ax.set_title("SSIM Change (Restored - Damaged)")
-    ax.set_xticks(x)
-    ax.set_xticklabels(names, rotation=55, ha="right", fontsize=7)
-    ax.grid(axis="y", alpha=0.3)
+        ax = axes[1, col]
+        colors = ["#2ecc71" if d >= 0 else "#e74c3c" for d in delta]
+        ax.bar(x, delta, color=colors, alpha=0.85)
+        ax.axhline(0, color="black", linewidth=0.8)
+        ax.set_ylabel(f"Delta {metric}{unit}")
+        ax.set_title(f"{metric} Change (Restored - Damaged)")
+        label_images(ax)
+        ax.grid(axis="y", alpha=0.3)
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     graph_path = os.path.join(output_dir, "evaluation_results.png")
