@@ -6,11 +6,11 @@ into the restored path set.
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from bezier_curves.bezier import BezierPath, BezierSegment
+from bezier_curves.bezier import BezierPath, BezierSegment, fit_straight_cubic
 from restoration.extraction import EndpointInfo
 from restoration.candidates import ConnectionCandidate
 from restoration.geometry import polyline_length, safe_normalize
@@ -33,27 +33,28 @@ def _stabilize_bridge_control_points(cp: np.ndarray) -> np.ndarray:
     rescue_forward = 0.08 * chord
     max_side = 0.60 * chord
 
-    v1 = p1 - p0
-    proj1 = float(np.dot(v1, chord_dir))
-    side1 = v1 - proj1 * chord_dir
-    side1_norm = float(np.linalg.norm(side1))
-    if proj1 < min_forward:
-        proj1 = rescue_forward
-    if side1_norm > max_side and side1_norm > 1e-12:
-        side1 = side1 * (max_side / side1_norm)
-    p1_new = p0 + proj1 * chord_dir + side1
+    def clamp(handle: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Split a handle into (along-chord, sideways) parts, each kept in range."""
+        proj = float(np.dot(handle, chord_dir))
+        side = handle - proj * chord_dir
+        side_norm = float(np.linalg.norm(side))
+        if proj < min_forward:
+            proj = rescue_forward
+        if side_norm > max_side and side_norm > 1e-12:
+            side = side * (max_side / side_norm)
+        return proj * chord_dir, side
 
-    v2 = p3 - p2
-    proj2 = float(np.dot(v2, chord_dir))
-    side2 = v2 - proj2 * chord_dir
-    side2_norm = float(np.linalg.norm(side2))
-    if proj2 < min_forward:
-        proj2 = rescue_forward
-    if side2_norm > max_side and side2_norm > 1e-12:
-        side2 = side2 * (max_side / side2_norm)
-    p2_new = p3 - (proj2 * chord_dir + side2)
+    along1, side1 = clamp(p1 - p0)
+    along2, side2 = clamp(p3 - p2)
+    return np.vstack([p0, p0 + along1 + side1, p3 - (along2 + side2), p3])
 
-    return np.vstack([p0, p1_new, p2_new, p3])
+
+def _bridge(cp: np.ndarray) -> BezierSegment:
+    """Bridge segment from raw control points, with stabilized handles."""
+    return BezierSegment(
+        control_points=_stabilize_bridge_control_points(cp),
+        source_type="bridge",
+    )
 
 
 def _is_straight(curvature_a: float, curvature_b: float,
@@ -70,23 +71,7 @@ def _is_straight(curvature_a: float, curvature_b: float,
 
 def _build_straight_bridge(ep_a: EndpointInfo, ep_b: EndpointInfo) -> BezierSegment:
     """Exactly straight cubic Bezier between two endpoints."""
-    p0 = ep_a.position.copy()
-    p3 = ep_b.position.copy()
-    d = p3 - p0
-    norm = np.linalg.norm(d)
-    if norm < 1e-12:
-        d = np.array([1.0, 0.0])
-        norm = 1.0
-    unit = d / norm
-    step = norm / 3.0
-    p1 = p0 + unit * step
-    p2 = p3 - unit * step
-    cp = np.vstack([p0, p1, p2, p3])
-    cp = _stabilize_bridge_control_points(cp)
-    return BezierSegment(
-        control_points=cp,
-        source_type="bridge",
-    )
+    return _bridge(fit_straight_cubic(ep_a.position, ep_b.position))
 
 
 def _build_g1_bridge(ep_a: EndpointInfo, ep_b: EndpointInfo) -> BezierSegment:
@@ -109,52 +94,32 @@ def _build_g1_bridge(ep_a: EndpointInfo, ep_b: EndpointInfo) -> BezierSegment:
     # ep_b.tangent is outward; incoming derivative at p3 should align with -ep_b.tangent.
     p2 = p3 + alpha_b * ep_b.tangent
 
-    cp = np.vstack([p0, p1, p2, p3])
-    cp = _stabilize_bridge_control_points(cp)
-
-    return BezierSegment(
-        control_points=cp,
-        source_type="bridge",
-    )
+    return _bridge(np.vstack([p0, p1, p2, p3]))
 
 
 def _build_intersection_bridge_linear(
     ep_a: EndpointInfo, ep_b: EndpointInfo, intersection: np.ndarray,
 ) -> List[BezierSegment]:
     """Two straight-ish segments through an intersection point (corner)."""
-    I = intersection.copy()
     segments: List[BezierSegment] = []
-
-    # Segment A → I
-    p0 = ep_a.position.copy()
-    p3 = I
-    chord = float(np.linalg.norm(p3 - p0))
-    if chord > 1e-6:
+    # (start, end, tangent leaving the start endpoint, outward tangent of the end endpoint)
+    legs: Tuple[Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]], ...] = (
+        (ep_a.position, intersection, ep_a.tangent, None),
+        (intersection, ep_b.position, None, ep_b.tangent),
+    )
+    for p0, p3, start_tangent, end_tangent in legs:
+        chord = float(np.linalg.norm(p3 - p0))
+        if chord <= 1e-6:
+            continue
         alpha = chord / 3.0
-        p1 = p0 + alpha * ep_a.tangent
-        p2 = p3 - alpha * safe_normalize(p3 - p0)
-        cp = np.vstack([p0, p1, p2, p3])
-        cp = _stabilize_bridge_control_points(cp)
-        segments.append(BezierSegment(
-            control_points=cp,
-            source_type="bridge",
-        ))
-
-    # Segment I → B
-    p0 = I
-    p3 = ep_b.position.copy()
-    chord = float(np.linalg.norm(p3 - p0))
-    if chord > 1e-6:
-        alpha = chord / 3.0
-        p1 = p0 + alpha * safe_normalize(p3 - p0)
-        # ep_b.tangent is outward; incoming derivative at p3 should align with -ep_b.tangent.
-        p2 = p3 + alpha * ep_b.tangent
-        cp = np.vstack([p0, p1, p2, p3])
-        cp = _stabilize_bridge_control_points(cp)
-        segments.append(BezierSegment(
-            control_points=cp,
-            source_type="bridge",
-        ))
+        toward_end = safe_normalize(p3 - p0)
+        p1 = p0 + alpha * (toward_end if start_tangent is None else start_tangent)
+        if end_tangent is None:
+            p2 = p3 - alpha * toward_end
+        else:
+            # The tangent is outward; the incoming derivative at p3 should align with -tangent.
+            p2 = p3 + alpha * end_tangent
+        segments.append(_bridge(np.vstack([p0, p1, p2, p3])))
 
     return segments
 
@@ -204,10 +169,9 @@ def synthesize_bridges(
 
 def merge_restored_paths(
     original_paths: List[BezierPath],
-    bridges: List[BezierSegment],
     accepted: List[ConnectionCandidate],
 ) -> List[BezierPath]:
-    """Merge bridge segments into the original path set.
+    """Merge the accepted candidates' bridge segments into the original path set.
 
     For each accepted connection:
       - If the bridge connects path A's end to path B's start,
@@ -216,104 +180,53 @@ def merge_restored_paths(
 
     Returns the new set of paths (some merged, some untouched).
     """
-    # An endpoint token is the (path_index, end) of an original open path end.
-    def endpoint_token_from_info(ep: EndpointInfo) -> Tuple[int, str]:
-        return (ep.path_index, ep.end)
-
-    def reverse_component(comp: Dict[str, object]) -> None:
-        comp["segments"] = _reverse_segments(comp["segments"])
-        comp["start_token"], comp["end_token"] = comp["end_token"], comp["start_token"]
-
-    def orient_component_to_end(comp: Dict[str, object], token: Tuple[int, str]) -> bool:
-        if comp["end_token"] == token:
-            return True
-        if comp["start_token"] == token:
-            reverse_component(comp)
-            return True
-        return False
-
-    def orient_component_to_start(comp: Dict[str, object], token: Tuple[int, str]) -> bool:
-        if comp["start_token"] == token:
-            return True
-        if comp["end_token"] == token:
-            reverse_component(comp)
-            return True
-        return False
-
-    def rebuild_endpoint_to_component(active: Dict[int, Dict[str, object]]) -> Dict[Tuple[int, str], int]:
-        mapping: Dict[Tuple[int, str], int] = {}
-        for cid, comp in active.items():
-            start_token = comp.get("start_token")
-            end_token = comp.get("end_token")
-            if start_token is not None:
-                mapping[start_token] = cid
-            if end_token is not None:
-                mapping[end_token] = cid
-        return mapping
-
-    active: Dict[int, Dict[str, object]] = {}
+    # A component is a chain of segments plus the tokens of its two free ends.
+    # A token is the (path_index, end) of an original open path end; it is None
+    # for closed paths and once a bridge has closed the component.
+    active: Dict[int, Dict[str, Any]] = {}
     for i, path in enumerate(original_paths):
-        if path.is_closed or not path.segments:
-            start_token = None
-            end_token = None
-        else:
-            start_token = (i, "start")
-            end_token = (i, "end")
-
+        is_open = not path.is_closed and bool(path.segments)
         active[i] = {
             "segments": list(path.segments),
-            "start_token": start_token,
-            "end_token": end_token,
+            "start_token": (i, "start") if is_open else None,
+            "end_token": (i, "end") if is_open else None,
         }
 
-    endpoint_to_component = rebuild_endpoint_to_component(active)
+    def component_with(token: Tuple[int, str]) -> Optional[int]:
+        return next(
+            (cid for cid, comp in active.items()
+             if token in (comp["start_token"], comp["end_token"])),
+            None,
+        )
 
-    ordered_connections = sorted(accepted, key=lambda c: (-c.score, c.distance, c.id))
+    def orient(comp: Dict[str, Any], side: str, token: Tuple[int, str]) -> None:
+        """Reverse *comp* if needed so that *token* is its *side* end."""
+        if comp[side] != token:
+            comp["segments"] = _reverse_segments(comp["segments"])
+            comp["start_token"], comp["end_token"] = comp["end_token"], comp["start_token"]
 
-    for c in ordered_connections:
-        token_a = endpoint_token_from_info(c.ep_a)
-        token_b = endpoint_token_from_info(c.ep_b)
-
-        comp_a_id = endpoint_to_component.get(token_a)
-        comp_b_id = endpoint_to_component.get(token_b)
-        if comp_a_id is None or comp_b_id is None:
+    for c in sorted(accepted, key=lambda c: (-c.score, c.distance, c.id)):
+        token_a = (c.ep_a.path_index, c.ep_a.end)
+        token_b = (c.ep_b.path_index, c.ep_b.end)
+        id_a, id_b = component_with(token_a), component_with(token_b)
+        if id_a is None or id_b is None or token_a == token_b:
             continue
 
-        comp_a = active.get(comp_a_id)
-        comp_b = active.get(comp_b_id)
-        if comp_a is None or comp_b is None:
-            continue
-
-        if comp_a_id == comp_b_id:
-            if token_a == token_b:
-                continue
-            if not orient_component_to_end(comp_a, token_a):
-                continue
-            if comp_a.get("start_token") != token_b:
-                continue
-
+        comp_a = active[id_a]
+        orient(comp_a, "end_token", token_a)
+        if id_a == id_b:
+            # The bridge closes this component onto itself.
             comp_a["segments"] = comp_a["segments"] + list(c.bridge_bezier)
-            comp_a["start_token"] = None
-            comp_a["end_token"] = None
-            endpoint_to_component = rebuild_endpoint_to_component(active)
+            comp_a["start_token"] = comp_a["end_token"] = None
             continue
 
-        if not orient_component_to_end(comp_a, token_a):
-            continue
-        if not orient_component_to_start(comp_b, token_b):
-            continue
-
-        merged_segments = comp_a["segments"] + list(c.bridge_bezier) + comp_b["segments"]
-        merged_start = comp_a.get("start_token")
-        merged_end = comp_b.get("end_token")
-
-        active[comp_a_id] = {
-            "segments": merged_segments,
-            "start_token": merged_start,
-            "end_token": merged_end,
+        comp_b = active.pop(id_b)
+        orient(comp_b, "start_token", token_b)
+        active[id_a] = {
+            "segments": comp_a["segments"] + list(c.bridge_bezier) + comp_b["segments"],
+            "start_token": comp_a["start_token"],
+            "end_token": comp_b["end_token"],
         }
-        del active[comp_b_id]
-        endpoint_to_component = rebuild_endpoint_to_component(active)
 
     result: List[BezierPath] = []
     for comp in active.values():
@@ -337,11 +250,8 @@ def merge_restored_paths(
 
 
 def _reverse_segments(segments: List[BezierSegment]) -> List[BezierSegment]:
-    """Reverse segment order and flip each segment's control points."""
-    reversed_segs: List[BezierSegment] = []
-    for seg in reversed(segments):
-        cp = seg.control_points[::-1].copy()
-        reversed_segs.append(BezierSegment(
-            control_points=cp, source_type=seg.source_type,
-        ))
-    return reversed_segs
+    """Reversed copy: segment order and each segment's control points flipped."""
+    return [
+        BezierSegment(control_points=seg.control_points[::-1].copy(), source_type=seg.source_type)
+        for seg in reversed(segments)
+    ]

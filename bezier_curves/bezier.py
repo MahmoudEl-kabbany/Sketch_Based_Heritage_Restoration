@@ -340,7 +340,7 @@ def _dominant_turn_index(points: np.ndarray, angle_threshold_deg: float = 70.0) 
     return max(1, min(best_idx, len(points) - 2))
 
 
-def _fit_straight_cubic(p0: np.ndarray, p3: np.ndarray) -> np.ndarray:
+def fit_straight_cubic(p0: np.ndarray, p3: np.ndarray) -> np.ndarray:
     """Create an exactly straight cubic Bezier between endpoints."""
     direction = p3 - p0
     norm = np.linalg.norm(direction)
@@ -397,7 +397,7 @@ def _fit_cubic_single(
 
     linear_tol = max(0.5, math.sqrt(max_error) * straightness_scale)
     if _is_near_straight(points, linear_tol):
-        return [_fit_straight_cubic(points[0], points[-1])]
+        return [fit_straight_cubic(points[0], points[-1])]
 
     corner_idx = _dominant_turn_index(points, angle_threshold_deg=corner_split_angle_deg)
     if corner_idx is not None:
@@ -431,7 +431,7 @@ def _fit_cubic_single(
         return left_curves + right_curves
 
     params = _chord_length_parameterize(points)
-    straight_cp = _fit_straight_cubic(points[0], points[-1])
+    straight_cp = fit_straight_cubic(points[0], points[-1])
     straight_err, straight_mean_err, _ = _fit_error_stats(points, straight_cp, params)
 
     cp = _generate_bezier(points, params, left_tangent, right_tangent)

@@ -9,56 +9,24 @@ from __future__ import annotations
 import os
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
+import cv2
 import numpy as np
 
 from restoration.candidates import ConnectionCandidate
 
 RULES_PATH = os.path.join(os.path.dirname(__file__), "asp_rules", "restoration.lp")
-_CLINGO_OPTION_ARGS_CACHE: Optional[List[str]] = None
 
 
-def _base_control_args(max_solutions: int) -> List[str]:
-    """Build base clingo control args with stable optimization semantics."""
-    return [
-        f"--models={max_solutions}",
-        "--opt-mode=optN",
-    ]
-
-
-def _discover_optional_control_args(base_args: List[str]) -> List[str]:
-    """Probe optional clingo args for runtime speedup with compatibility guards."""
-    import clingo
-
-    conservative = os.environ.get("RESTORATION_CLINGO_CONSERVATIVE", "0") == "1"
-    if conservative:
-        return []
-
-    workers = max(2, min(8, int(os.cpu_count() or 2)))
-    thread_options = [
-        f"--threads={workers}",
-        f"--parallel-mode={workers}",
-        f"-t{workers}",
-    ]
-
-    for opt in thread_options:
-        try:
-            clingo.Control(base_args + [opt])
-            return [opt]
-        except RuntimeError:
-            continue
-
-    return []
-
-
-def _build_control_args(max_solutions: int) -> List[str]:
-    """Return base + compatible optional clingo args (cached after first probe)."""
-    global _CLINGO_OPTION_ARGS_CACHE
-    base_args = _base_control_args(max_solutions)
-    if _CLINGO_OPTION_ARGS_CACHE is None:
-        _CLINGO_OPTION_ARGS_CACHE = _discover_optional_control_args(base_args)
-    return base_args + list(_CLINGO_OPTION_ARGS_CACHE)
+def _control_args(max_solutions: int) -> List[str]:
+    """clingo arguments: enumerate optimal models, solving in parallel unless
+    RESTORATION_CLINGO_CONSERVATIVE=1 asks for a single thread."""
+    args = [f"--models={max_solutions}", "--opt-mode=optN"]
+    if os.environ.get("RESTORATION_CLINGO_CONSERVATIVE", "0") != "1":
+        workers = max(2, min(8, int(os.cpu_count() or 2)))
+        args.append(f"--parallel-mode={workers}")
+    return args
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -72,11 +40,9 @@ def _to_int_score(value: float, scale: int = 100) -> int:
 
 def _compute_nested_shape_pairs(
     candidates: List[ConnectionCandidate],
-    extraction: "ExtractionResult"
+    extraction: "ExtractionResult",
 ) -> Set[Tuple[int, int]]:
-    import cv2
-    import numpy as np
-    
+    """Path pairs where one path starts inside the convex hull of the other, closed, path."""
     hulls = {}
     for i, path in enumerate(extraction.paths):
         if not path.is_closed or not path.segments:
@@ -84,28 +50,21 @@ def _compute_nested_shape_pairs(
         samples = path.sample(20)
         if len(samples) > 2:
             hulls[i] = cv2.convexHull(samples.astype(np.float32))
-            
+
     nested_pairs = set()
     for c in candidates:
         idx_a = int(c.ep_a.path_index)
         idx_b = int(c.ep_b.path_index)
         if idx_a == idx_b:
             continue
-            
-        if idx_b in hulls:
-            path_a = extraction.paths[idx_a]
-            if path_a.segments:
-                pt_a = path_a.segments[0].control_points[0]
-                if cv2.pointPolygonTest(hulls[idx_b], (float(pt_a[0]), float(pt_a[1])), False) >= 0:
+
+        for inner, outer in ((idx_a, idx_b), (idx_b, idx_a)):
+            inner_segments = extraction.paths[inner].segments
+            if outer in hulls and inner_segments:
+                pt = inner_segments[0].control_points[0]
+                if cv2.pointPolygonTest(hulls[outer], (float(pt[0]), float(pt[1])), False) >= 0:
                     nested_pairs.add((min(idx_a, idx_b), max(idx_a, idx_b)))
-                    
-        if idx_a in hulls:
-            path_b = extraction.paths[idx_b]
-            if path_b.segments:
-                pt_b = path_b.segments[0].control_points[0]
-                if cv2.pointPolygonTest(hulls[idx_a], (float(pt_b[0]), float(pt_b[1])), False) >= 0:
-                    nested_pairs.add((min(idx_a, idx_b), max(idx_a, idx_b)))
-                    
+
     return nested_pairs
 
 
@@ -318,7 +277,7 @@ def _solve_facts(
     """Run clingo on one fact bundle and return accepted candidate IDs."""
     import clingo
 
-    ctl = clingo.Control(_build_control_args(max_solutions))
+    ctl = clingo.Control(_control_args(max_solutions))
 
     ctl.load(rules_path)
     ctl.add("base", [], facts)
@@ -417,7 +376,7 @@ def solve_partitioned(
         "component_partition_enabled": bool(enable_component_partition),
         "dominance_pruning_enabled": bool(enable_dominance_pruning),
         "partition_fallback_reason": str(partition_fallback_reason),
-        "control_args": list(_build_control_args(max_solutions)),
+        "control_args": _control_args(max_solutions),
     }
     return sorted(accepted_ids), summary
 

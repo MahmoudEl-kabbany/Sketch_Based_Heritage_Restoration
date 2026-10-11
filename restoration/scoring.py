@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 from dtaidistance import dtw
+from scipy.spatial import cKDTree
 
 from bezier_curves.bezier import BezierPath
 from restoration.extraction import EndpointInfo, ExtractionResult
@@ -41,25 +42,21 @@ WEIGHTS_TIER2 = {
 # Metric computations
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _compute_mdtw(
+def context_curve(
     bridge_pts: np.ndarray,
-    source_path: BezierPath,
-    target_path: BezierPath,
+    source_samples: np.ndarray,
+    target_samples: np.ndarray,
     tail_len: int = 20,
-) -> float:
-    """DTW distance between bridge + local path context and a straight baseline.
+) -> np.ndarray:
+    """The bridge with its local context: source tail + bridge + target head."""
+    return np.vstack([source_samples[-tail_len:], bridge_pts, target_samples[:tail_len]])
+
+
+def compute_mdtw(combined: np.ndarray) -> float:
+    """DTW distance between a curve and the straight line joining its ends.
 
     Lower = smoother, more natural connection.
     """
-    # Sample tails from source and target paths
-    source_samples = source_path.sample(pts_per_segment=50)
-    target_samples = target_path.sample(pts_per_segment=50)
-
-    source_tail = source_samples[-tail_len:] if len(source_samples) >= tail_len else source_samples
-    target_head = target_samples[:tail_len] if len(target_samples) >= tail_len else target_samples
-
-    # Combined curve: source_tail + bridge + target_head
-    combined = np.vstack([source_tail, bridge_pts, target_head])
     if len(combined) < 4:
         return 0.0
 
@@ -74,23 +71,11 @@ def _compute_mdtw(
     return float(np.hypot(dtw_x, dtw_y))
 
 
-def _compute_mjerk(
-    bridge_pts: np.ndarray,
-    source_path: BezierPath,
-    target_path: BezierPath,
-    tail_len: int = 20,
-) -> float:
-    """Mean squared jerk (3rd derivative) of source_tail + bridge + target_head.
+def compute_mjerk(combined: np.ndarray) -> float:
+    """Mean squared jerk (3rd derivative) along a curve.
 
     Lower = smoother.
     """
-    source_samples = source_path.sample(pts_per_segment=50)
-    target_samples = target_path.sample(pts_per_segment=50)
-
-    source_tail = source_samples[-tail_len:] if len(source_samples) >= tail_len else source_samples
-    target_head = target_samples[:tail_len] if len(target_samples) >= tail_len else target_samples
-
-    combined = np.vstack([source_tail, bridge_pts, target_head])
     if len(combined) < 5:
         return 0.0
 
@@ -149,7 +134,6 @@ def _gestalt_continuation(
 def _gestalt_closure(
     ep_a: EndpointInfo,
     ep_b: EndpointInfo,
-    paths: List[BezierPath],
     all_endpoints: List[EndpointInfo],
 ) -> float:
     """1.0 if connecting ep_a and ep_b would close a loop, else 0.0.
@@ -260,7 +244,6 @@ def score_candidates(
     endpoints = result.endpoints
     bbox_stats = _path_bbox_stats(paths)
 
-    from scipy.spatial import cKDTree
     all_path_pts = []
     path_indices = []
     for idx, p in enumerate(paths):
@@ -275,18 +258,20 @@ def score_candidates(
         kdtree = cKDTree(all_path_pts)
         path_indices = np.array(path_indices)
 
-    # Compute raw metrics
+    # Compute raw metrics on each bridge together with its local path context
+    dense_samples: Dict[int, np.ndarray] = {}
+
+    def dense(path_index: int) -> np.ndarray:
+        if path_index not in dense_samples:
+            dense_samples[path_index] = paths[path_index].sample(pts_per_segment=50)
+        return dense_samples[path_index]
+
     raw_dtw: List[float] = []
     raw_jerk: List[float] = []
-
     for c in candidates:
-        src_path = paths[c.ep_a.path_index]
-        tgt_path = paths[c.ep_b.path_index]
-
-        mdtw_val = _compute_mdtw(c.bridge_points, src_path, tgt_path)
-        mjerk_val = _compute_mjerk(c.bridge_points, src_path, tgt_path)
-        raw_dtw.append(mdtw_val)
-        raw_jerk.append(mjerk_val)
+        combined = context_curve(c.bridge_points, dense(c.ep_a.path_index), dense(c.ep_b.path_index))
+        raw_dtw.append(compute_mdtw(combined))
+        raw_jerk.append(compute_mjerk(combined))
 
     # Normalize costs
     norm_dtw = _normalize_metric(raw_dtw)
@@ -300,7 +285,7 @@ def score_candidates(
         prox = _gestalt_proximity(c.distance, radius)
         direction_ab = c.ep_b.position - c.ep_a.position
         cont = _gestalt_continuation(c.ep_a.tangent, direction_ab)
-        clos = _gestalt_closure(c.ep_a, c.ep_b, paths, endpoints)
+        clos = _gestalt_closure(c.ep_a, c.ep_b, endpoints)
 
         c.score = (
             weights["proximity"] * prox

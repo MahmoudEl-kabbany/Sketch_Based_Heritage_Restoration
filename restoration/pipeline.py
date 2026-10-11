@@ -664,9 +664,7 @@ def restore(
     print("  Phase 5: Synthesizing bridges...")
     with _timed(stage_timings, "phase5_synthesis_s"):
         bridges = synthesize_bridges(accepted)
-        restored_paths = merge_restored_paths(
-            extraction.paths, bridges, accepted,
-        )
+        restored_paths = merge_restored_paths(extraction.paths, accepted)
     print(f"    {len(bridges)} bridge segment(s) created")
 
     # Phase 6: EFD Gap Closure
@@ -677,7 +675,6 @@ def restore(
             validity_check_enabled=efd_validity_check_enabled,
             plausibility_threshold=efd_plausibility_threshold,
             min_gap_for_validity_check=efd_min_gap_for_validity_check,
-            return_diagnostics=True,
         )
     closed_by_efd = (
         sum(1 for p in final_paths if p.is_closed)

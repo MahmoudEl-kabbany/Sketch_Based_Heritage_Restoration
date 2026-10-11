@@ -7,13 +7,27 @@ uses symmetry detection or curvature-aware arc interpolation to close them.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy.spatial.distance import directed_hausdorff
 
 from bezier_curves.bezier import BezierPath, BezierSegment
 from restoration.geometry import endpoint_curvature, polyline_length, safe_normalize
+
+# Reflection symmetry: minimum Hausdorff tolerance (px) and the gap/perimeter
+# range in which mirroring the opposite side is attempted.
+SYMMETRY_HAUSDORFF_PX = 8.0
+SYMMETRY_GAP_RATIO_RANGE = (0.08, 0.30)
+# A mirrored closure is resampled to this many points and rejected when it is
+# longer than this fraction of the perimeter (and 3x the gap).
+MAX_MIRRORED_POINTS = 80
+MAX_CLOSURE_LENGTH_RATIO = 0.45
+# A gap above the ratio threshold is still closed (with a plain arc, no validity
+# check) when it is this small in pixels on a shape at least this large.
+SMALL_GAP_PX = 20.0
+SMALL_GAP_MAX_RATIO = 0.45
+SMALL_GAP_MIN_PERIMETER = 80.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -430,20 +444,10 @@ def _evaluate_closure_validity(
 def close_single_gaps(
     paths: List[BezierPath],
     gap_threshold: float = 0.30,
-    symmetry_hausdorff: float = 8.0,
-    skip_if_bridge_present: bool = True,
-    symmetry_min_gap_ratio: float = 0.08,
-    symmetry_max_gap_ratio: float = 0.30,
-    max_mirrored_points: int = 80,
-    max_closure_length_ratio: float = 0.45,
-    conservative_small_gap_px: float = 20.0,
-    conservative_gap_ratio: float = 0.45,
-    conservative_min_perimeter: float = 80.0,
     validity_check_enabled: bool = True,
     plausibility_threshold: float = 0.50,
     min_gap_for_validity_check: float = 3.0,
-    return_diagnostics: bool = False,
-) -> Union[List[BezierPath], Tuple[List[BezierPath], List[Dict[str, Any]]]]:
+) -> Tuple[List[BezierPath], List[Dict[str, Any]]]:
     """Detect and close single-gap contours.
 
     A path qualifies if:
@@ -453,13 +457,15 @@ def close_single_gaps(
       - It has enough segments to be a meaningful shape
 
     Multi-gap shapes are left untouched.
+
+    Returns (paths, diagnostics) with one diagnostics entry per closure attempt.
     """
     result: List[BezierPath] = []
     diagnostics: List[Dict[str, Any]] = []
 
     for path_index, path in enumerate(paths):
+        result.append(path)  # replaced below if the path gets closed
         if path.is_closed or len(path.segments) < 3:
-            result.append(path)
             continue
 
         start_pt = path.segments[0].control_points[0]
@@ -468,51 +474,34 @@ def close_single_gaps(
 
         samples = path.sample(pts_per_segment=30)
         perimeter = polyline_length(samples)
-
         if perimeter < 1e-6:
-            result.append(path)
             continue
 
-        if skip_if_bridge_present:
-            # PR4 tuning: skip only if a bridge overlaps this same open gap.
-            gap_proximity = max(8.0, perimeter * 0.02)
-            if _bridge_overlaps_gap(path, end_pt, start_pt, proximity=gap_proximity):
-                result.append(path)
-                continue
+        # PR4 tuning: skip only if a bridge overlaps this same open gap.
+        if _bridge_overlaps_gap(path, end_pt, start_pt, proximity=max(8.0, perimeter * 0.02)):
+            continue
 
         gap_ratio = gap_dist / perimeter
-
-        force_small_gap_fallback = False
-        if gap_ratio > gap_threshold:
-            force_small_gap_fallback = (
-                gap_dist <= conservative_small_gap_px
-                and gap_ratio <= conservative_gap_ratio
-                and perimeter >= conservative_min_perimeter
-            )
-            if not force_small_gap_fallback:
-                result.append(path)
-                continue
-
+        force_small_gap_fallback = gap_ratio > gap_threshold
+        if force_small_gap_fallback and not (
+            gap_dist <= SMALL_GAP_PX
+            and gap_ratio <= SMALL_GAP_MAX_RATIO
+            and perimeter >= SMALL_GAP_MIN_PERIMETER
+        ):
+            continue
         if gap_ratio < 1e-6:
-            result.append(path)
             continue
 
         # This is a single-gap contour — attempt closure
         centroid = np.mean(samples, axis=0)
 
-        # Scale Hausdorff threshold for larger shapes
-        scaled_hausdorff = max(symmetry_hausdorff, perimeter * 0.015)
-
-        # Try symmetry-based mirroring
+        # Try symmetry-based mirroring (Hausdorff threshold scaled for larger shapes)
         axis_angle = None
-        use_symmetry = (
-            not force_small_gap_fallback
-            and symmetry_min_gap_ratio <= gap_ratio <= symmetry_max_gap_ratio
-        )
-        if use_symmetry:
+        min_ratio, max_ratio = SYMMETRY_GAP_RATIO_RANGE
+        if not force_small_gap_fallback and min_ratio <= gap_ratio <= max_ratio:
             axis_angle = _detect_symmetry(
                 samples, centroid,
-                hausdorff_threshold=scaled_hausdorff,
+                hausdorff_threshold=max(SYMMETRY_HAUSDORFF_PX, perimeter * 0.015),
             )
 
         plausibility_metrics = _closure_plausibility_metrics(
@@ -523,8 +512,21 @@ def close_single_gaps(
             gap_ratio=gap_ratio,
         )
 
-        validity_enabled = bool(validity_check_enabled) and not force_small_gap_fallback
-        if validity_enabled:
+        def record(accepted: bool, method: str, reason: str) -> None:
+            diagnostics.append({
+                "path_index": int(path_index),
+                "accepted": accepted,
+                "closure_method": method,
+                "reason": reason,
+                "gap_distance_px": round(float(gap_dist), 3),
+                "gap_ratio": round(float(gap_ratio), 6),
+                "plausibility_threshold": round(float(plausibility_threshold), 4),
+                "metrics": {
+                    k: round(float(v), 6) for k, v in plausibility_metrics.items()
+                },
+            })
+
+        if validity_check_enabled and not force_small_gap_fallback:
             valid, reject_reason = _evaluate_closure_validity(
                 plausibility_metrics,
                 gap_dist=gap_dist,
@@ -534,19 +536,7 @@ def close_single_gaps(
                 min_gap_for_check=min_gap_for_validity_check,
             )
             if not valid:
-                diagnostics.append({
-                    "path_index": int(path_index),
-                    "accepted": False,
-                    "closure_method": "none",
-                    "reason": str(reject_reason),
-                    "gap_distance_px": round(float(gap_dist), 3),
-                    "gap_ratio": round(float(gap_ratio), 6),
-                    "plausibility_threshold": round(float(plausibility_threshold), 4),
-                    "metrics": {
-                        k: round(float(v), 6) for k, v in plausibility_metrics.items()
-                    },
-                })
-                result.append(path)
+                record(False, "none", str(reject_reason))
                 continue
 
         closure_segments: List[BezierSegment] = []
@@ -559,66 +549,36 @@ def close_single_gaps(
                 gap_start=end_pt, gap_end=start_pt,
             )
             if len(mirrored) >= 2:
-                mirrored = _resample_polyline(mirrored, max_points=max_mirrored_points)
-                mirrored_len = polyline_length(mirrored)
+                mirrored = _resample_polyline(mirrored, max_points=MAX_MIRRORED_POINTS)
                 # PR3: reject mirrored closures that are much too complex for this gap.
-                if mirrored_len <= max(gap_dist * 3.0, perimeter * max_closure_length_ratio):
+                if polyline_length(mirrored) <= max(gap_dist * 3.0, perimeter * MAX_CLOSURE_LENGTH_RATIO):
                     closure_segments = _points_to_bezier_segments(
                         mirrored,
-                        max_segments=max(6, int(max_mirrored_points // 8)),
+                        max_segments=max(6, MAX_MIRRORED_POINTS // 8),
                     )
                     if closure_segments:
                         closure_method = "symmetry_mirroring"
 
         if not closure_segments:
             # Fallback: curvature-aware arc
-            t_start = _path_tangent_at(path, "end")
-            t_end = _path_tangent_at(path, "start")
-            k_start = endpoint_curvature(path, "end")
-            k_end = endpoint_curvature(path, "start")
             closure_segments = _curvature_aware_arc(
                 end_pt, start_pt,
-                t_start, t_end,
-                k_start, k_end,
+                _path_tangent_at(path, "end"), _path_tangent_at(path, "start"),
+                endpoint_curvature(path, "end"), endpoint_curvature(path, "start"),
             )
-            closure_method = "curvature_arc"
 
-        if closure_segments:
-            new_segments = list(path.segments) + closure_segments
-            # Snap closure endpoints
-            new_segments[-1].control_points[3] = new_segments[0].control_points[0].copy()
-            result.append(BezierPath(
-                segments=new_segments,
-                is_closed=True,
-                source_type="restored",
-            ))
-            diagnostics.append({
-                "path_index": int(path_index),
-                "accepted": True,
-                "closure_method": str(closure_method),
-                "reason": "accepted",
-                "gap_distance_px": round(float(gap_dist), 3),
-                "gap_ratio": round(float(gap_ratio), 6),
-                "plausibility_threshold": round(float(plausibility_threshold), 4),
-                "metrics": {
-                    k: round(float(v), 6) for k, v in plausibility_metrics.items()
-                },
-            })
-        else:
-            result.append(path)
-            diagnostics.append({
-                "path_index": int(path_index),
-                "accepted": False,
-                "closure_method": "none",
-                "reason": "no_geometry_constructed",
-                "gap_distance_px": round(float(gap_dist), 3),
-                "gap_ratio": round(float(gap_ratio), 6),
-                "plausibility_threshold": round(float(plausibility_threshold), 4),
-                "metrics": {
-                    k: round(float(v), 6) for k, v in plausibility_metrics.items()
-                },
-            })
+        if not closure_segments:
+            record(False, "none", "no_geometry_constructed")
+            continue
 
-    if return_diagnostics:
-        return result, diagnostics
-    return result
+        new_segments = list(path.segments) + closure_segments
+        # Snap closure endpoints
+        new_segments[-1].control_points[3] = new_segments[0].control_points[0].copy()
+        result[-1] = BezierPath(
+            segments=new_segments,
+            is_closed=True,
+            source_type="restored",
+        )
+        record(True, closure_method, "accepted")
+
+    return result, diagnostics
