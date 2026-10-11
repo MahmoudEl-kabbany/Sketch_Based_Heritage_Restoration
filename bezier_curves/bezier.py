@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import cv2
-import matplotlib.pyplot as plt
 import numpy as np
 from skimage.morphology import skeletonize
 import sknw
@@ -110,6 +109,20 @@ def _chord_length_parameterize(points: np.ndarray) -> np.ndarray:
     return cumlen / total
 
 
+def _turning_angles_deg(vectors: np.ndarray) -> List[Optional[float]]:
+    """Angle between each consecutive pair of vectors (None where one is degenerate)."""
+    angles: List[Optional[float]] = []
+    for a, b in zip(vectors[:-1], vectors[1:]):
+        na = np.linalg.norm(a)
+        nb = np.linalg.norm(b)
+        if na < 1e-12 or nb < 1e-12:
+            angles.append(None)
+            continue
+        dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
+        angles.append(float(np.degrees(np.arccos(dot))))
+    return angles
+
+
 def _estimate_tangent(points: np.ndarray, end: str, lookahead: int = 10, skip_tip: int = 2) -> np.ndarray:
     """Estimate a robust unit tangent at the start or end of a point sequence.
 
@@ -144,18 +157,11 @@ def _estimate_tangent(points: np.ndarray, end: str, lookahead: int = 10, skip_ti
     weights = np.exp(-decay_rate * np.arange(n_vecs))
 
     # Down-weight vectors at high local curvature (turning angle > 25°).
-    for i in range(n_vecs - 1):
-        a = vectors[i]
-        b = vectors[i + 1]
-        na = np.linalg.norm(a)
-        nb = np.linalg.norm(b)
-        if na > 1e-12 and nb > 1e-12:
-            dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
-            angle = float(np.degrees(np.arccos(dot)))
-            if angle > 25.0:
-                # Reduce influence of vectors around the turning point.
-                weights[i] *= 0.3
-                weights[i + 1] *= 0.3
+    for i, angle in enumerate(_turning_angles_deg(vectors)):
+        if angle is not None and angle > 25.0:
+            # Reduce influence of vectors around the turning point.
+            weights[i] *= 0.3
+            weights[i + 1] *= 0.3
 
     tangent = np.zeros(2, dtype=np.float64)
     for vec, w in zip(vectors, weights):
@@ -292,24 +298,8 @@ def _point_line_distances_sq(points: np.ndarray, p0: np.ndarray, p1: np.ndarray)
 
 def _max_turning_angle_deg(points: np.ndarray) -> float:
     """Maximum local turning angle in degrees for a polyline."""
-    if len(points) < 3:
-        return 0.0
-
-    diffs = np.diff(points, axis=0)
-    angles: List[float] = []
-    for i in range(len(diffs) - 1):
-        a = diffs[i]
-        b = diffs[i + 1]
-        na = np.linalg.norm(a)
-        nb = np.linalg.norm(b)
-        if na < 1e-12 or nb < 1e-12:
-            continue
-        dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
-        angles.append(float(np.degrees(np.arccos(dot))))
-
-    if not angles:
-        return 0.0
-    return max(angles)
+    angles = [a for a in _turning_angles_deg(np.diff(points, axis=0)) if a is not None]
+    return max(angles, default=0.0)
 
 
 def _dominant_turn_index(points: np.ndarray, angle_threshold_deg: float = 70.0) -> Optional[int]:
@@ -317,26 +307,17 @@ def _dominant_turn_index(points: np.ndarray, angle_threshold_deg: float = 70.0) 
     if len(points) < 5:
         return None
 
-    diffs = np.diff(points, axis=0)
+    # The turn at point i is the angle between the steps into and out of it;
+    # the turn at the last interior point is not considered.
     best_angle = angle_threshold_deg
     best_idx: Optional[int] = None
-    for i in range(1, len(diffs) - 1):
-        a = diffs[i - 1]
-        b = diffs[i]
-        na = np.linalg.norm(a)
-        nb = np.linalg.norm(b)
-        if na < 1e-12 or nb < 1e-12:
-            continue
-        dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
-        angle = float(np.degrees(np.arccos(dot)))
-        if angle > best_angle:
+    for i, angle in enumerate(_turning_angles_deg(np.diff(points, axis=0))[:-1], 1):
+        if angle is not None and angle > best_angle:
             best_angle = angle
             best_idx = i
 
     if best_idx is None:
         return None
-
-    # Convert from diff-index space to point-index space.
     return max(1, min(best_idx, len(points) - 2))
 
 
@@ -371,20 +352,39 @@ def _is_near_straight(points: np.ndarray, linear_tolerance: float) -> bool:
     )
 
 
+# Fitting constants (Schneider with a preference for exactly straight segments).
+_REPARAM_ITERATIONS = 4
+_CORNER_SPLIT_ANGLE_DEG = 72.0
+_LINE_PREFERENCE_IMPROVEMENT = 0.15
+
+
 def _fit_cubic_single(
     points: np.ndarray,
     left_tangent: np.ndarray,
     right_tangent: np.ndarray,
     max_error: float,
-    max_iterations: int = 4,
     straightness_scale: float = 0.75,
-    corner_split_angle_deg: float = 72.0,
-    line_preference_improvement: float = 0.15,
 ) -> List[np.ndarray]:
     """Fit a set of points with one or more cubic Bezier curves (recursive).
 
     Returns a list of (4, 2) control-point arrays.
     """
+    def split_at(idx: int) -> List[np.ndarray]:
+        """Fit both sides of points[idx] separately, joined by a shared tangent."""
+        center_tangent = points[idx + 1] - points[idx - 1]
+        norm = np.linalg.norm(center_tangent)
+        if norm < 1e-12:
+            center_tangent = np.array([1.0, 0.0])
+        else:
+            center_tangent = center_tangent / norm
+        left_curves = _fit_cubic_single(
+            points[: idx + 1], left_tangent, center_tangent, max_error, straightness_scale,
+        )
+        right_curves = _fit_cubic_single(
+            points[idx:], -center_tangent, right_tangent, max_error, straightness_scale,
+        )
+        return left_curves + right_curves
+
     if len(points) == 2:
         dist = np.linalg.norm(points[1] - points[0]) / 3.0
         cp = np.vstack([
@@ -399,36 +399,9 @@ def _fit_cubic_single(
     if _is_near_straight(points, linear_tol):
         return [fit_straight_cubic(points[0], points[-1])]
 
-    corner_idx = _dominant_turn_index(points, angle_threshold_deg=corner_split_angle_deg)
+    corner_idx = _dominant_turn_index(points, angle_threshold_deg=_CORNER_SPLIT_ANGLE_DEG)
     if corner_idx is not None:
-        center_tangent = points[corner_idx + 1] - points[corner_idx - 1]
-        norm = np.linalg.norm(center_tangent)
-        if norm < 1e-12:
-            center_tangent = np.array([1.0, 0.0])
-        else:
-            center_tangent = center_tangent / norm
-
-        left_curves = _fit_cubic_single(
-            points[: corner_idx + 1],
-            left_tangent,
-            center_tangent,
-            max_error,
-            max_iterations=max_iterations,
-            straightness_scale=straightness_scale,
-            corner_split_angle_deg=corner_split_angle_deg,
-            line_preference_improvement=line_preference_improvement,
-        )
-        right_curves = _fit_cubic_single(
-            points[corner_idx:],
-            -center_tangent,
-            right_tangent,
-            max_error,
-            max_iterations=max_iterations,
-            straightness_scale=straightness_scale,
-            corner_split_angle_deg=corner_split_angle_deg,
-            line_preference_improvement=line_preference_improvement,
-        )
-        return left_curves + right_curves
+        return split_at(corner_idx)
 
     params = _chord_length_parameterize(points)
     straight_cp = fit_straight_cubic(points[0], points[-1])
@@ -440,7 +413,7 @@ def _fit_cubic_single(
     # Prefer an exact straight cubic unless the flexible cubic significantly improves fit.
     if straight_err <= max_error * 1.35:
         improvement = (straight_mean_err - mean_err) / max(straight_mean_err, 1e-12)
-        if improvement < line_preference_improvement:
+        if improvement < _LINE_PREFERENCE_IMPROVEMENT:
             return [straight_cp]
 
     mean_limit = max_error * 0.38
@@ -450,7 +423,7 @@ def _fit_cubic_single(
 
     # Try iterative reparameterization
     if err < max_error * 4.0 or mean_err < mean_limit * 4.0:
-        for _ in range(max_iterations):
+        for _ in range(_REPARAM_ITERATIONS):
             params = _reparameterize(points, params, cp)
             cp = _generate_bezier(points, params, left_tangent, right_tangent)
             err, mean_err, split_idx = _fit_error_stats(points, cp, params)
@@ -458,35 +431,7 @@ def _fit_cubic_single(
                 return [cp]
 
     # Split at the point of maximum error and recurse
-    split_idx = max(1, min(split_idx, len(points) - 2))
-    center_tangent = points[split_idx + 1] - points[split_idx - 1]
-    norm = np.linalg.norm(center_tangent)
-    if norm < 1e-12:
-        center_tangent = np.array([1.0, 0.0])
-    else:
-        center_tangent = center_tangent / norm
-
-    left_curves = _fit_cubic_single(
-        points[: split_idx + 1],
-        left_tangent,
-        center_tangent,
-        max_error,
-        max_iterations=max_iterations,
-        straightness_scale=straightness_scale,
-        corner_split_angle_deg=corner_split_angle_deg,
-        line_preference_improvement=line_preference_improvement,
-    )
-    right_curves = _fit_cubic_single(
-        points[split_idx:],
-        -center_tangent,
-        right_tangent,
-        max_error,
-        max_iterations=max_iterations,
-        straightness_scale=straightness_scale,
-        corner_split_angle_deg=corner_split_angle_deg,
-        line_preference_improvement=line_preference_improvement,
-    )
-    return left_curves + right_curves
+    return split_at(max(1, min(split_idx, len(points) - 2)))
 
 
 @dataclass
@@ -549,36 +494,20 @@ def _extract_skeleton_edges(graph: Any) -> Tuple[Dict[int, _SkeletonEdge], Dict[
     """Build canonical edge objects and node->edge incidence map from sknw graph."""
     edges: Dict[int, _SkeletonEdge] = {}
     node_to_edges: Dict[int, List[int]] = {}
-    eid = 0
 
-    if hasattr(graph, "is_multigraph") and graph.is_multigraph():
-        iter_edges = graph.edges(keys=True, data=True)
-        for u, v, _k, data in iter_edges:
-            pts = data.get("pts", [])
-            pts_arr = np.asarray(pts, dtype=np.float64)
-            if pts_arr.ndim != 2 or pts_arr.shape[1] < 2 or len(pts_arr) < 2:
-                continue
-            pts_xy = pts_arr[:, :2][:, ::-1]
-            oriented = _orient_points_between_nodes(pts_xy, _node_xy(graph, u), _node_xy(graph, v))
+    is_multi = hasattr(graph, "is_multigraph") and graph.is_multigraph()
+    for edge in (graph.edges(keys=True, data=True) if is_multi else graph.edges(data=True)):
+        u, v, data = edge[0], edge[1], edge[-1]
+        pts_arr = np.asarray(data.get("pts", []), dtype=np.float64)
+        if pts_arr.ndim != 2 or pts_arr.shape[1] < 2 or len(pts_arr) < 2:
+            continue
+        pts_xy = pts_arr[:, :2][:, ::-1]
+        oriented = _orient_points_between_nodes(pts_xy, _node_xy(graph, u), _node_xy(graph, v))
 
-            edges[eid] = _SkeletonEdge(edge_id=eid, u=int(u), v=int(v), points_uv=oriented)
-            node_to_edges.setdefault(int(u), []).append(eid)
-            node_to_edges.setdefault(int(v), []).append(eid)
-            eid += 1
-    else:
-        iter_edges = graph.edges(data=True)
-        for u, v, data in iter_edges:
-            pts = data.get("pts", [])
-            pts_arr = np.asarray(pts, dtype=np.float64)
-            if pts_arr.ndim != 2 or pts_arr.shape[1] < 2 or len(pts_arr) < 2:
-                continue
-            pts_xy = pts_arr[:, :2][:, ::-1]
-            oriented = _orient_points_between_nodes(pts_xy, _node_xy(graph, u), _node_xy(graph, v))
-
-            edges[eid] = _SkeletonEdge(edge_id=eid, u=int(u), v=int(v), points_uv=oriented)
-            node_to_edges.setdefault(int(u), []).append(eid)
-            node_to_edges.setdefault(int(v), []).append(eid)
-            eid += 1
+        eid = len(edges)
+        edges[eid] = _SkeletonEdge(edge_id=eid, u=int(u), v=int(v), points_uv=oriented)
+        node_to_edges.setdefault(int(u), []).append(eid)
+        node_to_edges.setdefault(int(v), []).append(eid)
 
     return edges, node_to_edges
 
@@ -929,241 +858,38 @@ def fit_from_image_skeleton(
 # Visualization
 # ═══════════════════════════════════════════════════════════════════════════
 
+_CURVE_COLORS_BGR = [
+    (255, 255, 0),   # neon cyan
+    (0, 255, 255),   # bright yellow
+    (255, 140, 0),   # bright orange
+    (50, 255, 50),   # bright lime
+    (255, 60, 255),  # bright magenta
+    (100, 200, 255), # light orange-blue tint
+]
+
 
 def _draw_paths_on_canvas(
-    canvas: np.ndarray,
+    shape: Tuple[int, int],
     paths: List[BezierPath],
-    colors: Tuple[Tuple[float, float, float], ...],
     pts_per_segment: int,
     show_controls: bool,
 ) -> np.ndarray:
-    """Render Bezier paths onto an image-space canvas using OpenCV."""
-    rendered = canvas.copy()
-    curve_palette_bgr = [
-        (255, 255, 0),   # neon cyan
-        (0, 255, 255),   # bright yellow
-        (255, 140, 0),   # bright orange
-        (50, 255, 50),   # bright lime
-        (255, 60, 255),  # bright magenta
-        (100, 200, 255), # light orange-blue tint
-    ]
-    control_line_bgr = (180, 180, 180)
-    control_point_bgr = (255, 255, 255)
-
+    """Render Bezier paths, optionally with control handles, on a black BGR canvas."""
+    canvas = np.zeros((shape[0], shape[1], 3), dtype=np.uint8)
     for idx, bp in enumerate(paths):
-        color_bgr = curve_palette_bgr[idx % len(curve_palette_bgr)]
+        color = _CURVE_COLORS_BGR[idx % len(_CURVE_COLORS_BGR)]
         for seg in bp.segments:
             pts = np.round(seg.sample(pts_per_segment)).astype(np.int32).reshape((-1, 1, 2))
-            if len(pts) >= 2:
-                cv2.polylines(rendered, [pts], False, color_bgr, 2, lineType=cv2.LINE_AA)
-
+            cv2.polylines(canvas, [pts], False, color, 2, lineType=cv2.LINE_AA)
             if not show_controls:
                 continue
-
-            cp = np.round(seg.control_points).astype(np.int32)
-            cv2.line(rendered, tuple(cp[0]), tuple(cp[1]), control_line_bgr, 1, lineType=cv2.LINE_AA)
-            cv2.line(rendered, tuple(cp[2]), tuple(cp[3]), control_line_bgr, 1, lineType=cv2.LINE_AA)
+            cp = [tuple(int(v) for v in point) for point in np.round(seg.control_points)]
+            cv2.line(canvas, cp[0], cp[1], (180, 180, 180), 1, lineType=cv2.LINE_AA)
+            cv2.line(canvas, cp[2], cp[3], (180, 180, 180), 1, lineType=cv2.LINE_AA)
             for point in cp:
-                cv2.circle(rendered, tuple(point), 3, control_point_bgr, -1, lineType=cv2.LINE_AA)
+                cv2.circle(canvas, point, 3, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+    return canvas
 
-    return rendered
-
-
-def _visualize_paths_single_panel(
-    paths: List[BezierPath],
-    title: str,
-    save_path: Optional[str],
-    show_controls: bool,
-    pts_per_segment: int,
-) -> None:
-    """Fallback single-panel plot for callers without source-image context."""
-    fig, ax = plt.subplots(1, 1, figsize=(12, 10))
-    fig.patch.set_facecolor("black")
-    ax.set_facecolor("black")
-    ax.set_title(title)
-    ax.title.set_color("white")
-    ax.set_aspect("equal")
-    ax.tick_params(colors="white")
-    for spine in ax.spines.values():
-        spine.set_color("white")
-
-    all_points = []
-    bright_colors = [
-        "#00FFFF",  # neon cyan
-        "#FFFF00",  # bright yellow
-        "#39FF14",  # neon green
-        "#FF5F1F",  # bright orange
-        "#FF2CF0",  # bright magenta
-        "#6EE7FF",  # bright sky
-        "#FFD166",  # warm bright yellow
-        "#8BFF9E",  # mint bright
-        "#FF8BA7",  # bright rose
-        "#B794FF",  # bright violet
-    ]
-    for idx, bp in enumerate(paths):
-        color = bright_colors[idx % len(bright_colors)]
-        for seg in bp.segments:
-            pts = seg.sample(pts_per_segment)
-            ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=2.0)
-            all_points.append(pts)
-
-            if not show_controls:
-                continue
-
-            cp = seg.control_points
-            all_points.append(cp)
-            ax.plot(
-                [cp[0, 0], cp[1, 0]], [cp[0, 1], cp[1, 1]],
-                color="#CCCCCC", linewidth=0.9, linestyle="--", alpha=0.8,
-            )
-            ax.plot(
-                [cp[2, 0], cp[3, 0]], [cp[2, 1], cp[3, 1]],
-                color="#CCCCCC", linewidth=0.9, linestyle="--", alpha=0.8,
-            )
-            ax.plot(
-                cp[:, 0], cp[:, 1], "o",
-                color="#FFFFFF", markersize=3.5, alpha=0.9,
-            )
-
-    if all_points:
-        all_pts_array = np.concatenate(all_points, axis=0)
-        x_min, y_min = all_pts_array.min(axis=0)
-        x_max, y_max = all_pts_array.max(axis=0)
-        x_range = x_max - x_min if x_max != x_min else 1
-        y_range = y_max - y_min if y_max != y_min else 1
-        padding_x = x_range * 0.1
-        padding_y = y_range * 0.1
-        ax.set_xlim(x_min - padding_x, x_max + padding_x)
-        ax.set_ylim(y_min - padding_y, y_max + padding_y)
-
-    # Matplotlib uses Cartesian y-up; image-derived data is y-down.
-    if paths and paths[0].source_type in {"skeleton"}:
-        ax.invert_yaxis()
-
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="black")
-        print(f"  -> Saved visualization -> {save_path}")
-        plt.close(fig)
-        return
-
-    plt.show()
-
-
-def _visualize_paths_overview(
-    paths: List[BezierPath],
-    title: str,
-    save_path: Optional[str],
-    image_path: str,
-    show_controls: bool,
-    pts_per_segment: int,
-) -> None:
-    """Render an EFD-style 3-panel overview for Bezier results."""
-    img_bgr = cv2.imread(image_path)
-    if img_bgr is None:
-        _visualize_paths_single_panel(paths, title, save_path, show_controls, pts_per_segment)
-        return
-
-    h, w = img_bgr.shape[:2]
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.patch.set_facecolor("black")
-    for ax in axes:
-        ax.set_facecolor("black")
-
-    axes[0].imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-    axes[0].set_title("Original Image")
-    axes[0].title.set_color("white")
-    axes[0].axis("off")
-
-    colors = plt.cm.tab10.colors
-    curves_only = _draw_paths_on_canvas(
-        np.zeros((h, w, 3), dtype=np.uint8),
-        paths,
-        colors,
-        pts_per_segment,
-        show_controls=False,
-    )
-    axes[1].imshow(cv2.cvtColor(curves_only, cv2.COLOR_BGR2RGB))
-    axes[1].set_title(f"Bezier Curves Only ({len(paths)})")
-    axes[1].title.set_color("white")
-    axes[1].axis("off")
-
-    curves_with_controls = _draw_paths_on_canvas(
-        np.zeros((h, w, 3), dtype=np.uint8),
-        paths,
-        colors,
-        pts_per_segment,
-        show_controls=show_controls,
-    )
-    axes[2].imshow(cv2.cvtColor(curves_with_controls, cv2.COLOR_BGR2RGB))
-    if show_controls:
-        axes[2].set_title("Bezier Curves + Controls")
-    else:
-        axes[2].set_title("Bezier Curves Overview")
-    axes[2].title.set_color("white")
-    axes[2].axis("off")
-
-    suptitle = fig.suptitle(title)
-    suptitle.set_color("white")
-    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="black")
-        print(f"  -> Saved visualization -> {save_path}")
-        plt.close(fig)
-        return
-
-    plt.show()
-
-
-def _comparison_save_path_from_overview_path(save_path: str) -> str:
-    """Derive a companion compare filename from the main overview path."""
-    directory, filename = os.path.split(save_path)
-    stem, ext = os.path.splitext(filename)
-    if stem.endswith("_bezier_vis"):
-        stem = stem[: -len("_bezier_vis")]
-    if not ext:
-        ext = ".png"
-    return os.path.join(directory, f"{stem}_bezier_compare{ext}")
-
-
-def _save_original_vs_bezier_controls(
-    paths: List[BezierPath],
-    image_path: str,
-    save_path: str,
-    pts_per_segment: int,
-) -> None:
-    """Save a 2-panel comparison image: original and Bezier+controls."""
-    img_bgr = cv2.imread(image_path)
-    if img_bgr is None:
-        return
-
-    h, w = img_bgr.shape[:2]
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-    fig.patch.set_facecolor("black")
-    for ax in axes:
-        ax.set_facecolor("black")
-
-    axes[0].imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-    axes[0].set_title("Original Image")
-    axes[0].title.set_color("white")
-    axes[0].axis("off")
-
-    curves_with_controls = _draw_paths_on_canvas(
-        np.zeros((h, w, 3), dtype=np.uint8),
-        paths,
-        plt.cm.tab10.colors,
-        pts_per_segment,
-        show_controls=True,
-    )
-    axes[1].imshow(cv2.cvtColor(curves_with_controls, cv2.COLOR_BGR2RGB))
-    axes[1].set_title("Bezier Curves + Controls")
-    axes[1].title.set_color("white")
-    axes[1].axis("off")
-
-    plt.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="black")
-    print(f"  -> Saved comparison visualization -> {save_path}")
-    plt.close(fig)
 
 def visualize_paths(
     paths: List[BezierPath],
@@ -1172,40 +898,45 @@ def visualize_paths(
     show_controls: bool = True,
     pts_per_segment: int = 80,
     image_path: Optional[str] = None,
-    overview: bool = True,
 ) -> None:
-    """Plot Bezier paths with optional EFD-style overview rendering.
+    """Plot Bezier paths as side-by-side panels on a black background.
 
-    Args:
-        paths:           list of BezierPath objects
-        title:           figure title
-        save_path:       if given, save figure to this file
-        show_controls:   draw control points and handle lines
-        pts_per_segment: sampling density per segment
-        image_path:      source raster used for overview panel 1
-        overview:        when True and image_path is available, use 3-panel layout
+    Panels: the source image (when *image_path* is given), the curves alone,
+    and the curves with control points and handles (when *show_controls*).
+    The figure is saved to *save_path* if given, otherwise shown.
     """
-    if overview and image_path:
-        _visualize_paths_overview(
-            paths,
-            title,
-            save_path,
-            image_path,
-            show_controls,
-            pts_per_segment,
-        )
+    import matplotlib.pyplot as plt
 
-        if save_path:
-            compare_path = _comparison_save_path_from_overview_path(save_path)
-            _save_original_vs_bezier_controls(
-                paths,
-                image_path,
-                compare_path,
-                pts_per_segment,
-            )
-        return
+    image = cv2.imread(image_path) if image_path else None
+    if image is not None:
+        shape = image.shape[:2]
+    else:
+        # No source image: size the canvas to fit the control points.
+        extent = np.vstack([p.control_points for p in paths] + [np.ones((1, 2))]).max(axis=0)
+        shape = (int(extent[1]) + 20, int(extent[0]) + 20)
 
-    _visualize_paths_single_panel(paths, title, save_path, show_controls, pts_per_segment)
+    panels = [] if image is None else [("Original Image", image)]
+    panels.append((f"Bezier Curves Only ({len(paths)})",
+                   _draw_paths_on_canvas(shape, paths, pts_per_segment, show_controls=False)))
+    if show_controls:
+        panels.append(("Bezier Curves + Controls",
+                       _draw_paths_on_canvas(shape, paths, pts_per_segment, show_controls=True)))
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(6 * len(panels), 6), squeeze=False)
+    fig.patch.set_facecolor("black")
+    for ax, (name, panel) in zip(axes[0], panels):
+        ax.imshow(cv2.cvtColor(panel, cv2.COLOR_BGR2RGB))
+        ax.set_title(name, color="white")
+        ax.axis("off")
+    fig.suptitle(title, color="white")
+    plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="black")
+        print(f"  -> Saved visualization -> {save_path}")
+        plt.close(fig)
+    else:
+        plt.show()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1230,36 +961,16 @@ if __name__ == "__main__":
         description="Fit cubic Bezier curves from raster images using skeleton fitting."
     )
     parser.add_argument("image_path", help="Path to input image")
-    parser.add_argument(
-        "--tangent-lookahead",
-        type=int,
-        default=5,
-        help="Lookahead window used for tangent estimation",
-    )
-    parser.add_argument(
-        "--max-error",
-        type=float,
-        default=2.0,
-        help="Maximum geometric error (pixels) before splitting",
-    )
-    parser.add_argument(
-        "--straightness-scale",
-        type=float,
-        default=0.75,
-        help="Near-straight tolerance scale (higher favors straight cubics)",
-    )
-    parser.add_argument(
-        "--merge-radius",
-        type=float,
-        default=5.0,
-        help="Maximum pixel distance to merge endpoints",
-    )
-    parser.add_argument(
-        "--spur-threshold",
-        type=float,
-        default=25.0,
-        help="Maximum length of branches to prune",
-    )
+    parser.add_argument("--tangent-lookahead", type=int, default=5,
+                        help="Lookahead window used for tangent estimation")
+    parser.add_argument("--max-error", type=float, default=2.0,
+                        help="Maximum geometric error (pixels) before splitting")
+    parser.add_argument("--straightness-scale", type=float, default=0.75,
+                        help="Near-straight tolerance scale (higher favors straight cubics)")
+    parser.add_argument("--merge-radius", type=float, default=5.0,
+                        help="Maximum pixel distance to merge endpoints")
+    parser.add_argument("--spur-threshold", type=float, default=25.0,
+                        help="Maximum length of branches to prune")
     args = parser.parse_args()
 
     paths = fit_from_image_skeleton(
@@ -1276,4 +987,10 @@ if __name__ == "__main__":
 
     if paths:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        visualize_paths(paths, title=label, save_path=os.path.join(OUTPUT_DIR, "bezier_vis.png"))
+        name = os.path.splitext(os.path.basename(args.image_path))[0]
+        visualize_paths(
+            paths,
+            title=label,
+            save_path=os.path.join(OUTPUT_DIR, f"{name}_bezier_vis.png"),
+            image_path=args.image_path,
+        )
