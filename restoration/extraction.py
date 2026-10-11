@@ -13,6 +13,12 @@ import cv2
 import numpy as np
 
 from bezier_curves.bezier import BezierPath, fit_from_image_skeleton
+from restoration.geometry import (
+    bezier_derivative,
+    endpoint_curvature,
+    safe_normalize,
+    visual_order_key,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -45,48 +51,8 @@ class ExtractionResult:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Tangent / curvature from Bezier control points
+# Endpoint context tangent
 # ═══════════════════════════════════════════════════════════════════════════
-
-def _bezier_derivative_at(cp: np.ndarray, t: float) -> np.ndarray:
-    """First derivative of cubic Bezier at parameter *t*.
-
-    cp: (4, 2) control points.
-    """
-    u = 1.0 - t
-    return (
-        3.0 * u * u * (cp[1] - cp[0])
-        + 6.0 * u * t * (cp[2] - cp[1])
-        + 3.0 * t * t * (cp[3] - cp[2])
-    )
-
-
-def _bezier_second_derivative_at(cp: np.ndarray, t: float) -> np.ndarray:
-    """Second derivative of cubic Bezier at parameter *t*."""
-    u = 1.0 - t
-    return (
-        6.0 * u * (cp[2] - 2.0 * cp[1] + cp[0])
-        + 6.0 * t * (cp[3] - 2.0 * cp[2] + cp[1])
-    )
-
-
-def _curvature_at(cp: np.ndarray, t: float) -> float:
-    """Unsigned curvature κ = |x'y'' - y'x''| / (x'² + y'²)^(3/2)."""
-    d1 = _bezier_derivative_at(cp, t)
-    d2 = _bezier_second_derivative_at(cp, t)
-    cross = float(d1[0] * d2[1] - d1[1] * d2[0])
-    speed_sq = float(d1[0] ** 2 + d1[1] ** 2)
-    if speed_sq < 1e-24:
-        return 0.0
-    return abs(cross) / (speed_sq ** 1.5)
-
-
-def _safe_normalize(v: np.ndarray) -> np.ndarray:
-    n = np.linalg.norm(v)
-    if n < 1e-12:
-        return np.array([1.0, 0.0], dtype=np.float64)
-    return v / n
-
 
 def _dedupe_polyline(points: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     """Remove near-duplicate consecutive points from a sampled polyline."""
@@ -161,10 +127,10 @@ def _estimate_endpoint_context_tangent(
 
     if end == "start":
         path_dir = sampled[min(2, len(sampled)-1)] - sampled[0]
-        outward_ref = _safe_normalize(-path_dir)
+        outward_ref = safe_normalize(-path_dir)
     else:
         path_dir = sampled[-1] - sampled[max(0, len(sampled)-3)]
-        outward_ref = _safe_normalize(path_dir)
+        outward_ref = safe_normalize(path_dir)
 
     return _multiscale_context_tangent(sampled, end, outward_ref)
 
@@ -177,10 +143,10 @@ def _compute_endpoint_tangent(path: BezierPath, end: str) -> Tuple[np.ndarray, f
     """Outward endpoint tangent blended with local context and confidence."""
     if end == "start":
         cp = path.segments[0].control_points
-        derivative_tangent = _safe_normalize(-_bezier_derivative_at(cp, 0.0))
+        derivative_tangent = safe_normalize(-bezier_derivative(cp, 0.0))
     else:
         cp = path.segments[-1].control_points
-        derivative_tangent = _safe_normalize(_bezier_derivative_at(cp, 1.0))
+        derivative_tangent = safe_normalize(bezier_derivative(cp, 1.0))
 
     context_tangent, confidence = _estimate_endpoint_context_tangent(path, end)
     
@@ -189,28 +155,18 @@ def _compute_endpoint_tangent(path: BezierPath, end: str) -> Tuple[np.ndarray, f
     else:
         blend = float(np.clip(confidence, 0.40, 0.88))
         
-    tangent = _safe_normalize((1.0 - blend) * derivative_tangent + blend * context_tangent)
+    tangent = safe_normalize((1.0 - blend) * derivative_tangent + blend * context_tangent)
     
     if end == "start":
-        interior_dir = _safe_normalize(path.segments[0].control_points[3] - path.segments[0].control_points[0])
+        interior_dir = safe_normalize(path.segments[0].control_points[3] - path.segments[0].control_points[0])
     else:
-        interior_dir = _safe_normalize(path.segments[-1].control_points[0] - path.segments[-1].control_points[3])
+        interior_dir = safe_normalize(path.segments[-1].control_points[0] - path.segments[-1].control_points[3])
         
     if float(np.dot(tangent, interior_dir)) > 0.50:
         tangent = -tangent
         confidence *= 0.5
         
     return tangent, confidence
-
-
-def _compute_endpoint_curvature(path: BezierPath, end: str) -> float:
-    """Unsigned curvature at the given end of the path."""
-    if end == "start":
-        cp = path.segments[0].control_points
-        return _curvature_at(cp, 0.0)
-    else:
-        cp = path.segments[-1].control_points
-        return _curvature_at(cp, 1.0)
 
 
 def _extract_endpoints(paths: List[BezierPath]) -> List[EndpointInfo]:
@@ -233,7 +189,7 @@ def _extract_endpoints(paths: List[BezierPath]) -> List[EndpointInfo]:
                 end=end,
                 position=pos.astype(np.float64),
                 tangent=tangent,
-                curvature=_compute_endpoint_curvature(path, end),
+                curvature=endpoint_curvature(path, end),
                 tangent_confidence=tangent_confidence,
             ))
             next_endpoint_id += 1
@@ -310,13 +266,7 @@ def extract_paths(
     )
 
     # Ensure visual discovery order (top-down, left-right)
-    def path_sort_key(p: BezierPath):
-        pts = p.sample(5)
-        min_y = np.min(pts[:, 1])
-        min_x = np.min(pts[:, 0])
-        return (round(min_y / 12.0), min_x)
-    
-    paths.sort(key=path_sort_key)
+    paths.sort(key=visual_order_key)
 
     # Endpoint extraction
     endpoints = _extract_endpoints(paths)

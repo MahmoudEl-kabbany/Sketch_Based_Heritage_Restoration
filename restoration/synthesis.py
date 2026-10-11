@@ -13,18 +13,12 @@ import numpy as np
 from bezier_curves.bezier import BezierPath, BezierSegment
 from restoration.extraction import EndpointInfo
 from restoration.candidates import ConnectionCandidate
+from restoration.geometry import polyline_length, safe_normalize
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
-
-def _safe_normalize(v: np.ndarray) -> np.ndarray:
-    n = np.linalg.norm(v)
-    if n < 1e-12:
-        return np.array([1.0, 0.0], dtype=np.float64)
-    return v / n
-
 
 def _stabilize_bridge_control_points(cp: np.ndarray) -> np.ndarray:
     """Clamp handle geometry to prevent local hook/backtracking artifacts."""
@@ -138,7 +132,7 @@ def _build_intersection_bridge_linear(
     if chord > 1e-6:
         alpha = chord / 3.0
         p1 = p0 + alpha * ep_a.tangent
-        p2 = p3 - alpha * _safe_normalize(p3 - p0)
+        p2 = p3 - alpha * safe_normalize(p3 - p0)
         cp = np.vstack([p0, p1, p2, p3])
         cp = _stabilize_bridge_control_points(cp)
         segments.append(BezierSegment(
@@ -152,7 +146,7 @@ def _build_intersection_bridge_linear(
     chord = float(np.linalg.norm(p3 - p0))
     if chord > 1e-6:
         alpha = chord / 3.0
-        p1 = p0 + alpha * _safe_normalize(p3 - p0)
+        p1 = p0 + alpha * safe_normalize(p3 - p0)
         # ep_b.tangent is outward; incoming derivative at p3 should align with -ep_b.tangent.
         p2 = p3 + alpha * ep_b.tangent
         cp = np.vstack([p0, p1, p2, p3])
@@ -222,16 +216,15 @@ def merge_restored_paths(
 
     Returns the new set of paths (some merged, some untouched).
     """
-    def endpoint_token_from_info(ep: EndpointInfo) -> Tuple[str, int]:
-        if getattr(ep, "endpoint_id", -1) >= 0:
-            return ("id", int(ep.endpoint_id))
-        return ("path_end", int(ep.path_index) * 2 + (1 if ep.end == "end" else 0))
+    # An endpoint token is the (path_index, end) of an original open path end.
+    def endpoint_token_from_info(ep: EndpointInfo) -> Tuple[int, str]:
+        return (ep.path_index, ep.end)
 
     def reverse_component(comp: Dict[str, object]) -> None:
         comp["segments"] = _reverse_segments(comp["segments"])
         comp["start_token"], comp["end_token"] = comp["end_token"], comp["start_token"]
 
-    def orient_component_to_end(comp: Dict[str, object], token: Tuple[str, int]) -> bool:
+    def orient_component_to_end(comp: Dict[str, object], token: Tuple[int, str]) -> bool:
         if comp["end_token"] == token:
             return True
         if comp["start_token"] == token:
@@ -239,7 +232,7 @@ def merge_restored_paths(
             return True
         return False
 
-    def orient_component_to_start(comp: Dict[str, object], token: Tuple[str, int]) -> bool:
+    def orient_component_to_start(comp: Dict[str, object], token: Tuple[int, str]) -> bool:
         if comp["start_token"] == token:
             return True
         if comp["end_token"] == token:
@@ -247,8 +240,8 @@ def merge_restored_paths(
             return True
         return False
 
-    def rebuild_endpoint_to_component(active: Dict[int, Dict[str, object]]) -> Dict[Tuple[str, int], int]:
-        mapping: Dict[Tuple[str, int], int] = {}
+    def rebuild_endpoint_to_component(active: Dict[int, Dict[str, object]]) -> Dict[Tuple[int, str], int]:
+        mapping: Dict[Tuple[int, str], int] = {}
         for cid, comp in active.items():
             start_token = comp.get("start_token")
             end_token = comp.get("end_token")
@@ -258,28 +251,14 @@ def merge_restored_paths(
                 mapping[end_token] = cid
         return mapping
 
-    def estimate_path_length(segments: List[BezierSegment]) -> float:
-        if not segments:
-            return 0.0
-        pts_parts = [seg.sample(12) for seg in segments]
-        pts = np.vstack(pts_parts)
-        if len(pts) < 2:
-            return 0.0
-        return float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
-
-    endpoint_by_path_end: Dict[Tuple[int, str], Tuple[str, int]] = {}
-    for c in accepted:
-        endpoint_by_path_end[(c.ep_a.path_index, c.ep_a.end)] = endpoint_token_from_info(c.ep_a)
-        endpoint_by_path_end[(c.ep_b.path_index, c.ep_b.end)] = endpoint_token_from_info(c.ep_b)
-
     active: Dict[int, Dict[str, object]] = {}
     for i, path in enumerate(original_paths):
         if path.is_closed or not path.segments:
             start_token = None
             end_token = None
         else:
-            start_token = endpoint_by_path_end.get((i, "start"), ("path_end", i * 2))
-            end_token = endpoint_by_path_end.get((i, "end"), ("path_end", i * 2 + 1))
+            start_token = (i, "start")
+            end_token = (i, "end")
 
         active[i] = {
             "segments": list(path.segments),
@@ -344,7 +323,7 @@ def merge_restored_paths(
 
         start_pt = segs[0].control_points[0]
         end_pt = segs[-1].control_points[3]
-        path_len = estimate_path_length(segs)
+        path_len = polyline_length(np.vstack([seg.sample(12) for seg in segs]))
         closure_tolerance = max(5.0, 0.01 * path_len)
         is_closed = float(np.linalg.norm(start_pt - end_pt)) < closure_tolerance
 

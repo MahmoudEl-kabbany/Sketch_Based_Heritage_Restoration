@@ -12,8 +12,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 from scipy.spatial import cKDTree
 
-from bezier_curves.bezier import BezierPath, BezierSegment
+from bezier_curves.bezier import BezierPath, BezierSegment, bezier_eval
 from restoration.extraction import EndpointInfo, ExtractionResult
+from restoration.geometry import polyline_length, safe_normalize
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -45,23 +46,6 @@ class ConnectionCandidate:
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
-
-def _safe_normalize(v: np.ndarray) -> np.ndarray:
-    n = np.linalg.norm(v)
-    if n < 1e-12:
-        return np.array([1.0, 0.0], dtype=np.float64)
-    return v / n
-
-
-def _path_length(path: BezierPath, pts_per_segment: int = 20) -> float:
-    """Approximate arc length of one path by sampling."""
-    if not path.segments:
-        return 0.0
-    pts = path.sample(pts_per_segment=pts_per_segment)
-    if len(pts) < 2:
-        return 0.0
-    return float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
-
 
 def _pair_alignment_metrics(ep_a: EndpointInfo, ep_b: EndpointInfo) -> Tuple[float, float, float, float]:
     """Directional compatibility metrics for endpoint pairing."""
@@ -271,21 +255,8 @@ def _extrapolate_bezier(
                "backward" → t = -dt, -2dt, ...
     Returns (steps, 2) array.
     """
-    points = []
-    for i in range(1, steps + 1):
-        if direction == "forward":
-            t = 1.0 + i * dt
-        else:
-            t = -i * dt
-        u = 1.0 - t
-        pt = (
-            u**3 * cp[0]
-            + 3 * u**2 * t * cp[1]
-            + 3 * u * t**2 * cp[2]
-            + t**3 * cp[3]
-        )
-        points.append(pt)
-    return np.array(points, dtype=np.float64)
+    i = np.arange(1, steps + 1)
+    return bezier_eval(cp, 1.0 + i * dt if direction == "forward" else -i * dt)
 
 
 def _nearest_approach(pts_a: np.ndarray, pts_b: np.ndarray,
@@ -308,8 +279,8 @@ def _extension_alignment_quality(
     intersection: np.ndarray,
 ) -> float:
     """Quality of endpoint-to-intersection alignment for extension closures."""
-    dir_a = _safe_normalize(intersection - ep_a.position)
-    dir_b = _safe_normalize(intersection - ep_b.position)
+    dir_a = safe_normalize(intersection - ep_a.position)
+    dir_b = safe_normalize(intersection - ep_b.position)
     align_a = max(0.0, float(np.dot(ep_a.tangent, dir_a)))
     align_b = max(0.0, float(np.dot(ep_b.tangent, dir_b)))
 
@@ -317,8 +288,8 @@ def _extension_alignment_quality(
     dist_b = float(np.linalg.norm(intersection - ep_b.position))
     balance = 1.0 - (abs(dist_a - dist_b) / max(dist_a + dist_b, 1e-6))
 
-    conf_a = float(np.clip(getattr(ep_a, "tangent_confidence", 1.0), 0.0, 1.0))
-    conf_b = float(np.clip(getattr(ep_b, "tangent_confidence", 1.0), 0.0, 1.0))
+    conf_a = float(np.clip(ep_a.tangent_confidence, 0.0, 1.0))
+    conf_b = float(np.clip(ep_b.tangent_confidence, 0.0, 1.0))
     context_conf = min(conf_a, conf_b)
 
     quality = 0.55 * min(align_a, align_b) + 0.25 * max(0.0, balance) + 0.20 * context_conf
@@ -333,7 +304,7 @@ def _extension_alignment_quality(
 
 def _is_high_curvature_endpoint(ep: EndpointInfo, threshold: float = 0.008) -> bool:
     """True if endpoint curvature indicates a smooth curved boundary."""
-    return float(getattr(ep, "curvature", 0.0)) >= float(threshold)
+    return float(ep.curvature) >= float(threshold)
 
 
 def _distance_to_aabb(point: np.ndarray, min_xy: np.ndarray, max_xy: np.ndarray) -> float:
@@ -356,8 +327,8 @@ def _safe_same_path_extension_intersection(
 ) -> Tuple[Optional[np.ndarray], float]:
     """Return a guarded same-path extension intersection and quality."""
     context_conf = min(
-        float(np.clip(getattr(ep_a, "tangent_confidence", 1.0), 0.0, 1.0)),
-        float(np.clip(getattr(ep_b, "tangent_confidence", 1.0), 0.0, 1.0)),
+        float(np.clip(ep_a.tangent_confidence, 0.0, 1.0)),
+        float(np.clip(ep_b.tangent_confidence, 0.0, 1.0)),
     )
     both_high_curvature = _is_high_curvature_endpoint(ep_a) and _is_high_curvature_endpoint(ep_b)
 
@@ -613,7 +584,7 @@ def _build_intersection_bridge(
         (EndpointInfo(
             endpoint_id=-1,
             path_index=ep_b.path_index, end=ep_b.end,
-            position=I, tangent=_safe_normalize(ep_b.position - I),
+            position=I, tangent=safe_normalize(ep_b.position - I),
             curvature=0.0,
         ), ep_b.position, path_b, False),
     ]:
@@ -630,9 +601,9 @@ def _build_intersection_bridge(
             else:
                 alpha_start = alpha
             p1 = p0 + alpha_start * ep_a.tangent
-            p2 = p3 - alpha * _safe_normalize(p3 - p0)
+            p2 = p3 - alpha * safe_normalize(p3 - p0)
         else:
-            p1 = p0 + alpha * _safe_normalize(p3 - p0)
+            p1 = p0 + alpha * safe_normalize(p3 - p0)
             if ep_b.curvature > 1e-6:
                 alpha_end = min(alpha, 1.0 / (3.0 * ep_b.curvature))
             else:
@@ -696,7 +667,7 @@ def generate_candidates(
     }
 
     path_lengths: Dict[int, float] = {
-        idx: _path_length(path) for idx, path in enumerate(result.paths)
+        idx: polyline_length(path.sample(pts_per_segment=20)) for idx, path in enumerate(result.paths)
     }
     spur_length_soft = max(22.0, result.diagonal * 0.008)
     spur_length_hard = max(36.0, result.diagonal * 0.012)
@@ -782,8 +753,8 @@ def generate_candidates(
             misalignment_deg,
             tier=1,
             same_path=True,
-            tangent_confidence_a=float(getattr(ep_end, "tangent_confidence", 1.0)),
-            tangent_confidence_b=float(getattr(ep_start, "tangent_confidence", 1.0)),
+            tangent_confidence_a=float(ep_end.tangent_confidence),
+            tangent_confidence_b=float(ep_start.tangent_confidence),
         ):
             if same_diag is not None:
                 _diag_increment_reason(same_diag, "same_direction_gate")
@@ -989,12 +960,12 @@ def generate_candidates(
                 misalignment_deg,
                 tier=tier,
                 same_path=False,
-                tangent_confidence_a=float(getattr(ep_a, "tangent_confidence", 1.0)),
-                tangent_confidence_b=float(getattr(ep_b, "tangent_confidence", 1.0)),
+                tangent_confidence_a=float(ep_a.tangent_confidence),
+                tangent_confidence_b=float(ep_b.tangent_confidence),
             )
             min_conf = min(
-                float(getattr(ep_a, "tangent_confidence", 1.0)),
-                float(getattr(ep_b, "tangent_confidence", 1.0)),
+                float(ep_a.tangent_confidence),
+                float(ep_b.tangent_confidence),
             )
             best_forward = max(fwd_a, fwd_b)
             worst_forward = min(fwd_a, fwd_b)
@@ -1010,8 +981,8 @@ def generate_candidates(
             )
 
             # Narrow Tier-2 fallback for sparse straight-edged scenes (e.g., staggered rectangle sides).
-            curv_a = float(getattr(ep_a, "curvature", 0.0))
-            curv_b = float(getattr(ep_b, "curvature", 0.0))
+            curv_a = float(ep_a.curvature)
+            curv_b = float(ep_b.curvature)
             low_curvature_pair = max(curv_a, curv_b) <= 0.0045
             extension_pregate_t2 = (
                 tier == 2

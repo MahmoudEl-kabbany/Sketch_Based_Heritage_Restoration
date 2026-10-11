@@ -13,6 +13,7 @@ import numpy as np
 from scipy.spatial.distance import directed_hausdorff
 
 from bezier_curves.bezier import BezierPath, BezierSegment
+from restoration.geometry import endpoint_curvature, polyline_length, safe_normalize
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -82,13 +83,6 @@ def _resample_polyline(points: np.ndarray, max_points: int) -> np.ndarray:
     x = np.interp(targets, cumulative, points[:, 0])
     y = np.interp(targets, cumulative, points[:, 1])
     return np.column_stack((x, y)).astype(np.float64)
-
-
-def _polyline_length(points: np.ndarray) -> float:
-    """Arc length of a polyline."""
-    if len(points) < 2:
-        return 0.0
-    return float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
 
 
 def _bridge_overlaps_gap(
@@ -266,13 +260,6 @@ def _points_to_bezier_segments(
 # Endpoint tangent extraction
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _safe_normalize(v: np.ndarray) -> np.ndarray:
-    n = float(np.linalg.norm(v))
-    if n < 1e-12:
-        return np.array([1.0, 0.0], dtype=np.float64)
-    return (v / n).astype(np.float64)
-
-
 def _context_endpoint_tangent(path: BezierPath, end: str) -> Tuple[np.ndarray, float]:
     """Estimate outward tangent from local sampled path context."""
     sampled = path.sample(pts_per_segment=24)
@@ -302,7 +289,7 @@ def _context_endpoint_tangent(path: BezierPath, end: str) -> Tuple[np.ndarray, f
         return np.array([1.0, 0.0], dtype=np.float64), 0.0
 
     unit = vectors[valid] / np.linalg.norm(vectors[valid], axis=1, keepdims=True)
-    mean_vec = _safe_normalize(np.mean(unit, axis=0))
+    mean_vec = safe_normalize(np.mean(unit, axis=0))
     consistency = float(np.mean(np.clip(unit @ mean_vec, 0.0, 1.0)))
     return mean_vec, float(np.clip(consistency, 0.0, 1.0))
 
@@ -315,31 +302,10 @@ def _path_tangent_at(path: BezierPath, end: str) -> np.ndarray:
         cp = path.segments[0].control_points
         derivative = 3.0 * (cp[0] - cp[1])
 
-    derivative_tangent = _safe_normalize(derivative)
+    derivative_tangent = safe_normalize(derivative)
     context_tangent, confidence = _context_endpoint_tangent(path, end)
     blend = float(np.clip(confidence, 0.15, 0.90))
-    return _safe_normalize((1.0 - blend) * derivative_tangent + blend * context_tangent)
-
-
-def _path_curvature_at(path: BezierPath, end: str) -> float:
-    """Unsigned curvature at a path boundary."""
-    if end == "end":
-        cp = path.segments[-1].control_points
-        t = 1.0
-    else:
-        cp = path.segments[0].control_points
-        t = 0.0
-    u = 1.0 - t
-    d1 = (3.0 * u * u * (cp[1] - cp[0])
-          + 6.0 * u * t * (cp[2] - cp[1])
-          + 3.0 * t * t * (cp[3] - cp[2]))
-    d2 = (6.0 * u * (cp[2] - 2 * cp[1] + cp[0])
-          + 6.0 * t * (cp[3] - 2 * cp[2] + cp[1]))
-    cross = float(d1[0] * d2[1] - d1[1] * d2[0])
-    speed_sq = float(d1[0] ** 2 + d1[1] ** 2)
-    if speed_sq < 1e-24:
-        return 0.0
-    return abs(cross) / (speed_sq ** 1.5)
+    return safe_normalize((1.0 - blend) * derivative_tangent + blend * context_tangent)
 
 
 def _closure_plausibility_metrics(
@@ -355,7 +321,7 @@ def _closure_plausibility_metrics(
     _, conf_start = _context_endpoint_tangent(path, "end")
     _, conf_end = _context_endpoint_tangent(path, "start")
 
-    gap_dir = _safe_normalize(gap_end - gap_start)
+    gap_dir = safe_normalize(gap_end - gap_start)
     forward_start = float(np.dot(t_start, gap_dir))
     forward_end = float(np.dot(t_end, -gap_dir))
     bilateral = float(min(forward_start, forward_end))
@@ -364,8 +330,8 @@ def _closure_plausibility_metrics(
     anti_parallel = float(np.clip(np.dot(t_start, -t_end), -1.0, 1.0))
     misalignment_deg = float(np.degrees(np.arccos(anti_parallel)))
 
-    k_start = _path_curvature_at(path, "end")
-    k_end = _path_curvature_at(path, "start")
+    k_start = endpoint_curvature(path, "end")
+    k_end = endpoint_curvature(path, "start")
     k_sum = float(k_start + k_end)
     if k_sum < 1e-9:
         curvature_coherence = 1.0
@@ -500,10 +466,8 @@ def close_single_gaps(
         end_pt = path.segments[-1].control_points[3]
         gap_dist = float(np.linalg.norm(end_pt - start_pt))
 
-        # Estimate perimeter
         samples = path.sample(pts_per_segment=30)
-        diffs = np.diff(samples, axis=0)
-        perimeter = float(np.sum(np.linalg.norm(diffs, axis=1)))
+        perimeter = polyline_length(samples)
 
         if perimeter < 1e-6:
             result.append(path)
@@ -596,7 +560,7 @@ def close_single_gaps(
             )
             if len(mirrored) >= 2:
                 mirrored = _resample_polyline(mirrored, max_points=max_mirrored_points)
-                mirrored_len = _polyline_length(mirrored)
+                mirrored_len = polyline_length(mirrored)
                 # PR3: reject mirrored closures that are much too complex for this gap.
                 if mirrored_len <= max(gap_dist * 3.0, perimeter * max_closure_length_ratio):
                     closure_segments = _points_to_bezier_segments(
@@ -610,8 +574,8 @@ def close_single_gaps(
             # Fallback: curvature-aware arc
             t_start = _path_tangent_at(path, "end")
             t_end = _path_tangent_at(path, "start")
-            k_start = _path_curvature_at(path, "end")
-            k_end = _path_curvature_at(path, "start")
+            k_start = endpoint_curvature(path, "end")
+            k_end = endpoint_curvature(path, "start")
             closure_segments = _curvature_aware_arc(
                 end_pt, start_pt,
                 t_start, t_end,

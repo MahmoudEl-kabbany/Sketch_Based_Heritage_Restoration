@@ -26,6 +26,13 @@ import sknw
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
 
 
+def bezier_eval(cp: np.ndarray, ts: np.ndarray) -> np.ndarray:
+    """Evaluate the cubic Bezier with control points *cp* (4, 2) at parameters *ts* (n,)."""
+    t = ts[:, np.newaxis]
+    u = 1.0 - t
+    return (u**3) * cp[0] + 3 * (u**2) * t * cp[1] + 3 * u * (t**2) * cp[2] + (t**3) * cp[3]
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Data classes
 # ═══════════════════════════════════════════════════════════════════════════
@@ -47,16 +54,7 @@ class BezierSegment:
 
     def sample(self, n: int = 50) -> np.ndarray:
         """Return *n* evenly-spaced (x, y) points along the curve."""
-        ts = np.linspace(0.0, 1.0, n)
-        u = 1.0 - ts
-        # Vectorized De Casteljau evaluation
-        pts = (
-            (u**3)[:, np.newaxis] * self.control_points[0]
-            + 3 * (u**2)[:, np.newaxis] * ts[:, np.newaxis] * self.control_points[1]
-            + 3 * u[:, np.newaxis] * (ts**2)[:, np.newaxis] * self.control_points[2]
-            + (ts**3)[:, np.newaxis] * self.control_points[3]
-        )  # shape (n, 2)
-        return pts
+        return bezier_eval(self.control_points, np.linspace(0.0, 1.0, n))
 
     def reverse(self) -> None:
         """Reverse the direction of the control points."""
@@ -239,13 +237,7 @@ def _reparameterize(
     u = 1.0 - params  # shape (n,)
     t = params        # shape (n,)
 
-    # Bezier curve value at all parameters
-    q = (
-        (u**3)[:, np.newaxis] * cp[0]
-        + 3 * (u**2)[:, np.newaxis] * t[:, np.newaxis] * cp[1]
-        + 3 * u[:, np.newaxis] * (t**2)[:, np.newaxis] * cp[2]
-        + (t**3)[:, np.newaxis] * cp[3]
-    )  # shape (n, 2)
+    q = bezier_eval(cp, params)  # shape (n, 2)
 
     # First derivative
     q1 = (
@@ -278,15 +270,7 @@ def _fit_error_stats(
     points: np.ndarray, cp: np.ndarray, params: np.ndarray
 ) -> Tuple[float, float, int]:
     """Return (max squared error, mean squared error, worst index)."""
-    u = 1.0 - params
-    t = params
-    bezier_pts = (
-        (u**3)[:, np.newaxis] * cp[0]
-        + 3 * (u**2)[:, np.newaxis] * t[:, np.newaxis] * cp[1]
-        + 3 * u[:, np.newaxis] * (t**2)[:, np.newaxis] * cp[2]
-        + (t**3)[:, np.newaxis] * cp[3]
-    )
-    errors = np.sum((bezier_pts - points) ** 2, axis=1)
+    errors = np.sum((bezier_eval(cp, params) - points) ** 2, axis=1)
     split_idx = int(np.argmax(errors))
     return float(errors[split_idx]), float(np.mean(errors)), split_idx
 

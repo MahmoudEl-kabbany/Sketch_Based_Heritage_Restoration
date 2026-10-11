@@ -311,29 +311,29 @@ def score_candidates(
         )
 
         # PR2 tie-break refinements: prioritize robust local closure, suppress spur links.
-        c.score += 0.16 * max(0.0, float(getattr(c, "bilateral_alignment", 0.0)))
-        if getattr(c, "same_path_closure", False):
+        c.score += 0.16 * max(0.0, float(c.bilateral_alignment))
+        if c.same_path_closure:
             c.score += 0.20
-        if getattr(c, "spur_involved", False):
+        if c.spur_involved:
             c.score -= 0.22
 
-        misalignment_deg = float(getattr(c, "misalignment_deg", 180.0))
+        misalignment_deg = float(c.misalignment_deg)
         if misalignment_deg > 70.0:
             c.score -= 0.08 * min(1.0, (misalignment_deg - 70.0) / 60.0)
 
-        if c.tier == 2 and float(getattr(c, "bilateral_alignment", 0.0)) < 0.25:
+        if c.tier == 2 and float(c.bilateral_alignment) < 0.25:
             c.score -= 0.06
 
-        ext_quality = float(np.clip(getattr(c, "extension_quality", 0.0), 0.0, 1.0))
+        ext_quality = float(np.clip(c.extension_quality, 0.0, 1.0))
         if c.scenario == "extension_intersection":
-            if getattr(c, "same_path_closure", False):
+            if c.same_path_closure:
                 # Favor extension for sharp same-path closures only when alignment evidence is strong.
                 corner_factor = float(np.clip((misalignment_deg - 55.0) / 60.0, 0.0, 1.0))
-                continuation_strength = float(np.clip(getattr(c, "bilateral_alignment", 0.0), 0.0, 1.0))
+                continuation_strength = float(np.clip(c.bilateral_alignment, 0.0, 1.0))
                 extension_need = 1.0 - continuation_strength
                 context_conf = min(
-                    float(np.clip(getattr(c.ep_a, "tangent_confidence", 1.0), 0.0, 1.0)),
-                    float(np.clip(getattr(c.ep_b, "tangent_confidence", 1.0), 0.0, 1.0)),
+                    float(np.clip(c.ep_a.tangent_confidence, 0.0, 1.0)),
+                    float(np.clip(c.ep_b.tangent_confidence, 0.0, 1.0)),
                 )
                 c.score += (0.26 + 0.10 * corner_factor) * ext_quality * (extension_need ** 2) * context_conf
                 if continuation_strength > 0.60:
@@ -346,7 +346,7 @@ def score_candidates(
                 c.score += 0.04 * ext_quality
                 # Recover short corner-like cross-path closures that are geometrically
                 # plausible but under-scored by continuation-based penalties.
-                bilateral = float(np.clip(getattr(c, "bilateral_alignment", 0.0), -1.0, 1.0))
+                bilateral = float(np.clip(c.bilateral_alignment, -1.0, 1.0))
                 if (
                     c.tier == 1
                     and c.distance <= min(60.0, radius_t1 * 0.42)
@@ -371,7 +371,7 @@ def score_candidates(
     affinity_by_candidate: Dict[int, float] = {}
 
     for c in candidates:
-        if not getattr(c, "same_path_closure", False):
+        if not c.same_path_closure:
             continue
         path_idx = int(c.ep_a.path_index)
         current = best_self_closure_by_path.get(path_idx)
@@ -380,7 +380,7 @@ def score_candidates(
             best_self_closure_by_path[path_idx] = candidate_data
 
     for c in candidates:
-        if getattr(c, "same_path_closure", False):
+        if c.same_path_closure:
             continue
         if c.ep_a.path_index == c.ep_b.path_index:
             continue
@@ -415,7 +415,7 @@ def score_candidates(
     # PR4b: if a path has a strong high-affinity option, suppress low-affinity competitors.
     best_high_affinity_score_by_path: Dict[int, float] = {}
     for c in candidates:
-        if getattr(c, "same_path_closure", False):
+        if c.same_path_closure:
             continue
         affinity = affinity_by_candidate.get(int(c.id), 0.0)
         if affinity < 0.22:
@@ -427,7 +427,7 @@ def score_candidates(
             )
 
     for c in candidates:
-        if getattr(c, "same_path_closure", False):
+        if c.same_path_closure:
             continue
         affinity = affinity_by_candidate.get(int(c.id), 0.0)
         if affinity >= 0.10:
@@ -448,8 +448,8 @@ def score_candidates(
     candidates.sort(
         key=lambda c: (
             -c.score,
-            int(not getattr(c, "same_path_closure", False)),
-            -float(getattr(c, "extension_quality", 0.0)),
+            int(not c.same_path_closure),
+            -float(c.extension_quality),
             c.distance,
             c.misalignment_deg,
             -c.bilateral_alignment,

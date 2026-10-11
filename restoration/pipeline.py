@@ -23,6 +23,7 @@ from restoration.scoring import score_candidates
 from restoration.asp_engine import decode_solution, solve_partitioned, RULES_PATH
 from restoration.synthesis import synthesize_bridges, merge_restored_paths
 from restoration.efd_closure import close_single_gaps
+from restoration.geometry import polyline_length, safe_normalize, visual_order_key
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
 
@@ -42,14 +43,6 @@ class RestorationResult:
     report: Dict[str, Any]
 
 
-def _endpoint_token(ep) -> Tuple[str, int]:
-    """Canonical endpoint token used for occupancy checks."""
-    if getattr(ep, "endpoint_id", -1) >= 0:
-        return ("id", int(ep.endpoint_id))
-    # Fallback for synthetic endpoints.
-    return ("path_end", int(ep.path_index) * 2 + (1 if ep.end == "end" else 0))
-
-
 def _sanitize_accepted_candidates(
     accepted: List[ConnectionCandidate],
 ) -> Tuple[List[ConnectionCandidate], int]:
@@ -58,13 +51,13 @@ def _sanitize_accepted_candidates(
         return [], 0
 
     ordered = sorted(accepted, key=lambda c: (-c.score, c.distance, c.id))
-    used_tokens: Set[Tuple[str, int]] = set()
+    used_tokens: Set[int] = set()
     sanitized: List[ConnectionCandidate] = []
     dropped = 0
 
     for c in ordered:
-        token_a = _endpoint_token(c.ep_a)
-        token_b = _endpoint_token(c.ep_b)
+        token_a = c.ep_a.endpoint_id
+        token_b = c.ep_b.endpoint_id
         if token_a == token_b or token_a in used_tokens or token_b in used_tokens:
             dropped += 1
             continue
@@ -112,14 +105,6 @@ def _bridge_crosses_image_mask(
     return False
 
 
-def _safe_unit(v: np.ndarray) -> np.ndarray:
-    """Return a unit vector with robust fallback for degenerate vectors."""
-    n = float(np.linalg.norm(v))
-    if n < 1e-12:
-        return np.array([1.0, 0.0], dtype=np.float64)
-    return v / n
-
-
 def _numeric_summary(values: List[float], digits: int = 3) -> Dict[str, float]:
     """Summarize numeric lists for reporting."""
     if not values:
@@ -141,20 +126,10 @@ def _count_by(items: List[Any], key_fn) -> Dict[str, int]:
     return counts
 
 
-def _endpoint_token_key(token: Tuple[str, int]) -> str:
-    """Serialize endpoint token tuples into stable text keys."""
-    return f"{token[0]}:{token[1]}"
-
-
 def _candidate_endpoint_pair_key(candidate: ConnectionCandidate) -> str:
     """Canonical order-independent endpoint pair key for exactness checks."""
-    token_a = _endpoint_token(candidate.ep_a)
-    token_b = _endpoint_token(candidate.ep_b)
-    key_a = _endpoint_token_key(token_a)
-    key_b = _endpoint_token_key(token_b)
-    if key_a <= key_b:
-        return f"{key_a}|{key_b}"
-    return f"{key_b}|{key_a}"
+    key_a, key_b = sorted((f"id:{candidate.ep_a.endpoint_id}", f"id:{candidate.ep_b.endpoint_id}"))
+    return f"{key_a}|{key_b}"
 
 
 def _build_bridge_event_explanation(
@@ -171,7 +146,7 @@ def _build_bridge_event_explanation(
 
     extension_suffix = ""
     if candidate.scenario == "extension_intersection":
-        ext_quality = float(getattr(candidate, "extension_quality", 0.0))
+        ext_quality = float(candidate.extension_quality)
         extension_suffix = f" Extension convergence quality is {ext_quality:.2f}."
 
     return (
@@ -327,7 +302,7 @@ def _save_labeled_restoration(
     bridge_owner_by_segment_id: Dict[int, ConnectionCandidate] = {}
     if accepted:
         for c in accepted:
-            for bridge_seg in getattr(c, "bridge_bezier", []):
+            for bridge_seg in c.bridge_bezier:
                 bridge_owner_by_segment_id[id(bridge_seg)] = c
 
     changes = []
@@ -392,8 +367,8 @@ def _save_labeled_restoration(
                 pos = change_pts[mid_idx]
                 prev_pt = change_pts[max(0, mid_idx - 1)]
                 next_pt = change_pts[min(len(change_pts) - 1, mid_idx + 1)]
-                tangent = _safe_unit(next_pt - prev_pt)
-                normal = _safe_unit(np.array([-tangent[1], tangent[0]], dtype=np.float64))
+                tangent = safe_normalize(next_pt - prev_pt)
+                normal = safe_normalize(np.array([-tangent[1], tangent[0]], dtype=np.float64))
                 base_offset = float(np.clip(img_diag * 0.007, 8.0, 18.0))
                 box_w, box_h = _estimate_label_box(label_id)
 
@@ -443,7 +418,7 @@ def _save_labeled_restoration(
                     ),
                 )
 
-                approx_length = float(np.sum(np.linalg.norm(np.diff(change_pts, axis=0), axis=1))) if len(change_pts) >= 2 else 0.0
+                approx_length = polyline_length(change_pts)
 
                 owning_candidate = None
                 if source == "bridge":
@@ -473,7 +448,7 @@ def _save_labeled_restoration(
                         "tier": int(owning_candidate.tier),
                         "distance_px": round(float(owning_candidate.distance), 2),
                         "score": round(float(owning_candidate.score), 4),
-                        "extension_quality": round(float(getattr(owning_candidate, "extension_quality", 0.0)), 4),
+                        "extension_quality": round(float(owning_candidate.extension_quality), 4),
                         "bilateral_alignment": round(float(owning_candidate.bilateral_alignment), 4),
                         "misalignment_deg": round(float(owning_candidate.misalignment_deg), 2),
                         "same_path_closure": bool(owning_candidate.same_path_closure),
@@ -481,15 +456,15 @@ def _save_labeled_restoration(
                         "endpoint_a": {
                             "path_index": int(owning_candidate.ep_a.path_index),
                             "end": str(owning_candidate.ep_a.end),
-                            "endpoint_id": int(getattr(owning_candidate.ep_a, "endpoint_id", -1)),
+                            "endpoint_id": int(owning_candidate.ep_a.endpoint_id),
                         },
                         "endpoint_b": {
                             "path_index": int(owning_candidate.ep_b.path_index),
                             "end": str(owning_candidate.ep_b.end),
-                            "endpoint_id": int(getattr(owning_candidate.ep_b, "endpoint_id", -1)),
+                            "endpoint_id": int(owning_candidate.ep_b.endpoint_id),
                         },
                     }
-                    if getattr(owning_candidate, "intersection_point", None) is not None:
+                    if owning_candidate.intersection_point is not None:
                         ip = np.asarray(owning_candidate.intersection_point, dtype=np.float64).reshape(2)
                         event_entry["candidate"]["intersection_point"] = [
                             round(float(ip[0]), 2),
@@ -879,13 +854,7 @@ def restore(
     t_phase = time.perf_counter()
 
     # Ensure visual order for labeling (top-down, left-right)
-    def final_path_sort_key(p: BezierPath):
-        pts = p.sample(5)
-        min_y = np.min(pts[:, 1])
-        min_x = np.min(pts[:, 0])
-        return (round(min_y / 12.0), min_x)
-    
-    final_paths.sort(key=final_path_sort_key)
+    final_paths.sort(key=visual_order_key)
 
     # Labeled overlay visualization + logs
     _, change_logs = _save_labeled_restoration(

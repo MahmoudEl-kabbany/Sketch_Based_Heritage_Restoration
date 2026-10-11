@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from restoration.extraction import EndpointInfo
 from restoration.candidates import ConnectionCandidate
 
 RULES_PATH = os.path.join(os.path.dirname(__file__), "asp_rules", "restoration.lp")
@@ -71,15 +70,6 @@ def _to_int_score(value: float, scale: int = 100) -> int:
     return max(0, min(scale, int(round(value * scale))))
 
 
-def _endpoint_token_id(ep: EndpointInfo) -> int:
-    """Return a stable endpoint token ID for ASP occupancy constraints."""
-    if ep.endpoint_id >= 0:
-        return int(ep.endpoint_id)
-    # Fallback for synthetic endpoints not coming from extraction.
-    end_map = {"start": 0, "end": 1}
-    return int(ep.path_index * 2 + end_map.get(ep.end, 0))
-
-
 def _compute_nested_shape_pairs(
     candidates: List[ConnectionCandidate],
     extraction: "ExtractionResult"
@@ -121,41 +111,24 @@ def _compute_nested_shape_pairs(
 
 def encode_facts(
     candidates: List[ConnectionCandidate],
-    extraction: "ExtractionResult",
     nested_pairs: Set[Tuple[int, int]] = None,
 ) -> str:
-    """Convert scored candidates and endpoints into ASP fact strings."""
+    """Convert scored candidates into ASP fact strings."""
     lines: List[str] = []
     end_map = {"start": 0, "end": 1}
-    endpoint_token_cache: Dict[Tuple[int, int, str], int] = {}
-    for ep in extraction.endpoints:
-        key = (int(getattr(ep, "endpoint_id", -1)), int(ep.path_index), str(ep.end))
-        endpoint_token_cache[key] = _endpoint_token_id(ep)
-
-    def _cached_endpoint_token_id(ep: EndpointInfo) -> int:
-        key = (int(getattr(ep, "endpoint_id", -1)), int(ep.path_index), str(ep.end))
-        cached = endpoint_token_cache.get(key)
-        if cached is not None:
-            return cached
-        token_id = _endpoint_token_id(ep)
-        endpoint_token_cache[key] = token_id
-        return token_id
-
     path_strength = _path_self_closure_strength_map(candidates)
 
     # Candidate facts
     for c in candidates:
         ea = end_map[c.ep_a.end]
         eb = end_map[c.ep_b.end]
-        ea_id = _cached_endpoint_token_id(c.ep_a)
-        eb_id = _cached_endpoint_token_id(c.ep_b)
         score_int = _to_int_score(c.score)
         lines.append(
             f"candidate({c.id},{c.ep_a.path_index},{ea},"
             f"{c.ep_b.path_index},{eb},{score_int})."
         )
-        lines.append(f"candidate_endpoint({c.id},{ea_id},{eb_id}).")
-        if getattr(c, "same_path_closure", False):
+        lines.append(f"candidate_endpoint({c.id},{c.ep_a.endpoint_id},{c.ep_b.endpoint_id}).")
+        if c.same_path_closure:
             lines.append(f"candidate_self_closure({c.id}).")
 
         utility = _candidate_effective_utility(c, path_strength)
@@ -181,7 +154,7 @@ def _path_self_closure_strength_map(
     """Compute per-path self-closure support buckets used by ASP soft suppression."""
     best_self_closure_by_path: Dict[int, float] = {}
     for c in candidates:
-        if not getattr(c, "same_path_closure", False):
+        if not c.same_path_closure:
             continue
         pidx = int(c.ep_a.path_index)
         best_self_closure_by_path[pidx] = max(
@@ -204,16 +177,16 @@ def _candidate_effective_utility(
 ) -> int:
     """Compute candidate utility equivalent to current ASP objective terms."""
     utility = int(_to_int_score(float(candidate.score)))
-    relaxed_tier2_extension = bool(getattr(candidate, "relaxed_tier2_extension", False))
+    relaxed_tier2_extension = bool(candidate.relaxed_tier2_extension)
 
     # Soft rewards from weak constraints with negative weights.
     closure_flag = bool(
-        getattr(candidate, "same_path_closure", False)
+        candidate.same_path_closure
         or (float(candidate.score) > 0.45 and float(candidate.distance) < 30.0)
     )
     if closure_flag:
         utility += 3
-    if getattr(candidate, "same_path_closure", False):
+    if candidate.same_path_closure:
         utility += 2
 
     # Cross-shape suppression from path-level self-closure support.
@@ -236,15 +209,15 @@ def _candidate_effective_utility(
     if cont_int < 40 and not relaxed_tier2_extension:
         utility -= 2
 
-    ext_quality = int(_to_int_score(float(getattr(candidate, "extension_quality", 0.0))))
+    ext_quality = int(_to_int_score(float(candidate.extension_quality)))
     if (
         str(candidate.scenario) == "extension_intersection"
-        and bool(getattr(candidate, "same_path_closure", False))
+        and bool(candidate.same_path_closure)
         and ext_quality < 45
     ):
         utility -= 3
 
-    if int(getattr(candidate, "tier", 1)) == 2:
+    if int(candidate.tier) == 2:
         utility -= 1
         if relaxed_tier2_extension:
             utility += 1
@@ -266,8 +239,7 @@ def _prune_strictly_dominated_candidates(
     path_strength = _path_self_closure_strength_map(candidates)
     groups: Dict[Tuple[int, int], List[ConnectionCandidate]] = defaultdict(list)
     for c in candidates:
-        ea = int(_endpoint_token_id(c.ep_a))
-        eb = int(_endpoint_token_id(c.ep_b))
+        ea, eb = c.ep_a.endpoint_id, c.ep_b.endpoint_id
         key = (ea, eb) if ea <= eb else (eb, ea)
         groups[key].append(c)
 
@@ -277,7 +249,7 @@ def _prune_strictly_dominated_candidates(
             keep_ids.add(int(group[0].id))
             continue
 
-        if any(bool(getattr(c, "same_path_closure", False)) for c in group):
+        if any(bool(c.same_path_closure) for c in group):
             for c in group:
                 keep_ids.add(int(c.id))
             continue
@@ -303,8 +275,7 @@ def _split_candidates_by_endpoint_component(
     endpoint_to_candidate_indexes: Dict[int, List[int]] = defaultdict(list)
 
     for idx, c in enumerate(candidates):
-        ea = int(_endpoint_token_id(c.ep_a))
-        eb = int(_endpoint_token_id(c.ep_b))
+        ea, eb = c.ep_a.endpoint_id, c.ep_b.endpoint_id
         adjacency[ea].add(eb)
         adjacency[eb].add(ea)
         endpoint_to_candidate_indexes[ea].append(idx)
@@ -419,7 +390,7 @@ def solve_partitioned(
 
     for component_candidates in components:
         t_encode = time.perf_counter()
-        facts = encode_facts(component_candidates, extraction, nested_pairs)
+        facts = encode_facts(component_candidates, nested_pairs)
         encoding_time_s += (time.perf_counter() - t_encode)
 
         fact_lines += int(len(facts.splitlines()))
