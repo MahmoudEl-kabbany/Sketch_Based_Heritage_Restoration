@@ -131,12 +131,11 @@ If the closure is rejected, the path remains open.
 ```python
 def close_single_gaps(
     paths: List[BezierPath],
-    efd_contours: List[dict],
     gap_threshold: float = 0.30,
     validity_check_enabled: bool = True,
     plausibility_threshold: float = 0.50,
-    return_diagnostics: bool = False,
-) -> Union[List[BezierPath], Tuple[List[BezierPath], List[Dict[str, Any]]]]:
+    min_gap_for_validity_check: float = 3.0,
+) -> Tuple[List[BezierPath], List[Dict[str, Any]]]:  # (paths, diagnostics)
 ```
 
 ---

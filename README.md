@@ -64,7 +64,6 @@ Heritage sketches often suffer from physical deterioration. This project provide
               ┌─────────────────────────┐
               │Skeleton → Graph → Bézier│
               │Endpoints + Tangents     │
-              │  EFD Coefficients       |
               │  Distance Map           |
               └────────────┬────────────┘
                            │
@@ -146,7 +145,8 @@ Sketch_Based_Heritage_Restoration/
 │   ├── asp_engine.py               # Phase 4 — ASP fact encoding, Clingo solver
 │   ├── synthesis.py                # Phase 5 — G1 bridge construction & path merging
 │   ├── efd_closure.py              # Phase 6 — EFD single-gap closure
-│   ├── render_restored_sketch.py   # Binary sketch renderer for evaluation
+│   ├── geometry.py                 # Geometry helpers shared by the phases
+│   ├── render_restored_sketch.py   # Draws restoration bridges onto the damaged image for evaluation
 │   └── asp_rules/
 │       └── restoration.lp          # Answer Set Programming logic rules
 │
@@ -154,16 +154,12 @@ Sketch_Based_Heritage_Restoration/
 │   └── bezier.py                   # Bézier curve data structures & Schneider fitting
 │
 ├── eliptic_fourier_descriptors/
-│   └── efd.py                      # EFD extraction, reconstruction & visualization
+│   └── efd.py                      # Standalone EFD demo (not used by the pipeline)
 │
 ├── add_gaps.py                     # Damage simulation tool (gaps, cracks, scrubs)
 ├── evaluate_restoration.py         # PSNR/SSIM evaluation framework
 ├── evaluate_bridge_vs_original.py  # Fluidity metrics (MDTW/MJerk) vs ground truth
 ├── run_batch_test.py               # Batch restoration runner
-│
-├── test_add_gaps.py                # Tests for gap simulation
-├── test_bezier.py                  # Tests for Bézier curve fitting
-├── test_efd.py                     # Tests for EFD extraction
 ```
 
 ---
@@ -296,7 +292,6 @@ Converts the raster input into structured geometric representations:
 - **Chain traversal** with junction-continuation heuristics
 - **Schneider fitting** to produce cubic Bézier paths from polylines
 - **Endpoint tangent estimation** using multi-scale PCA with confidence scoring
-- **EFD coefficient extraction** for contour-level shape descriptors
 - **Distance map** computation for collision detection
 
 ### Phase 2 — Candidate Generation
@@ -335,7 +330,7 @@ Encodes the scored candidates as Answer Set Programming facts and solves for the
 Constructs the final Bézier bridge curves:
 - **Straight bridges** for collinear, low-curvature endpoints
 - **G1-continuous bridges** with curvature-aware handle lengths
-- **Intersection bridges** (linear or curved) through convergence points
+- **Corner bridges** — two segments through the extension intersection when both strokes are straight
 - **Control point stabilization** to prevent hook/backtracking artifacts
 - **Path merging** — concatenates bridge segments into restored paths with closure detection
 
@@ -394,7 +389,7 @@ Key parameters of the `restore()` function:
 | `scipy` | KD-trees, spatial distance, Hausdorff |
 | `scikit-image` | Skeletonization, PSNR/SSIM metrics |
 | `matplotlib` | Visualization and plotting |
-| `pyefd` | Elliptic Fourier Descriptor computation |
+| `pyefd` | Elliptic Fourier Descriptor computation (standalone `efd.py` demo only) |
 | `clingo` | Answer Set Programming solver |
 | `dtaidistance` | Dynamic Time Warping distance |
 | `sknw` | Skeleton-to-graph conversion |

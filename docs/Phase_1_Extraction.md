@@ -1,7 +1,7 @@
 # Phase 1 — Extraction
 
 > **Source file:** [`restoration/extraction.py`](../restoration/extraction.py)  
-> **Supporting module:** [`bezier_curves/bezier.py`](../bezier_curves/bezier.py), [`eliptic_fourier_descriptors/efd.py`](../eliptic_fourier_descriptors/efd.py)
+> **Supporting module:** [`bezier_curves/bezier.py`](../bezier_curves/bezier.py)
 
 ---
 
@@ -11,7 +11,6 @@ Phase 1 transforms a raw raster sketch image into a structured geometric represe
 
 - **Bézier paths** — cubic Bézier curve representations of every line in the sketch
 - **Endpoint descriptors** — position, outward tangent, curvature, and tangent confidence for each open path endpoint
-- **EFD contour data** — Elliptic Fourier Descriptor coefficients for closed contours
 - **Distance map** — pixel-wise distance from the nearest sketch line (for collision detection in later phases)
 
 ---
@@ -37,9 +36,6 @@ Raster Image (grayscale)
     │       ├─► Multi-scale PCA context tangent
     │       ├─► Blended tangent + confidence score
     │       └─► EndpointInfo objects
-    │
-    ├─► EFD Contour Extraction
-    │       └─► Fourier coefficients (order=40)
     │
     └─► Distance Map Computation
             └─► cv2.distanceTransform
@@ -202,17 +198,7 @@ Computed from Bézier first and second derivatives:
 κ = |x'y'' - y'x''| / (x'² + y'²)^(3/2)
 ```
 
-### 3.7 EFD Contour Extraction
-
-Closed contours are extracted and their Elliptic Fourier Descriptor coefficients computed:
-
-1. **Binarize** with Otsu + morphological closing (5×5 elliptical kernel)
-2. **Find contours** using `cv2.findContours` with `RETR_TREE` hierarchy
-3. **Filter** by minimum area (default: 100 pixels²)
-4. **Compute EFD coefficients** using `pyefd` with order=40 harmonics
-5. **Store** contour points, coefficients, and DC locus (a₀, c₀)
-
-### 3.8 Distance Map
+### 3.7 Distance Map
 
 ```python
 dist_map = cv2.distanceTransform((255 - binary), cv2.DIST_L2, 5)
@@ -245,7 +231,6 @@ class EndpointInfo:
 class ExtractionResult:
     paths: List[BezierPath]          # All extracted Bézier paths
     endpoints: List[EndpointInfo]    # Endpoints of open paths only
-    efd_contours: List[dict]         # EFD data for closed contours
     image_shape: Tuple[int, int]     # (height, width)
     diagonal: float                  # √(h² + w²)
     dist_map: Optional[np.ndarray]   # Distance map from lines
@@ -288,8 +273,6 @@ def extract_paths(
 | `max_error` | 2.0 | Maximum squared error for Schneider fitting (pixels²) |
 | `spur_threshold` | 12.0 | Minimum path arc length to keep (removes noise spurs) |
 | `merge_radius` | 5.0 | Radius for merging nearby endpoints |
-| `min_contour_area` | 100 | Minimum area for EFD contour extraction |
-| `efd_order` | 40 | Number of Fourier harmonics for EFD |
 
 ---
 
@@ -301,4 +284,3 @@ def extract_paths(
 | `scikit-image` | Morphological skeletonization |
 | `sknw` | Skeleton-to-graph conversion |
 | `numpy` | Array operations, linear algebra |
-| `pyefd` | Elliptic Fourier Descriptor computation |

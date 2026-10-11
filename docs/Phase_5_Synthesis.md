@@ -84,12 +84,8 @@ Used when both endpoints are straight lines (< 0.008 curvature).
 - Segment 2: `I` to `P3`
 - The handles going toward and away from `I` follow the direct straight-line vectors to `I`.
 
-**Curved Intersection (Organic Convergence):**
-- Segment 1: `P0` to `I`. `P1` follows the source tangent. `P2` approaches `I` from the chord direction.
-- Segment 2: `I` to `P3`. `P1` departs `I` along the chord direction. `P2` follows the target tangent.
-
 **Smooth Fallback:**
-If the calculated intersection point `I` is very close to the chord midpoint (distance < 45% of chord), drawing a 2-segment bridge through it creates an unnatural kink. In this case, the system discards the intersection and falls back to a single smooth **G1 bridge**.
+If either endpoint is curved (curvature ≥ 0.008), the intersection point is not used and the candidate gets a single smooth **G1 bridge**.
 
 ---
 
@@ -97,7 +93,7 @@ If the calculated intersection point `I` is very close to the chord midpoint (di
 
 After the bridge segments are created, the discrete paths must be chained together.
 
-1. **Tokenization:** Every start and end of every path is assigned a stable token `(type, ID)`.
+1. **Tokenization:** Every start and end of every open path is identified by the token `(path_index, end)`.
 2. **Path Storage:** All paths are loaded into an `active` dictionary.
 3. **Bridge Iteration:** For each accepted connection A ↔ B:
    - Look up the active path containing endpoint A.
@@ -120,7 +116,6 @@ def synthesize_bridges(
 
 def merge_restored_paths(
     original_paths: List[BezierPath],
-    bridges: List[BezierSegment],
     accepted: List[ConnectionCandidate],
 ) -> List[BezierPath]:
     # Returns the combined final topology

@@ -149,7 +149,7 @@ components = _split_candidates_by_endpoint_component(working_candidates)
 Instead of running one massive solver instance, `clingo` is invoked separately on each independent component, radically reducing exponential branching overhead.
 
 ### 5.3 Parallel Clingo
-The system probes for `clingo` multithreading support and injects arguments like `--threads=N` and `--opt-mode=optN` based on CPU core count.
+`clingo` is run with `--opt-mode=optN` and `--parallel-mode=N`, where N is the CPU core count clamped to 2–8. Setting the environment variable `RESTORATION_CLINGO_CONSERVATIVE=1` runs it single-threaded instead.
 
 ---
 

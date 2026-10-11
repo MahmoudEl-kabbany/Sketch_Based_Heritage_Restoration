@@ -55,8 +55,10 @@ List[ConnectionCandidate]  +  ExtractionResult
 5. **Final metric:** `MDTW = √(dtw_x² + dtw_y²)`
 
 ```python
-def _compute_mdtw(bridge_pts, source_path, target_path, tail_len=20):
-    combined = vstack([source_tail, bridge_pts, target_head])
+combined = context_curve(bridge_pts, source_samples, target_samples, tail_len=20)
+#        = vstack([source_tail, bridge_pts, target_head])
+
+def compute_mdtw(combined):
     baseline = linspace(combined[0], combined[-1], len(combined))
     dtw_x = dtw.distance(combined[:, 0], baseline[:, 0])
     dtw_y = dtw.distance(combined[:, 1], baseline[:, 1])
@@ -92,8 +94,7 @@ MJerk = mean(||j||²)
 ```
 
 ```python
-def _compute_mjerk(bridge_pts, source_path, target_path, tail_len=20):
-    combined = vstack([source_tail, bridge_pts, target_head])
+def compute_mjerk(combined):  # the same context curve as for MDTW
     diffs = diff(combined, axis=0)
     ds = norm(diffs, axis=1)
     vel = diffs / ds[:, newaxis]
