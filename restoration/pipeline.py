@@ -7,14 +7,18 @@ Simple API:
 
 from __future__ import annotations
 
+import functools
+import io
 import json
 import os
+import sys
 import time
 from collections import Counter
-from contextlib import contextmanager
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass
 from itertools import groupby
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import cv2
 import numpy as np
@@ -735,13 +739,60 @@ def restore(
     )
 
 
+def default_workers() -> int:
+    """Worker processes for batch runs: leave two cores free, use at most eight."""
+    return max(1, min(8, (os.cpu_count() or 1) - 2))
+
+
+def _run_captured(fn: Callable, job: Sequence[Any]) -> Tuple[Any, str]:
+    """Call fn(*job) and return its result with everything it printed."""
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        result = fn(*job)
+    return result, buffer.getvalue()
+
+
+def map_in_processes(
+    fn: Callable,
+    jobs: Sequence[Sequence[Any]],
+    workers: int = 1,
+    announce: Optional[Callable[[int], None]] = None,
+) -> Iterator[Any]:
+    """Yield fn(*job) for every job, in order.
+
+    With more than one worker the calls run in separate processes; what each
+    call prints is held back and shown as one block when its result is
+    yielded. *announce(i)* is called just before the output of job i appears.
+    *fn* must be a module-level function so that it can be sent to a worker.
+    """
+    if workers <= 1 or len(jobs) <= 1:
+        for i, job in enumerate(jobs):
+            if announce:
+                announce(i)
+            yield fn(*job)
+        return
+
+    with ProcessPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
+        futures = [pool.submit(_run_captured, fn, job) for job in jobs]
+        for i, future in enumerate(futures):
+            result, output = future.result()
+            if announce:
+                announce(i)
+            sys.stdout.write(output)
+            yield result
+
+
 def restore_batch(
     image_paths: List[str],
+    workers: int = 1,
     **kwargs,
 ) -> List[RestorationResult]:
-    """Restore multiple images. Each is processed independently."""
-    results = []
-    for i, path in enumerate(image_paths, 1):
-        print(f"\n[{i}/{len(image_paths)}]")
-        results.append(restore(path, **kwargs))
-    return results
+    """Restore multiple images. Each is processed independently, in *workers*
+    parallel processes if more than one is asked for; results keep the input order."""
+    total = len(image_paths)
+    return list(map_in_processes(
+        functools.partial(restore, **kwargs),
+        [(path,) for path in image_paths],
+        workers,
+        announce=lambda i: print(f"\n[{i + 1}/{total}]"),
+    ))

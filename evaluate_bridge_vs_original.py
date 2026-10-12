@@ -4,6 +4,7 @@ rejected candidates and with the matching strokes of the undamaged originals.
 Usage:
     python evaluate_bridge_vs_original.py              # all matched pairs
     python evaluate_bridge_vs_original.py --limit 10   # first 10 pairs only
+    python evaluate_bridge_vs_original.py --workers 1  # one pair at a time
 """
 import argparse
 
@@ -16,6 +17,7 @@ from restoration.extraction import extract_paths
 from restoration.candidates import generate_candidates
 from restoration.scoring import compute_mdtw, compute_mjerk, context_curve, score_candidates
 from restoration.asp_engine import solve_candidates
+from restoration.pipeline import default_workers, map_in_processes
 
 # MJerk (mean squared third derivative, px^-4) is reported in units of 1e-3.
 MJERK_SCALE = 1e-3
@@ -89,6 +91,8 @@ def evaluate_image(damaged_path: str, orig_path: str, tail_len=20):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--workers", type=int, default=default_workers(),
+                        help="Image pairs evaluated in parallel (1 = one at a time).")
     args = parser.parse_args()
 
     pairs = discover_pairs()
@@ -99,9 +103,12 @@ def main():
 
     print(f"Starting evaluation on {len(pairs)} image pairs...")
 
-    for i, (name, orig_p, dmg_p) in enumerate(pairs):
-        print(f"[{i+1}/{len(pairs)}] Evaluating {name}...")
-        result = evaluate_image(dmg_p, orig_p)
+    jobs = [(dmg_p, orig_p) for _, orig_p, dmg_p in pairs]
+
+    def announce(i: int) -> None:
+        print(f"[{i+1}/{len(pairs)}] Evaluating {pairs[i][0]}...")
+
+    for result in map_in_processes(evaluate_image, jobs, args.workers, announce):
         print(f"    Found {len(result['chosen_mdtw'])} matched bridges "
               f"and {len(result['rejected_mdtw'])} rejected candidates.")
         for key in RESULT_KEYS:

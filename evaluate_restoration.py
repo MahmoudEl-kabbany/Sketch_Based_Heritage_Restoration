@@ -8,6 +8,7 @@ Usage:
     python evaluate_restoration.py                  # run all 32 pairs
     python evaluate_restoration.py --limit 5        # run first 5 pairs only
     python evaluate_restoration.py --filter ankh    # run only pairs matching 'ankh'
+    python evaluate_restoration.py --workers 1      # one image at a time
     python evaluate_restoration.py --save-images    # also write the overlay figures
 """
 
@@ -26,7 +27,7 @@ import cv2
 import numpy as np
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
-from restoration.pipeline import restore
+from restoration.pipeline import default_workers, map_in_processes, restore
 from restoration.render_restored_sketch import (
     estimate_line_width,
     render_bridges_on_damaged,
@@ -458,6 +459,10 @@ def main() -> None:
         help="Directory for output files.",
     )
     parser.add_argument(
+        "--workers", type=int, default=default_workers(),
+        help="Image pairs evaluated in parallel (1 = one at a time).",
+    )
+    parser.add_argument(
         "--save-images", action="store_true",
         help="Also write the pipeline's overlay and comparison figures for each image.",
     )
@@ -481,10 +486,15 @@ def main() -> None:
     results: List[ImageMetrics] = []
     print_table_header()
 
-    for i, (name, orig_path, dmg_path) in enumerate(pairs, 1):
-        print(f"\n  [{i}/{len(pairs)}] Processing: {name}")
-        metrics = evaluate_single(name, orig_path, dmg_path, output_dir=args.output_dir,
-                                  save_images=args.save_images)
+    jobs = [
+        (name, orig_path, dmg_path, args.output_dir, args.save_images)
+        for name, orig_path, dmg_path in pairs
+    ]
+
+    def announce(i: int) -> None:
+        print(f"\n  [{i + 1}/{len(pairs)}] Processing: {pairs[i][0]}")
+
+    for metrics in map_in_processes(evaluate_single, jobs, args.workers, announce):
         results.append(metrics)
         print_table_row(metrics)
 
