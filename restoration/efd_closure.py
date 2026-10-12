@@ -13,7 +13,12 @@ import numpy as np
 from scipy.spatial.distance import directed_hausdorff
 
 from bezier_curves.bezier import BezierPath, BezierSegment
-from restoration.geometry import endpoint_curvature, polyline_length, safe_normalize
+from restoration.geometry import (
+    endpoint_curvature,
+    g1_control_points,
+    polyline_length,
+    safe_normalize,
+)
 
 # Reflection symmetry: minimum Hausdorff tolerance (px) and the gap/perimeter
 # range in which mirroring the opposite side is attempted.
@@ -194,24 +199,13 @@ def _curvature_aware_arc(
     Tangent_start points INTO the gap (outward from path end).
     Tangent_end points INTO the gap (outward from path start, negated).
     """
-    p0 = gap_start.copy()
-    p3 = gap_end.copy()
-    chord = float(np.linalg.norm(p3 - p0))
-    if chord < 1e-6:
+    if float(np.linalg.norm(gap_end - gap_start)) < 1e-6:
         return []
 
-    # Handle lengths
-    alpha_0 = chord / 3.0
-    alpha_3 = chord / 3.0
-    if curvature_start > 1e-6:
-        alpha_0 = min(alpha_0, 1.0 / (3.0 * curvature_start))
-    if curvature_end > 1e-6:
-        alpha_3 = min(alpha_3, 1.0 / (3.0 * curvature_end))
-
-    p1 = p0 + alpha_0 * tangent_start
-    p2 = p3 + alpha_3 * tangent_end
-
-    cp = np.vstack([p0, p1, p2, p3])
+    cp = g1_control_points(
+        gap_start, tangent_start, curvature_start,
+        gap_end, tangent_end, curvature_end,
+    )
     return [BezierSegment(control_points=cp, source_type="efd_closure")]
 
 

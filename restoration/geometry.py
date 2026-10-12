@@ -56,6 +56,30 @@ def endpoint_curvature(path: BezierPath, end: str) -> float:
     return bezier_curvature(path.segments[-1].control_points, 1.0)
 
 
+def g1_control_points(
+    p0: np.ndarray, tangent0: np.ndarray, curvature0: float,
+    p3: np.ndarray, tangent3: np.ndarray, curvature3: float,
+) -> np.ndarray:
+    """Control points (4, 2) of a cubic joining two path ends smoothly.
+
+    *tangent0* and *tangent3* are the outward tangents of the two ends, so the
+    curve leaves p0 along tangent0 and arrives at p3 moving against tangent3,
+    which puts both handles inside the gap. Handles are a third of the chord,
+    shortened at an end with high curvature.
+    """
+    chord = float(np.linalg.norm(p3 - p0))
+    if chord < 1e-6:
+        chord = 1.0
+
+    alpha0 = alpha3 = chord / 3.0
+    if curvature0 > 1e-6:
+        alpha0 = min(alpha0, 1.0 / (3.0 * curvature0))
+    if curvature3 > 1e-6:
+        alpha3 = min(alpha3, 1.0 / (3.0 * curvature3))
+
+    return np.vstack([p0, p0 + alpha0 * tangent0, p3 + alpha3 * tangent3, p3])
+
+
 def visual_order_key(path: BezierPath) -> Tuple[int, float]:
     """Sort key for top-down, then left-right ordering (12 px row bands)."""
     pts = path.sample(5)

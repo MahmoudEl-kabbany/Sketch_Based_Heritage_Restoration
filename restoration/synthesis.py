@@ -13,7 +13,7 @@ import numpy as np
 from bezier_curves.bezier import BezierPath, BezierSegment, fit_straight_cubic
 from restoration.extraction import EndpointInfo
 from restoration.candidates import ConnectionCandidate
-from restoration.geometry import polyline_length, safe_normalize
+from restoration.geometry import g1_control_points, polyline_length, safe_normalize
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -76,25 +76,10 @@ def _build_straight_bridge(ep_a: EndpointInfo, ep_b: EndpointInfo) -> BezierSegm
 
 def _build_g1_bridge(ep_a: EndpointInfo, ep_b: EndpointInfo) -> BezierSegment:
     """Single cubic Bezier with G1-continuous handles driven by curvature."""
-    p0 = ep_a.position.copy()
-    p3 = ep_b.position.copy()
-    chord = float(np.linalg.norm(p3 - p0))
-    if chord < 1e-6:
-        chord = 1.0
-
-    # Handle lengths — curvature-aware scaling
-    alpha_a = chord / 3.0
-    alpha_b = chord / 3.0
-    if ep_a.curvature > 1e-6:
-        alpha_a = min(alpha_a, 1.0 / (3.0 * ep_a.curvature))
-    if ep_b.curvature > 1e-6:
-        alpha_b = min(alpha_b, 1.0 / (3.0 * ep_b.curvature))
-
-    p1 = p0 + alpha_a * ep_a.tangent
-    # ep_b.tangent is outward; incoming derivative at p3 should align with -ep_b.tangent.
-    p2 = p3 + alpha_b * ep_b.tangent
-
-    return _bridge(np.vstack([p0, p1, p2, p3]))
+    return _bridge(g1_control_points(
+        ep_a.position, ep_a.tangent, ep_a.curvature,
+        ep_b.position, ep_b.tangent, ep_b.curvature,
+    ))
 
 
 def _build_intersection_bridge_linear(

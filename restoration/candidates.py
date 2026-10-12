@@ -15,7 +15,7 @@ from scipy.spatial.distance import cdist
 
 from bezier_curves.bezier import BezierPath, BezierSegment, bezier_eval
 from restoration.extraction import EndpointInfo, ExtractionResult
-from restoration.geometry import polyline_length, safe_normalize
+from restoration.geometry import g1_control_points, polyline_length, safe_normalize
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -536,25 +536,11 @@ def _build_continuation_bridge(
     ep_a: EndpointInfo, ep_b: EndpointInfo,
 ) -> List[BezierSegment]:
     """G1-continuous cubic Bezier bridge between two endpoints."""
-    p0 = ep_a.position.copy()
-    p3 = ep_b.position.copy()
-    chord = float(np.linalg.norm(p3 - p0))
-    if chord < 1e-6:
-        chord = 1.0
-
-    alpha_a = chord / 3.0
-    alpha_b = chord / 3.0
-    if ep_a.curvature > 1e-6:
-        alpha_a = min(alpha_a, 1.0 / (3.0 * ep_a.curvature))
-    if ep_b.curvature > 1e-6:
-        alpha_b = min(alpha_b, 1.0 / (3.0 * ep_b.curvature))
-
-    p1 = p0 + alpha_a * ep_a.tangent
-    p2 = p3 + alpha_b * (-ep_b.tangent)
-
-    cp = np.vstack([p0, p1, p2, p3])
-    seg = BezierSegment(control_points=cp, source_type="bridge")
-    return [seg]
+    cp = g1_control_points(
+        ep_a.position, ep_a.tangent, ep_a.curvature,
+        ep_b.position, ep_b.tangent, ep_b.curvature,
+    )
+    return [BezierSegment(control_points=cp, source_type="bridge")]
 
 
 def _build_intersection_bridge(
@@ -577,7 +563,8 @@ def _build_intersection_bridge(
             p2 = p3 - alpha * safe_normalize(p3 - p0)
         else:
             p1 = p0 + alpha * safe_normalize(p3 - p0)
-            p2 = p3 + alpha_ep * (-ep.tangent)
+            # ep.tangent points outward, into the gap: the handle belongs on that side.
+            p2 = p3 + alpha_ep * ep.tangent
 
         cp = np.vstack([p0, p1, p2, p3])
         segments.append(BezierSegment(control_points=cp, source_type="bridge"))
