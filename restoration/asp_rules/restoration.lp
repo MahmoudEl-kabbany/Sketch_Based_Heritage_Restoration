@@ -41,5 +41,9 @@ path_fully_connected(P) :- path_side_accepted(P, 0), path_side_accepted(P, 1).
 #maximize { Utility@2, Id : accept(Id), candidate_utility(Id, Utility) }.
 #maximize { 8@1, P : path_fully_connected(P) }.
 
+% --- Tie-break: among otherwise equal answers, prefer fewer bridges ---
+% (a bridge that adds no utility and completes no path has no evidence for it)
+#minimize { 1@0, Id : accept(Id) }.
+
 % --- Show directive ---
 #show accept/1.

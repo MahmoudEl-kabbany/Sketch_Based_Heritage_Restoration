@@ -1,7 +1,8 @@
 """Phase 4 — ASP Decision Engine.
 
 Encodes scored candidates as ASP facts, solves with clingo,
-and decodes the optimal connection set.
+and decodes the optimal connection set. The solve is deterministic:
+the same candidates always give the same connections.
 """
 
 from __future__ import annotations
@@ -20,13 +21,13 @@ RULES_PATH = os.path.join(os.path.dirname(__file__), "asp_rules", "restoration.l
 
 
 def _control_args(max_solutions: int) -> List[str]:
-    """clingo arguments: enumerate optimal models, solving in parallel unless
-    RESTORATION_CLINGO_CONSERVATIVE=1 asks for a single thread."""
-    args = [f"--models={max_solutions}", "--opt-mode=optN"]
-    if os.environ.get("RESTORATION_CLINGO_CONSERVATIVE", "0") != "1":
-        workers = max(2, min(8, int(os.cpu_count() or 2)))
-        args.append(f"--parallel-mode={workers}")
-    return args
+    """clingo arguments: enumerate optimal models on a single thread.
+
+    Core-guided optimization (usc) proves the optimum in milliseconds on these
+    programs, and one thread makes the choice among equally good answers
+    repeatable; with several threads it depends on which one finishes first.
+    """
+    return [f"--models={max_solutions}", "--opt-mode=optN", "--opt-strategy=usc"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -223,51 +224,6 @@ def _prune_strictly_dominated_candidates(
     return kept, len(pruned)
 
 
-def _split_candidates_by_endpoint_component(
-    candidates: List[ConnectionCandidate],
-) -> List[List[ConnectionCandidate]]:
-    """Split candidates by connected components in endpoint-conflict space."""
-    if len(candidates) <= 1:
-        return [list(candidates)] if candidates else []
-
-    adjacency: Dict[int, Set[int]] = defaultdict(set)
-    endpoint_to_candidate_indexes: Dict[int, List[int]] = defaultdict(list)
-
-    for idx, c in enumerate(candidates):
-        ea, eb = c.ep_a.endpoint_id, c.ep_b.endpoint_id
-        adjacency[ea].add(eb)
-        adjacency[eb].add(ea)
-        endpoint_to_candidate_indexes[ea].append(idx)
-        endpoint_to_candidate_indexes[eb].append(idx)
-
-    visited: Set[int] = set()
-    components: List[List[ConnectionCandidate]] = []
-
-    for start in list(adjacency.keys()):
-        if start in visited:
-            continue
-
-        stack = [start]
-        visited.add(start)
-        candidate_indexes: Set[int] = set()
-
-        while stack:
-            node = stack.pop()
-            for idx in endpoint_to_candidate_indexes.get(node, []):
-                candidate_indexes.add(int(idx))
-            for nxt in adjacency.get(node, set()):
-                if nxt in visited:
-                    continue
-                visited.add(nxt)
-                stack.append(nxt)
-
-        component = [candidates[idx] for idx in sorted(candidate_indexes)]
-        if component:
-            components.append(component)
-
-    return components
-
-
 def _solve_facts(
     facts: str,
     rules_path: str,
@@ -303,82 +259,45 @@ def _solve_facts(
     return sorted(accepted_ids)
 
 
-def solve_partitioned(
+def solve_candidates(
     candidates: List[ConnectionCandidate],
     extraction: "ExtractionResult",
     rules_path: str = RULES_PATH,
     max_solutions: int = 1,
-    enable_component_partition: bool = True,
-    enable_dominance_pruning: bool = True,
     timeout_s: float = 30.0,
 ) -> Tuple[List[int], Dict[str, Any]]:
-    """Solve ASP in independent endpoint components and return accepted IDs + stats."""
+    """Solve for the optimal set of connections; return accepted IDs + stats.
+
+    All candidates of an image are solved as one program: the reward for
+    connecting both ends of a path spans endpoints that an endpoint-conflict
+    partition would put into separate programs.
+    """
     start_total = time.perf_counter()
 
     nested_pairs = _compute_nested_shape_pairs(candidates, extraction)
+    working, pruned_count = _prune_strictly_dominated_candidates(list(candidates))
 
-    working = list(candidates)
-    pruned_count = 0
-    if enable_dominance_pruning:
-        working, pruned_count = _prune_strictly_dominated_candidates(working)
+    t_encode = time.perf_counter()
+    facts = encode_facts(working, nested_pairs)
+    encoding_time_s = time.perf_counter() - t_encode
 
-    components: List[List[ConnectionCandidate]]
-    if enable_component_partition:
-        components = _split_candidates_by_endpoint_component(working)
-    else:
-        components = [working] if working else []
-
-    raw_component_count = int(len(components))
-    raw_largest_component = int(max((len(c) for c in components), default=0))
-    total_candidates = int(len(working))
-    partition_fallback_reason = ""
-
-    if enable_component_partition and len(components) > 1 and total_candidates > 0:
-        dominant_ratio = float(raw_largest_component / max(total_candidates, 1))
-        if dominant_ratio >= 0.80:
-            # One dominant component means repeated grounding overhead can outweigh
-            # any partitioning benefit; fall back to one monolithic solve.
-            components = [working]
-            partition_fallback_reason = "dominant_component"
-
-    accepted_ids: List[int] = []
-    encoding_time_s = 0.0
-    solving_time_s = 0.0
-    fact_lines = 0
-    fact_bytes = 0
-
-    for component_candidates in components:
-        t_encode = time.perf_counter()
-        facts = encode_facts(component_candidates, nested_pairs)
-        encoding_time_s += (time.perf_counter() - t_encode)
-
-        fact_lines += int(len(facts.splitlines()))
-        fact_bytes += int(len(facts.encode("utf-8")))
-
-        t_solve = time.perf_counter()
-        accepted_ids.extend(_solve_facts(facts, rules_path, max_solutions, timeout_s))
-        solving_time_s += (time.perf_counter() - t_solve)
+    t_solve = time.perf_counter()
+    accepted_ids = _solve_facts(facts, rules_path, max_solutions, timeout_s)
+    solving_time_s = time.perf_counter() - t_solve
 
     summary: Dict[str, Any] = {
-        "candidate_count_input": int(len(candidates)),
-        "candidate_count_after_pruning": int(len(working)),
-        "candidate_count_pruned": int(pruned_count),
-        "component_count": int(len(components)),
-        "component_count_raw": int(raw_component_count),
-        "largest_component_candidates": int(max((len(c) for c in components), default=0)),
-        "largest_component_candidates_raw": int(raw_largest_component),
-        "fact_lines": int(fact_lines),
-        "fact_bytes": int(fact_bytes),
-        "accepted_id_count_before_decode": int(len(accepted_ids)),
-        "encoding_time_s": float(encoding_time_s),
-        "solving_time_s": float(solving_time_s),
-        "total_partitioned_solve_s": float(time.perf_counter() - start_total),
-        "component_partition_enabled": bool(enable_component_partition),
-        "dominance_pruning_enabled": bool(enable_dominance_pruning),
-        "partition_fallback_reason": str(partition_fallback_reason),
+        "candidate_count_input": len(candidates),
+        "candidate_count_after_pruning": len(working),
+        "candidate_count_pruned": pruned_count,
+        "fact_lines": len(facts.splitlines()),
+        "fact_bytes": len(facts.encode("utf-8")),
+        "accepted_id_count_before_decode": len(accepted_ids),
+        "encoding_time_s": encoding_time_s,
+        "solving_time_s": solving_time_s,
+        "total_solve_s": time.perf_counter() - start_total,
         "control_args": _control_args(max_solutions),
     }
-    return sorted(accepted_ids), summary
+    return accepted_ids, summary
 
 
 # ═══════════════════════════════════════════════════════════════════════════

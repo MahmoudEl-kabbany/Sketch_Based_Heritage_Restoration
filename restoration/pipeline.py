@@ -23,7 +23,7 @@ from bezier_curves.bezier import BezierPath, BezierSegment
 from restoration.extraction import ExtractionResult, extract_paths
 from restoration.candidates import ConnectionCandidate, generate_candidates
 from restoration.scoring import score_candidates
-from restoration.asp_engine import decode_solution, solve_partitioned, RULES_PATH
+from restoration.asp_engine import decode_solution, solve_candidates, RULES_PATH
 from restoration.synthesis import synthesize_bridges, merge_restored_paths
 from restoration.efd_closure import close_single_gaps
 from restoration.geometry import polyline_length, safe_normalize, visual_order_key
@@ -478,7 +478,7 @@ def _build_report(
     final_closed = len(final_paths) - final_open
 
     return {
-        "schema_version": "2.0",
+        "schema_version": "2.1",
         "image": {
             "name": os.path.basename(image_path),
             "shape": list(result.image_shape),
@@ -565,7 +565,7 @@ def restore(
         efd_plausibility_threshold: minimum plausibility score required for Phase 6 closure
         efd_min_gap_for_validity_check: bypass plausibility check for tiny gaps (pixels)
         output_dir: where to save visualization outputs
-        asp_timeout_s: max time in seconds for the ASP solver to run per component
+        asp_timeout_s: max time in seconds for the ASP solver
 
     Returns:
         RestorationResult with original paths, restored paths, bridges, and report
@@ -623,15 +623,15 @@ def restore(
         phase4_asp_decode_s=0.0,
     )
     if scored:
-        accepted_ids, partition_summary = solve_partitioned(
+        accepted_ids, solver_summary = solve_candidates(
             scored,
             extraction,
             RULES_PATH,
             timeout_s=asp_timeout_s,
         )
-        stage_timings["phase4_asp_fact_encoding_s"] = partition_summary["encoding_time_s"]
-        stage_timings["phase4_asp_solving_s"] = partition_summary["solving_time_s"]
-        asp_solver_summary.update(partition_summary)
+        stage_timings["phase4_asp_fact_encoding_s"] = solver_summary["encoding_time_s"]
+        stage_timings["phase4_asp_solving_s"] = solver_summary["solving_time_s"]
+        asp_solver_summary.update(solver_summary)
         with _timed(stage_timings, "phase4_asp_decode_s"):
             accepted = decode_solution(accepted_ids, scored)
     stage_timings["phase4_asp_total_s"] = (
