@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import os
 import time
-from collections import defaultdict
-from typing import Any, Dict, List, Set, Tuple
-
-import numpy as np
+from typing import Any, Dict, List, Sequence, Tuple
 
 from restoration.candidates import ConnectionCandidate
 
 RULES_PATH = os.path.join(os.path.dirname(__file__), "asp_rules", "restoration.lp")
+
+# Integer utility units per unit of log-odds above the acceptance threshold.
+UTILITY_SCALE = 10
 
 
 def _control_args(max_solutions: int) -> List[str]:
@@ -33,159 +33,22 @@ def _control_args(max_solutions: int) -> List[str]:
 # Encoding
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _to_int_score(value: float, scale: int = 100) -> int:
-    """Scale a float score to an integer in [0, scale]."""
-    return max(0, min(scale, int(round(value * scale))))
+def utility(score: float) -> int:
+    """Integer utility of a candidate whose log-odds exceed the threshold by *score*."""
+    return int(round(score * UTILITY_SCALE))
 
 
-def encode_facts(
-    candidates: List[ConnectionCandidate],
-) -> str:
+def encode_facts(candidates: Sequence[ConnectionCandidate]) -> str:
     """Convert scored candidates into ASP fact strings."""
-    lines: List[str] = []
-    end_map = {"start": 0, "end": 1}
-    path_strength = _path_self_closure_strength_map(candidates)
-
-    # Candidate facts
-    for c in candidates:
-        ea = end_map[c.ep_a.end]
-        eb = end_map[c.ep_b.end]
-        score_int = _to_int_score(c.score)
-        lines.append(
-            f"candidate({c.id},{c.ep_a.path_index},{ea},"
-            f"{c.ep_b.path_index},{eb},{score_int})."
-        )
-        lines.append(f"candidate_endpoint({c.id},{c.ep_a.endpoint_id},{c.ep_b.endpoint_id}).")
-        if c.same_path_closure:
-            lines.append(f"candidate_self_closure({c.id}).")
-
-        utility = _candidate_effective_utility(c, path_strength)
-        lines.append(f"candidate_utility({c.id},{utility}).")
-
-        lines.append("")
-
-    return "\n".join(lines)
+    return "\n".join(
+        f"candidate({c.id},{c.ep_a.endpoint_id},{c.ep_b.endpoint_id},{utility(c.score)})."
+        for c in candidates
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Solving
 # ═══════════════════════════════════════════════════════════════════════════
-
-def _path_self_closure_strength_map(
-    candidates: List[ConnectionCandidate],
-) -> Dict[int, int]:
-    """Compute per-path self-closure support buckets used by ASP soft suppression."""
-    best_self_closure_by_path: Dict[int, float] = {}
-    for c in candidates:
-        if not c.same_path_closure:
-            continue
-        pidx = int(c.ep_a.path_index)
-        best_self_closure_by_path[pidx] = max(
-            best_self_closure_by_path.get(pidx, -1e9),
-            float(c.score),
-        )
-
-    buckets: Dict[int, int] = {}
-    for pidx, score in best_self_closure_by_path.items():
-        if score >= 0.60:
-            buckets[pidx] = 2
-        elif score >= 0.45:
-            buckets[pidx] = 1
-    return buckets
-
-
-def _candidate_effective_utility(
-    candidate: ConnectionCandidate,
-    path_strength: Dict[int, int],
-) -> int:
-    """Compute candidate utility equivalent to current ASP objective terms."""
-    utility = int(_to_int_score(float(candidate.score)))
-    relaxed_tier2_extension = bool(candidate.relaxed_tier2_extension)
-
-    # Soft rewards from weak constraints with negative weights.
-    closure_flag = bool(
-        candidate.same_path_closure
-        or (float(candidate.score) > 0.45 and float(candidate.distance) < 30.0)
-    )
-    if closure_flag:
-        utility += 3
-    if candidate.same_path_closure:
-        utility += 2
-
-    # Cross-shape suppression from path-level self-closure support.
-    if int(candidate.ep_b.path_index) != int(candidate.ep_a.path_index):
-        touched = [int(candidate.ep_a.path_index), int(candidate.ep_b.path_index)]
-        for pidx in touched:
-            bucket = int(path_strength.get(pidx, 0))
-            if bucket == 1:
-                utility -= 2
-            elif bucket == 2:
-                utility -= 4
-
-    direction_ab = candidate.ep_b.position - candidate.ep_a.position
-    n = float(np.linalg.norm(direction_ab))
-    if n > 1e-12:
-        cont_raw = float(np.dot(candidate.ep_a.tangent, direction_ab / n))
-    else:
-        cont_raw = 0.0
-    cont_int = int(_to_int_score(max(0.0, cont_raw)))
-    if cont_int < 40 and not relaxed_tier2_extension:
-        utility -= 2
-
-    ext_quality = int(_to_int_score(float(candidate.extension_quality)))
-    if (
-        str(candidate.scenario) == "extension_intersection"
-        and bool(candidate.same_path_closure)
-        and ext_quality < 45
-    ):
-        utility -= 3
-
-    if int(candidate.tier) == 2:
-        utility -= 1
-        if relaxed_tier2_extension:
-            utility += 1
-
-    return utility
-
-
-def _prune_strictly_dominated_candidates(
-    candidates: List[ConnectionCandidate],
-) -> Tuple[List[ConnectionCandidate], int]:
-    """Drop strictly dominated alternatives sharing the same endpoint pair.
-
-    Conservative rule: never prune groups containing same-path closure candidates,
-    because those facts influence path-level soft suppression for other candidates.
-    """
-    if len(candidates) <= 1:
-        return list(candidates), 0
-
-    path_strength = _path_self_closure_strength_map(candidates)
-    groups: Dict[Tuple[int, int], List[ConnectionCandidate]] = defaultdict(list)
-    for c in candidates:
-        ea, eb = c.ep_a.endpoint_id, c.ep_b.endpoint_id
-        key = (ea, eb) if ea <= eb else (eb, ea)
-        groups[key].append(c)
-
-    keep_ids: Set[int] = set()
-    for group in groups.values():
-        if len(group) == 1:
-            keep_ids.add(int(group[0].id))
-            continue
-
-        if any(bool(c.same_path_closure) for c in group):
-            for c in group:
-                keep_ids.add(int(c.id))
-            continue
-
-        best_utility = max(_candidate_effective_utility(c, path_strength) for c in group)
-        for c in group:
-            if _candidate_effective_utility(c, path_strength) >= best_utility:
-                keep_ids.add(int(c.id))
-
-    pruned = [c for c in candidates if int(c.id) not in keep_ids]
-    kept = [c for c in candidates if int(c.id) in keep_ids]
-    return kept, len(pruned)
-
 
 def _solve_facts(
     facts: str,
@@ -230,26 +93,24 @@ def solve_candidates(
 ) -> Tuple[List[int], Dict[str, Any]]:
     """Solve for the optimal set of connections; return accepted IDs + stats.
 
-    All candidates of an image are solved as one program: the reward for
-    connecting both ends of a path spans endpoints that an endpoint-conflict
-    partition would put into separate programs.
+    A candidate at or below the acceptance threshold has no positive utility
+    and cannot be part of an optimal answer, so only the others are encoded.
     """
     start_total = time.perf_counter()
 
-    working, pruned_count = _prune_strictly_dominated_candidates(list(candidates))
+    working = [c for c in candidates if utility(c.score) > 0]
 
     t_encode = time.perf_counter()
     facts = encode_facts(working)
     encoding_time_s = time.perf_counter() - t_encode
 
     t_solve = time.perf_counter()
-    accepted_ids = _solve_facts(facts, rules_path, max_solutions, timeout_s)
+    accepted_ids = _solve_facts(facts, rules_path, max_solutions, timeout_s) if working else []
     solving_time_s = time.perf_counter() - t_solve
 
     summary: Dict[str, Any] = {
         "candidate_count_input": len(candidates),
-        "candidate_count_after_pruning": len(working),
-        "candidate_count_pruned": pruned_count,
+        "candidate_count_above_threshold": len(working),
         "fact_lines": len(facts.splitlines()),
         "fact_bytes": len(facts.encode("utf-8")),
         "accepted_id_count_before_decode": len(accepted_ids),

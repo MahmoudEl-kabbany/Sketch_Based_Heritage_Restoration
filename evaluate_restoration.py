@@ -28,6 +28,7 @@ import numpy as np
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 from restoration.pipeline import default_workers, map_in_processes, restore
+from restoration.scoring import MODEL_PATH, held_out_models
 from restoration.render_restored_sketch import (
     estimate_line_width,
     render_bridges_on_damaged,
@@ -181,6 +182,7 @@ def evaluate_single(
     damaged_path: str,
     output_dir: str = OUTPUT_DIR,
     save_images: bool = False,
+    model_path: str = MODEL_PATH,
 ) -> ImageMetrics:
     """Run restoration on one image pair and compute metrics.
 
@@ -190,6 +192,7 @@ def evaluate_single(
         damaged_path: Path to the damaged image.
         output_dir: Directory to save outputs.
         save_images: Also write the pipeline's overlay and comparison figures.
+        model_path: The scoring model to restore with.
 
     Returns:
         ImageMetrics with before/after PSNR and SSIM.
@@ -215,7 +218,7 @@ def evaluate_single(
     # Run restoration
     t0 = time.perf_counter()
     try:
-        result = restore(damaged_path, output_dir=output_dir, save_images=save_images)
+        result = restore(damaged_path, model_path=model_path, output_dir=output_dir, save_images=save_images)
     except Exception as e:
         metrics.restoration_time_s = time.perf_counter() - t0
         metrics.error = f"Restoration failed: {e}"
@@ -466,6 +469,11 @@ def main() -> None:
         "--save-images", action="store_true",
         help="Also write the pipeline's overlay and comparison figures for each image.",
     )
+    parser.add_argument(
+        "--models", type=str, default=None,
+        help="Directory written by train_scoring.py --cv-dir: every drawing is then "
+             "scored by the model fitted without it.",
+    )
     args = parser.parse_args()
 
     # Discover pairs
@@ -486,8 +494,9 @@ def main() -> None:
     results: List[ImageMetrics] = []
     print_table_header()
 
+    model_of = held_out_models(args.models, [name for name, _, _ in pairs]) if args.models else {}
     jobs = [
-        (name, orig_path, dmg_path, args.output_dir, args.save_images)
+        (name, orig_path, dmg_path, args.output_dir, args.save_images, model_of.get(name, MODEL_PATH))
         for name, orig_path, dmg_path in pairs
     ]
 

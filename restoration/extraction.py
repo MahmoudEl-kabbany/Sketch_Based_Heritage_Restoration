@@ -11,13 +11,14 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-from bezier_curves.bezier import BezierPath, fit_from_image_skeleton, stroke_geometry
-from restoration.geometry import (
-    bezier_derivative,
-    endpoint_curvature,
-    safe_normalize,
-    visual_order_key,
-)
+from bezier_curves.bezier import BezierPath, fit_from_image_skeleton, stroke_geometry, stroke_radius
+from restoration.geometry import safe_normalize, visual_order_key
+
+# The direction of a stroke at a free end is that of the longest stretch behind
+# the end, up to this many stroke widths, that follows a single circular arc to
+# within this many stroke radii (never asking for better than a pixel).
+DIRECTION_WINDOW_WIDTHS = 6.0
+ARC_FIT_RADII = 0.5
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -33,9 +34,11 @@ class EndpointInfo:
     end: str                 # "start" | "end"
     position: np.ndarray     # (x, y)
     tangent: np.ndarray      # unit tangent pointing *outward* from the path
-    curvature: float         # unsigned curvature κ at this endpoint
-    tangent_confidence: float = 1.0  # confidence in endpoint tangent direction
-    radius: float = 1.0      # local stroke radius (half the stroke width) at this end
+    curvature: float         # unsigned curvature κ of the stroke as it reaches this end
+    radius: float = 1.0      # radius (half the width) of the stroke this end belongs to
+    # The same curvature with a sign: positive when the stroke, followed towards
+    # this end, turns towards (-tangent.y, tangent.x).
+    signed_curvature: float = 0.0
 
 
 @dataclass
@@ -51,123 +54,74 @@ class ExtractionResult:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Endpoint context tangent
+# Direction of a stroke at its end
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _dedupe_polyline(points: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    """Remove near-duplicate consecutive points from a sampled polyline."""
-    if len(points) <= 1:
-        return points
-    diffs = np.linalg.norm(np.diff(points, axis=0), axis=1)
-    keep = np.ones(len(points), dtype=bool)
-    keep[1:] = diffs > eps
-    return points[keep]
+def _arc_through(far: np.ndarray, mid: np.ndarray, tip: np.ndarray, points: np.ndarray) -> Tuple[np.ndarray, float, float]:
+    """The circular arc from *far* through *mid* to *tip*.
+
+    Returns (unit tangent at tip in the direction of travel, signed curvature,
+    largest distance of *points* from the arc). Three points in line give a
+    straight line.
+    """
+    # Work relative to the tip, which keeps the arithmetic well conditioned.
+    far, mid, points = far - tip, mid - tip, points - tip
+    chord = safe_normalize(-far)
+    bulge = float(mid[0] * chord[1] - mid[1] * chord[0])    # signed distance of mid from the line far-tip
+    if abs(bulge) < 0.01:
+        return chord, 0.0, float(np.max(np.abs(points[:, 0] * chord[1] - points[:, 1] * chord[0])))
+
+    # Centre of the circle through far, mid and the tip (the origin).
+    denominator = 2.0 * float(far[0] * mid[1] - far[1] * mid[0])
+    centre = np.array([
+        float(mid[1] * (far @ far) - far[1] * (mid @ mid)),
+        float(far[0] * (mid @ mid) - mid[0] * (far @ far)),
+    ]) / denominator
+    radius = float(np.linalg.norm(centre))
+    tangent = np.array([centre[1], -centre[0]]) / radius    # perpendicular to the radius at the tip
+    if float(tangent @ -mid) < 0.0:
+        tangent = -tangent
+    turning_left = float(-(mid - far)[0] * mid[1] + (mid - far)[1] * mid[0]) > 0.0   # (mid - far) x (tip - mid)
+    deviation = float(np.max(np.abs(np.linalg.norm(points - centre, axis=1) - radius)))
+    return tangent, (1.0 if turning_left else -1.0) / radius, deviation
 
 
-def _multiscale_context_tangent(
-    sampled: np.ndarray, end: str, outward_ref: np.ndarray
-) -> Tuple[np.ndarray, float]:
-    """Run PCA at 4 different window sizes and return circular mean of directions."""
-    fractions = [0.10, 0.15, 0.20, 0.25]
-    directions = []
-    weights = []
-    n_pts = len(sampled)
-    
-    for frac in fractions:
-        window = int(round(n_pts * frac))
-        window = max(8, min(28, max(2, n_pts - 1), window))
-        
-        if end == "start":
-            local = sampled[: window + 1]
-        else:
-            local = sampled[-(window + 1):]
-            
-        centered = local - np.mean(local, axis=0)
-        cov = centered.T @ centered
-        vals, vecs = np.linalg.eigh(cov)
-        idx_max = int(np.argmax(vals))
-        principal = vecs[:, idx_max]
-        
-        if float(np.dot(principal, outward_ref)) < 0.0:
-            principal = -principal
-            
-        var_sum = float(np.sum(vals))
-        linearity = float(vals[idx_max] / (var_sum + 1e-12))
-        directional = max(0.0, float(np.dot(principal, outward_ref)))
-        conf = float(np.clip(0.5 * linearity + 0.5 * directional, 0.0, 1.0))
-        
-        directions.append(principal)
-        weights.append(conf)
-        
-    mean_dir = np.zeros(2, dtype=np.float64)
-    for d, w in zip(directions, weights):
-        mean_dir += d * w
-        
-    norm = np.linalg.norm(mean_dir)
-    if norm < 1e-12:
-        return outward_ref, 0.0
-        
-    final_tangent = mean_dir / norm
-    R = norm / sum(weights) if sum(weights) > 0 else 0.0
-    final_conf = float(np.clip(R * np.mean(weights), 0.0, 1.0))
-    
-    return final_tangent, final_conf
+def _end_direction(path: BezierPath, end: str, stroke_radius: float) -> Tuple[np.ndarray, float]:
+    """Outward unit tangent and signed curvature of a stroke at one of its ends.
 
+    Both come from the arc through the end and two points further back along
+    the stroke. The stretch used is DIRECTION_WINDOW_WIDTHS long; if the
+    stroke does not follow one arc over that length (it has a corner, say),
+    the stretch is halved, at most twice.
+    """
+    samples = path.sample(pts_per_segment=24)
+    into = samples if end == "end" else samples[::-1]           # running into the end
+    steps = np.linalg.norm(np.diff(into, axis=0), axis=1)
+    into = into[np.concatenate((steps > 1e-9, [True]))]
+    if len(into) < 2:
+        return np.array([1.0, 0.0]), 0.0
+    steps = np.linalg.norm(np.diff(into, axis=0), axis=1)
+    back = np.concatenate((np.cumsum(steps[::-1])[::-1], [0.0]))   # arc length from each sample to the end
+    tip = into[-1]
 
-def _estimate_endpoint_context_tangent(
-    path: BezierPath,
-    end: str,
-) -> Tuple[np.ndarray, float]:
-    """Estimate endpoint tangent from local sampled context and return confidence."""
-    sampled = path.sample(pts_per_segment=24)
-    sampled = _dedupe_polyline(sampled)
+    def point_at(distance: float) -> np.ndarray:
+        return np.array([np.interp(distance, back[::-1], into[::-1, axis]) for axis in (0, 1)])
 
-    if len(sampled) < 3:
-        return np.array([1.0, 0.0], dtype=np.float64), 0.0
-
-    if end == "start":
-        path_dir = sampled[min(2, len(sampled)-1)] - sampled[0]
-        outward_ref = safe_normalize(-path_dir)
-    else:
-        path_dir = sampled[-1] - sampled[max(0, len(sampled)-3)]
-        outward_ref = safe_normalize(path_dir)
-
-    return _multiscale_context_tangent(sampled, end, outward_ref)
+    tolerance = max(ARC_FIT_RADII * stroke_radius, 1.0)
+    window = min(DIRECTION_WINDOW_WIDTHS * 2.0 * stroke_radius, float(back[0]))
+    for attempt in range(3):
+        tangent, curvature, deviation = _arc_through(
+            point_at(window), point_at(window / 2.0), tip, into[back <= window],
+        )
+        if deviation <= tolerance:
+            break
+        window /= 2.0
+    return tangent, curvature
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Endpoint extraction
 # ═══════════════════════════════════════════════════════════════════════════
-
-def _compute_endpoint_tangent(path: BezierPath, end: str) -> Tuple[np.ndarray, float]:
-    """Outward endpoint tangent blended with local context and confidence."""
-    if end == "start":
-        cp = path.segments[0].control_points
-        derivative_tangent = safe_normalize(-bezier_derivative(cp, 0.0))
-    else:
-        cp = path.segments[-1].control_points
-        derivative_tangent = safe_normalize(bezier_derivative(cp, 1.0))
-
-    context_tangent, confidence = _estimate_endpoint_context_tangent(path, end)
-    
-    if confidence < 0.40:
-        blend = float(np.clip(confidence, 0.05, 0.35))
-    else:
-        blend = float(np.clip(confidence, 0.40, 0.88))
-        
-    tangent = safe_normalize((1.0 - blend) * derivative_tangent + blend * context_tangent)
-    
-    if end == "start":
-        interior_dir = safe_normalize(path.segments[0].control_points[3] - path.segments[0].control_points[0])
-    else:
-        interior_dir = safe_normalize(path.segments[-1].control_points[0] - path.segments[-1].control_points[3])
-        
-    if float(np.dot(tangent, interior_dir)) > 0.50:
-        tangent = -tangent
-        confidence *= 0.5
-        
-    return tangent, confidence
-
 
 def _extract_endpoints(
     paths: List[BezierPath],
@@ -179,11 +133,11 @@ def _extract_endpoints(
     An end that sits on a junction is connected to other strokes and is not a
     place where a stroke could be missing.
     """
-    h, w = radius_map.shape
     endpoints: List[EndpointInfo] = []
     for idx, path in enumerate(paths):
         if path.is_closed or not path.segments:
             continue
+        radius = stroke_radius(path.sample(pts_per_segment=24), radius_map, fallback_radius)
         for end, is_free in (("start", path.start_free), ("end", path.end_free)):
             if not is_free:
                 continue
@@ -192,19 +146,16 @@ def _extract_endpoints(
                 if end == "start"
                 else path.segments[-1].control_points[3]
             ).astype(np.float64)
-            x = int(np.clip(round(pos[0]), 0, w - 1))
-            y = int(np.clip(round(pos[1]), 0, h - 1))
-            radius = float(radius_map[y, x]) if radius_map[y, x] > 0 else fallback_radius
-            tangent, tangent_confidence = _compute_endpoint_tangent(path, end)
+            tangent, curvature = _end_direction(path, end, radius)
             endpoints.append(EndpointInfo(
                 endpoint_id=len(endpoints),
                 path_index=idx,
                 end=end,
                 position=pos,
                 tangent=tangent,
-                curvature=endpoint_curvature(path, end),
-                tangent_confidence=tangent_confidence,
+                curvature=abs(curvature),
                 radius=radius,
+                signed_curvature=curvature,
             ))
     return endpoints
 

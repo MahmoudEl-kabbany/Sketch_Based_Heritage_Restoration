@@ -1,0 +1,220 @@
+{
+  "description": "Scorecards giving the probability that a candidate bridge redraws a missing stroke, one per bridge shape. log-odds = intercept + sum of weight * (transform(value) - mean) / scale. Fitted by train_scoring.py.",
+  "threshold": 0.6666666666666666,
+  "scorecards": {
+    "smooth": {
+      "intercept": -5.576593864151173,
+      "features": [
+        {
+          "name": "gap_length",
+          "meaning": "gap length in stroke widths",
+          "transform": "log2(x)",
+          "weight": -0.7891863347561247,
+          "mean": 3.7627222707333967,
+          "scale": 1.1899332433814165
+        },
+        {
+          "name": "mutual_nearest",
+          "meaning": "share of the two ends for which the other is the nearest free end",
+          "transform": "x",
+          "weight": 0.1806154884245319,
+          "mean": 0.13691086489168183,
+          "scale": 0.3127576483652164
+        },
+        {
+          "name": "nearest_ratio",
+          "meaning": "gap length relative to the distance from each end to its nearest free end",
+          "transform": "log2(x)",
+          "weight": -0.2489923180458387,
+          "mean": 1.5489330633886667,
+          "scale": 0.9881737666113616
+        },
+        {
+          "name": "same_stroke",
+          "meaning": "the two ends belong to one stroke (1 = yes: the bridge closes it)",
+          "transform": "x",
+          "weight": -0.11911218279352227,
+          "mean": 0.07398710104183893,
+          "scale": 0.26174989956300393
+        },
+        {
+          "name": "crossed_ink",
+          "meaning": "existing stroke the bridge runs over between its ends, in stroke widths",
+          "transform": "log2(1 + x)",
+          "weight": -2.7872338851714322,
+          "mean": 0.7159300371289393,
+          "scale": 1.0072724966925468
+        },
+        {
+          "name": "aim_worst",
+          "meaning": "degrees by which the worse-aimed end points away from the other end",
+          "transform": "x",
+          "weight": -0.40325973781955093,
+          "mean": 113.48354169972811,
+          "scale": 53.1875740890082
+        },
+        {
+          "name": "aim_best",
+          "meaning": "degrees by which the better-aimed end points away from the other end",
+          "transform": "x",
+          "weight": -1.6997399764071692,
+          "mean": 63.83698190205084,
+          "scale": 51.53527427455038
+        },
+        {
+          "name": "sideways_offset",
+          "meaning": "stroke widths by which one stroke, continued straight, passes beside the other end",
+          "transform": "log2(1 + x)",
+          "weight": -0.7780410913875897,
+          "mean": 3.6411556224353823,
+          "scale": 1.3735740402534504
+        },
+        {
+          "name": "mdtw",
+          "meaning": "MDTW: deviation of the bridge and the stroke on either side from a straight line",
+          "transform": "ln(1 + x)",
+          "weight": -0.2046073379000377,
+          "mean": 3.9452276733631435,
+          "scale": 1.2066616945780224
+        },
+        {
+          "name": "mjerk",
+          "meaning": "MJerk: abruptness of the change of curvature along the bridge and the stroke on either side",
+          "transform": "log10(1 + 1e10 x)",
+          "weight": -0.13113937913086804,
+          "mean": 7.740218368257502,
+          "scale": 1.4467650948848167
+        }
+      ]
+    },
+    "corner": {
+      "intercept": -2.2779145655798567,
+      "features": [
+        {
+          "name": "gap_length",
+          "meaning": "gap length in stroke widths",
+          "transform": "log2(x)",
+          "weight": -1.3541813612246527,
+          "mean": 3.399733205866493,
+          "scale": 1.161627928822176
+        },
+        {
+          "name": "width_mismatch",
+          "meaning": "width of the wider stroke relative to the narrower",
+          "transform": "log2(x)",
+          "weight": -0.32979813371411837,
+          "mean": 0.21897518000103086,
+          "scale": 0.3134147941948193
+        },
+        {
+          "name": "nearest_ratio",
+          "meaning": "gap length relative to the distance from each end to its nearest free end",
+          "transform": "log2(x)",
+          "weight": -0.7797346183595539,
+          "mean": 1.256378813908448,
+          "scale": 1.0276727048069794
+        },
+        {
+          "name": "same_stroke",
+          "meaning": "the two ends belong to one stroke (1 = yes: the bridge closes it)",
+          "transform": "x",
+          "weight": -0.1640118682893767,
+          "mean": 0.014574187884108867,
+          "scale": 0.11984064807746914
+        },
+        {
+          "name": "crossed_ink",
+          "meaning": "existing stroke the bridge runs over between its ends, in stroke widths",
+          "transform": "log2(1 + x)",
+          "weight": -2.634704990699091,
+          "mean": 1.011517830250833,
+          "scale": 1.455897593853964
+        },
+        {
+          "name": "corner_turn",
+          "meaning": "change of direction at the corner, in degrees",
+          "transform": "x",
+          "weight": -1.13362320509877,
+          "mean": 86.26645140678282,
+          "scale": 49.29888635113096
+        },
+        {
+          "name": "corner_detour",
+          "meaning": "extra length of the corner bridge over the straight gap, in gap lengths",
+          "transform": "x",
+          "weight": -0.12396215823700794,
+          "mean": 0.5098357898137523,
+          "scale": 0.6172125584558472
+        },
+        {
+          "name": "corner_balance",
+          "meaning": "how unequal the two legs of the corner are (0 = equal, 1 = one leg only)",
+          "transform": "x",
+          "weight": -0.12279488580563627,
+          "mean": 0.3680838997414881,
+          "scale": 0.2806837826160177
+        },
+        {
+          "name": "corner_bend",
+          "meaning": "how curved the two strokes are where the corner bridge meets them (0 = straight)",
+          "transform": "x",
+          "weight": -0.39971586451603885,
+          "mean": 0.24680163123386692,
+          "scale": 0.36913983742890644
+        }
+      ]
+    }
+  },
+  "training": {
+    "drawings": 32,
+    "images": 160,
+    "candidates": 35930,
+    "correct_candidates": 6709,
+    "cross_validated_auc": 0.9683,
+    "cross_validated_calibration": [
+      {
+        "from": 0.0,
+        "to": 0.1,
+        "candidates": 24823,
+        "share_correct": 0.01
+      },
+      {
+        "from": 0.1,
+        "to": 0.33,
+        "candidates": 3403,
+        "share_correct": 0.2051
+      },
+      {
+        "from": 0.33,
+        "to": 0.5,
+        "candidates": 1402,
+        "share_correct": 0.418
+      },
+      {
+        "from": 0.5,
+        "to": 0.667,
+        "candidates": 1372,
+        "share_correct": 0.5962
+      },
+      {
+        "from": 0.667,
+        "to": 0.8,
+        "candidates": 1022,
+        "share_correct": 0.7094
+      },
+      {
+        "from": 0.8,
+        "to": 0.9,
+        "candidates": 1224,
+        "share_correct": 0.8848
+      },
+      {
+        "from": 0.9,
+        "to": 1.0,
+        "candidates": 2684,
+        "share_correct": 0.9508
+      }
+    ],
+    "threshold_rule": "a bridge is drawn when it is at least 2 times as likely to be right as wrong"
+  }
+}

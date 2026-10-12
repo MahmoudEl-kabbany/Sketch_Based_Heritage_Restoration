@@ -1,48 +1,100 @@
 """Phase 3 — Scoring.
 
-MDTW (via dtaidistance), MJerk, and Gestalt heuristic scoring for
-connection candidates.
+Each candidate bridge is described by a handful of geometric measurements
+that do not depend on the image's resolution or line width. A scorecard, a
+logistic regression with one weight per measurement, turns them into the
+probability that the bridge redraws a missing stroke. Smooth bridges and
+corner bridges each have their own scorecard. The weights are fitted by
+train_scoring.py and stored in scoring_model.json; none is set by hand.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+import json
+import os
+from dataclasses import dataclass
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 from dtaidistance import dtw
 from scipy.interpolate import CubicSpline
 from scipy.spatial import cKDTree
 
-from bezier_curves.bezier import BezierPath
-from restoration.extraction import EndpointInfo, ExtractionResult
 from restoration.candidates import ConnectionCandidate
+from restoration.extraction import EndpointInfo, ExtractionResult
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "scoring_model.json")
 
 # Arc-length spacing (pixels) of the samples MJerk is computed on.
 JERK_STEP_PX = 1.0
+
+# MDTW and MJerk of a candidate are measured on its bridge together with the
+# stroke on either side, resampled to this many points and scaled to this
+# length, so that the image's resolution does not enter.
+CONTEXT_SAMPLES = 64
+CONTEXT_LENGTH = 100.0
 
 # dtaidistance's compiled DTW computes the same recurrence as its pure-Python
 # one, about 100x faster. Use it when the C library was built.
 _DTW_OPTIONS = {"use_c": True} if dtw.try_import_c() else {}
 
+# The measurements, with what each one means. A smooth bridge is judged by how
+# the two strokes continue into each other, a corner bridge by the corner it makes.
+FEATURES: Dict[str, str] = {
+    # ---- any bridge
+    "gap_length": "gap length in stroke widths",
+    "width_mismatch": "width of the wider stroke relative to the narrower",
+    "stub_shortness": "gap length relative to the length of the shorter stroke",
+    "mutual_nearest": "share of the two ends for which the other is the nearest free end",
+    "nearest_ratio": "gap length relative to the distance from each end to its nearest free end",
+    "same_stroke": "the two ends belong to one stroke (1 = yes: the bridge closes it)",
+    "crossed_ink": "existing stroke the bridge runs over between its ends, in stroke widths",
+    # ---- smooth bridges
+    "aim_worst": "degrees by which the worse-aimed end points away from the other end",
+    "aim_best": "degrees by which the better-aimed end points away from the other end",
+    "turn": "change of direction between the two strokes, in degrees",
+    "sideways_offset": "stroke widths by which one stroke, continued straight, passes beside the other end",
+    "arc_miss": "gap lengths by which one stroke, continued with its own curvature, passes beside the other end",
+    "mdtw": "MDTW: deviation of the bridge and the stroke on either side from a straight line",
+    "mjerk": "MJerk: abruptness of the change of curvature along the bridge and the stroke on either side",
+    # ---- corner bridges
+    "corner_turn": "change of direction at the corner, in degrees",
+    "corner_detour": "extra length of the corner bridge over the straight gap, in gap lengths",
+    "corner_balance": "how unequal the two legs of the corner are (0 = equal, 1 = one leg only)",
+    "corner_bend": "how curved the two strokes are where the corner bridge meets them (0 = straight)",
+}
+FEATURE_NAMES = tuple(FEATURES)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Default scoring weights
-# ═══════════════════════════════════════════════════════════════════════════
-
-WEIGHTS_TIER1 = {
-    "proximity": 0.20,
-    "continuation": 0.30,
-    "closure": 0.15,
-    "dtw": 0.20,
-    "jerk": 0.15,
+# The measurements on the scorecard of each bridge shape.
+_ANY_BRIDGE = FEATURE_NAMES[:FEATURE_NAMES.index("aim_worst")]
+SHAPE_FEATURES: Dict[str, Tuple[str, ...]] = {
+    "smooth": _ANY_BRIDGE + FEATURE_NAMES[FEATURE_NAMES.index("aim_worst"):FEATURE_NAMES.index("corner_turn")],
+    "corner": _ANY_BRIDGE + FEATURE_NAMES[FEATURE_NAMES.index("corner_turn"):],
 }
 
-WEIGHTS_TIER2 = {
-    "proximity": 0.05,
-    "continuation": 0.40,
-    "closure": 0.15,
-    "dtw": 0.25,
-    "jerk": 0.15,
+# How a measurement enters its scorecard. Lengths and ratios range over orders
+# of magnitude and enter by their logarithm; the others enter as they are.
+FEATURE_SCALES: Dict[str, str] = {
+    "gap_length": "log2(x)", "width_mismatch": "log2(x)", "stub_shortness": "log2(x)", "nearest_ratio": "log2(x)",
+    "crossed_ink": "log2(1 + x)", "sideways_offset": "log2(1 + x)",
+    "mdtw": "ln(1 + x)", "mjerk": "log10(1 + 1e10 x)",
+}
+_SCALE_FUNCTIONS = {
+    "log2(x)": np.log2,
+    "log2(1 + x)": lambda x: np.log2(1.0 + x),
+    "ln(1 + x)": np.log1p,
+    "log10(1 + 1e10 x)": lambda x: np.log10(1.0 + 1e10 * x),
+}
+
+# Which way a measurement may move a bridge's odds: -1 where more of it can only
+# count against the bridge, +1 where it can only count for it. The fit keeps to
+# these directions, so that every weight reads the way its meaning suggests.
+# Measurements not listed may count either way.
+FEATURE_DIRECTIONS: Dict[str, int] = {
+    "gap_length": -1, "width_mismatch": -1, "stub_shortness": -1, "nearest_ratio": -1, "crossed_ink": -1,
+    "aim_worst": -1, "aim_best": -1, "turn": -1, "sideways_offset": -1, "arc_miss": -1, "mdtw": -1, "mjerk": -1,
+    "corner_detour": -1, "corner_balance": -1, "corner_bend": -1,
+    "mutual_nearest": 1,
 }
 
 
@@ -116,122 +168,245 @@ def compute_mjerk(combined: np.ndarray) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Gestalt heuristics
+# Measurements of one candidate
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _gestalt_proximity(distance: float, radius: float) -> float:
-    """Proximity score: 1.0 when touching, 0.0 at radius edge."""
-    if radius < 1e-6:
-        return 1.0
-    return max(0.0, 1.0 - distance / radius)
+class _End(NamedTuple):
+    """What the scorer needs to know about the stroke behind a free end."""
+
+    into: np.ndarray       # samples of the stroke, ordered so that they run into the end
+    back: np.ndarray       # arc length from each of those samples to the end
+    stroke_length: float
+    nearest: float         # distance to the nearest other free end
 
 
-def _gestalt_continuation(
-    tangent_a: np.ndarray, direction_ab: np.ndarray,
-) -> float:
-    """Good-continuation score: cos(angle between tangent and bridge direction).
+def _signed_angle(reference: np.ndarray, direction: np.ndarray) -> float:
+    """Angle from *reference* to *direction*, in (-pi, pi]."""
+    cross = float(reference[0] * direction[1] - reference[1] * direction[0])
+    return float(np.arctan2(cross, float(np.dot(reference, direction))))
 
-    Returns value in [-1, 1]; 1.0 = perfect alignment.
-    """
-    n = np.linalg.norm(direction_ab)
-    if n < 1e-12:
+
+def _end_contexts(result: ExtractionResult) -> Dict[int, _End]:
+    """The stroke behind every free end, keyed by endpoint id."""
+    endpoints = result.endpoints
+    positions = np.array([ep.position for ep in endpoints]).reshape(-1, 2)
+    if len(endpoints) > 1:
+        nearest = cKDTree(positions).query(positions, k=2)[0][:, 1]
+    else:
+        nearest = np.full(len(endpoints), np.inf)
+
+    dense: Dict[int, np.ndarray] = {}
+    contexts: Dict[int, _End] = {}
+    for ep, nearest_distance in zip(endpoints, nearest):
+        if ep.path_index not in dense:
+            dense[ep.path_index] = result.paths[ep.path_index].sample(pts_per_segment=50)
+        samples = dense[ep.path_index]
+        into = samples if ep.end == "end" else samples[::-1]
+        steps = np.linalg.norm(np.diff(into, axis=0), axis=1)
+        back = np.concatenate((np.cumsum(steps[::-1])[::-1], [0.0]))
+        contexts[ep.endpoint_id] = _End(into, back, float(back[0]), float(nearest_distance))
+    return contexts
+
+
+def _tail(end: _End, length: float) -> np.ndarray:
+    """The last *length* of the stroke running into an end (at least two samples)."""
+    first = int(np.searchsorted(-end.back, -length))   # end.back decreases towards the end
+    return end.into[max(0, min(first, len(end.into) - 2)):]
+
+
+def _resample(points: np.ndarray, count: Optional[int] = None, spacing: float = 1.0) -> Optional[np.ndarray]:
+    """Points at equal arc-length steps along a polyline: *count* of them, or one every *spacing*."""
+    steps = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    points = points[np.concatenate(([True], steps > 1e-9))]
+    if len(points) < 2:
+        return None
+    arc = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))))
+    if count is None:
+        count = int(np.ceil(arc[-1] / spacing)) + 1
+    grid = np.linspace(0.0, arc[-1], count)
+    return np.column_stack([np.interp(grid, arc, points[:, 0]), np.interp(grid, arc, points[:, 1])])
+
+
+def _arc_miss(ep: EndpointInfo, curvature: float, target: np.ndarray, gap: float) -> float:
+    """How close the stroke gets to *target* when continued with its own curvature, in gap lengths."""
+    s = np.linspace(0.0, 2.0 * gap, 41)
+    tangent = ep.tangent
+    normal = np.array([-tangent[1], tangent[0]])
+    if abs(curvature) * gap < 1e-4:
+        along, across = s, np.zeros_like(s)
+    else:
+        along, across = np.sin(curvature * s) / curvature, (1.0 - np.cos(curvature * s)) / curvature
+    arc = ep.position + along[:, np.newaxis] * tangent + across[:, np.newaxis] * normal
+    return float(np.min(np.linalg.norm(arc - target, axis=1)) / gap)
+
+
+def _crossed_ink(bridge_points: np.ndarray, dist_map: Optional[np.ndarray]) -> float:
+    """Length (pixels) of existing stroke the bridge runs over, not counting the two strokes it joins."""
+    if dist_map is None:
         return 0.0
-    return float(np.dot(tangent_a, direction_ab / n))
-
-
-def _gestalt_closure(
-    ep_a: EndpointInfo,
-    ep_b: EndpointInfo,
-    all_endpoints: List[EndpointInfo],
-) -> float:
-    """1.0 if connecting ep_a and ep_b would close a loop, else 0.0.
-
-    A loop is closed when every endpoint of the paths involved in the
-    chain between ep_a and ep_b becomes connected.
-    """
-    # Simple heuristic: if after connecting these two, both paths would
-    # have all their endpoints connected to something, it's closure.
-    # For now, check if connecting the *other* ends of these two paths
-    # would complete a loop (both other ends already share a path).
-    idx_a = ep_a.path_index
-    idx_b = ep_b.path_index
-
-    # Find the other endpoints of those same paths
-    other_a = [e for e in all_endpoints
-               if e.path_index == idx_a and e.end != ep_a.end]
-    other_b = [e for e in all_endpoints
-               if e.path_index == idx_b and e.end != ep_b.end]
-
-    if not other_a or not other_b:
+    samples = _resample(bridge_points, spacing=1.0)
+    if samples is None:
         return 0.0
+    h, w = dist_map.shape
+    xy = np.round(samples).astype(int)
+    inside = (xy[:, 0] >= 0) & (xy[:, 0] < w) & (xy[:, 1] >= 0) & (xy[:, 1] < h)
+    ink = np.zeros(len(xy), dtype=bool)
+    ink[inside] = dist_map[xy[inside, 1], xy[inside, 0]] == 0
+    if ink.all():
+        return 0.0
+    # The bridge starts and ends on the strokes it joins; only ink in between counts.
+    first_clear = int(np.argmin(ink))
+    last_clear = len(ink) - 1 - int(np.argmin(ink[::-1]))
+    return float(ink[first_clear:last_clear + 1].sum())
 
-    # If the other ends are close to each other, connecting a↔b creates a loop
-    dist = float(np.linalg.norm(other_a[0].position - other_b[0].position))
-    if dist < 15.0:
-        return 1.0
-    return 0.0
+
+def _measure(candidate: ConnectionCandidate, ends: Dict[int, _End], result: ExtractionResult) -> List[float]:
+    """The FEATURES of one candidate, in order; NaN for those not on the scorecard of its shape."""
+    ep_a, ep_b = candidate.ep_a, candidate.ep_b
+    end_a, end_b = ends[ep_a.endpoint_id], ends[ep_b.endpoint_id]
+    gap = max(candidate.distance, 1e-6)
+    width = max(ep_a.radius + ep_b.radius, 1e-6)   # mean width of the two strokes
+    toward_b = (ep_b.position - ep_a.position) / gap
+
+    angle_a = _signed_angle(toward_b, ep_a.tangent)
+    angle_b = _signed_angle(-toward_b, ep_b.tangent)
+    # ep_a's tangent and the reverse of ep_b's are the direction of travel before and after the gap.
+    turn = abs((angle_a - angle_b + np.pi) % (2.0 * np.pi) - np.pi)
+    radii = sorted((max(ep_a.radius, 1e-6), max(ep_b.radius, 1e-6)))
+
+    values = dict.fromkeys(FEATURE_NAMES, float("nan"))
+    values.update(
+        gap_length=gap / width,
+        width_mismatch=radii[1] / radii[0],
+        stub_shortness=gap / max(min(end_a.stroke_length, end_b.stroke_length), 1e-6),
+        mutual_nearest=((gap <= end_a.nearest + 1e-9) + (gap <= end_b.nearest + 1e-9)) / 2.0,
+        nearest_ratio=gap / max(np.sqrt(end_a.nearest * end_b.nearest), 1e-6),   # geometric mean of the two ratios
+        same_stroke=float(candidate.same_path_closure),
+        crossed_ink=_crossed_ink(candidate.bridge_points, result.dist_map) / width,
+    )
+
+    if candidate.shape == "corner":
+        corner = np.asarray(candidate.corner_point, dtype=np.float64)
+        leg_a = float(np.linalg.norm(corner - ep_a.position))
+        leg_b = float(np.linalg.norm(ep_b.position - corner))
+        values.update(
+            corner_turn=np.degrees(turn),
+            corner_detour=(leg_a + leg_b) / gap - 1.0,
+            corner_balance=abs(leg_a - leg_b) / max(leg_a + leg_b, 1e-6),
+            corner_bend=min(1.0, (ep_a.curvature + ep_b.curvature) * gap / 2.0),
+        )
+        return [float(values[name]) for name in FEATURE_NAMES]
+
+    def straight_miss(angle: float) -> float:
+        return gap * np.sin(abs(angle)) if abs(angle) < np.pi / 2.0 else gap
+
+    context = _resample(
+        np.vstack([_tail(end_a, gap), candidate.bridge_points, _tail(end_b, gap)[::-1]]),
+        count=CONTEXT_SAMPLES,
+    )
+    if context is None:
+        mdtw = mjerk = 0.0
+    else:
+        length = float(np.sum(np.linalg.norm(np.diff(context, axis=0), axis=1)))
+        context = (context - context[0]) * (CONTEXT_LENGTH / max(length, 1e-9))
+        mdtw, mjerk = compute_mdtw(context), compute_mjerk(context)
+
+    values.update(
+        aim_worst=np.degrees(max(abs(angle_a), abs(angle_b))),
+        aim_best=np.degrees(min(abs(angle_a), abs(angle_b))),
+        turn=np.degrees(turn),
+        sideways_offset=max(straight_miss(angle_a), straight_miss(angle_b)) / width,
+        arc_miss=max(_arc_miss(ep_a, ep_a.signed_curvature, ep_b.position, gap),
+                     _arc_miss(ep_b, ep_b.signed_curvature, ep_a.position, gap)),
+        mdtw=mdtw,
+        mjerk=mjerk,
+    )
+    return [float(values[name]) for name in FEATURE_NAMES]
+
+
+def measure_candidates(candidates: List[ConnectionCandidate], result: ExtractionResult) -> np.ndarray:
+    """Matrix of FEATURES in their natural units, one row per candidate; NaN for those not on the scorecard of its shape."""
+    if not candidates:
+        return np.zeros((0, len(FEATURE_NAMES)))
+    ends = _end_contexts(result)
+    return np.array([_measure(c, ends, result) for c in candidates], dtype=np.float64)
+
+
+def on_scorecard_scale(measurements: np.ndarray) -> np.ndarray:
+    """Measurements (columns in FEATURES order) on the scale they enter a scorecard with."""
+    scaled = np.array(measurements, dtype=np.float64)
+    for name, scale in FEATURE_SCALES.items():
+        column = FEATURE_NAMES.index(name)
+        scaled[:, column] = _SCALE_FUNCTIONS[scale](scaled[:, column])
+    return scaled
+
+
+def candidate_features(candidates: List[ConnectionCandidate], result: ExtractionResult) -> np.ndarray:
+    """What the scorecards are fitted on: the candidates' measurements on their scorecard scale."""
+    return on_scorecard_scale(measure_candidates(candidates, result))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Normalization
+# The fitted model
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _normalize_metric(values: List[float]) -> List[float]:
-    """Min-max normalize a list of values to [0, 1]."""
-    if not values:
-        return []
-    mn = min(values)
-    mx = max(values)
-    rng = mx - mn
-    if rng < 1e-12:
-        return [0.0] * len(values)
-    return [(v - mn) / rng for v in values]
+@dataclass
+class Scorecard:
+    """A logistic regression on standardized measurements, for bridges of one shape."""
+
+    names: List[str]
+    mean: np.ndarray
+    scale: np.ndarray
+    weights: np.ndarray
+    intercept: float
+
+    def contributions(self, features: np.ndarray) -> np.ndarray:
+        """Log-odds each measurement (on its scorecard scale) adds, relative to its average value."""
+        return (features - self.mean) / self.scale * self.weights
 
 
-def _path_bbox_stats(paths: List[BezierPath]) -> Dict[int, Tuple[np.ndarray, np.ndarray, float, np.ndarray]]:
-    """Return per-path bbox stats: (min_xy, max_xy, area, centroid)."""
-    stats: Dict[int, Tuple[np.ndarray, np.ndarray, float, np.ndarray]] = {}
-    for idx, path in enumerate(paths):
-        pts = path.sample(pts_per_segment=20)
-        if len(pts) == 0:
-            min_xy = np.array([0.0, 0.0], dtype=np.float64)
-            max_xy = np.array([0.0, 0.0], dtype=np.float64)
-            area = 0.0
-            centroid = np.array([0.0, 0.0], dtype=np.float64)
-        else:
-            min_xy = np.min(pts, axis=0)
-            max_xy = np.max(pts, axis=0)
-            wh = np.maximum(0.0, max_xy - min_xy)
-            area = float(wh[0] * wh[1])
-            centroid = 0.5 * (min_xy + max_xy)
-        stats[idx] = (min_xy, max_xy, area, centroid)
-    return stats
+@dataclass
+class ScoringModel:
+    """A scorecard per bridge shape, and the probability above which a bridge is drawn."""
+
+    scorecards: Dict[str, Scorecard]
+    threshold: float
+
+    @property
+    def threshold_log_odds(self) -> float:
+        return float(np.log(self.threshold / (1.0 - self.threshold)))
 
 
-def _same_shape_affinity(
-    path_a_idx: int,
-    path_b_idx: int,
-    bbox_stats: Dict[int, Tuple[np.ndarray, np.ndarray, float, np.ndarray]],
-) -> float:
-    """Estimate whether two paths are likely fragments of the same shape."""
-    min_a, max_a, area_a, cent_a = bbox_stats[path_a_idx]
-    min_b, max_b, area_b, cent_b = bbox_stats[path_b_idx]
+def load_model(path: str = MODEL_PATH) -> ScoringModel:
+    """Read a model written by train_scoring.py."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No scoring model at {path}; run train_scoring.py to fit one.")
+    with open(path) as f:
+        data = json.load(f)
 
-    if area_a < 1e-6 or area_b < 1e-6:
-        return 0.0
+    scorecards: Dict[str, Scorecard] = {}
+    for shape, card in data["scorecards"].items():
+        unknown = [feature["name"] for feature in card["features"] if feature["name"] not in SHAPE_FEATURES.get(shape, ())]
+        if unknown:
+            raise ValueError(f"Scoring model {path}: unknown measurements for {shape} bridges: {unknown}")
+        scorecards[shape] = Scorecard(
+            names=[feature["name"] for feature in card["features"]],
+            mean=np.array([feature["mean"] for feature in card["features"]], dtype=np.float64),
+            scale=np.array([feature["scale"] for feature in card["features"]], dtype=np.float64),
+            weights=np.array([feature["weight"] for feature in card["features"]], dtype=np.float64),
+            intercept=float(card["intercept"]),
+        )
+    return ScoringModel(scorecards=scorecards, threshold=float(data["threshold"]))
 
-    inter_min = np.maximum(min_a, min_b)
-    inter_max = np.minimum(max_a, max_b)
-    inter_wh = np.maximum(0.0, inter_max - inter_min)
-    inter_area = float(inter_wh[0] * inter_wh[1])
-    overlap_ratio = inter_area / max(min(area_a, area_b), 1e-6)
 
-    centroid_dist = float(np.linalg.norm(cent_a - cent_b))
-    scale = np.sqrt(max(min(area_a, area_b), 1e-6))
-    centroid_factor = max(0.0, 1.0 - centroid_dist / (3.0 * scale))
-
-    affinity = overlap_ratio * centroid_factor
-    return float(np.clip(affinity, 0.0, 1.0))
+def held_out_models(directory: str, drawings: List[str]) -> Dict[str, str]:
+    """For each drawing, the path of the model that train_scoring.py --cv-dir fitted without it."""
+    with open(os.path.join(directory, "folds.json")) as f:
+        model_of = {name: os.path.join(directory, filename) for name, filename in json.load(f).items()}
+    unseen = [name for name in drawings if name not in model_of]
+    if unseen:
+        raise KeyError(f"No held-out model in {directory} for: {', '.join(unseen)}")
+    return model_of
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -241,206 +416,29 @@ def _same_shape_affinity(
 def score_candidates(
     candidates: List[ConnectionCandidate],
     result: ExtractionResult,
+    model: Union[ScoringModel, str, None] = None,
 ) -> List[ConnectionCandidate]:
-    """Score all candidates in-place and return sorted (best first)."""
+    """Score all candidates in place and return them best first.
+
+    Each candidate gets its measurements (in their natural units), the
+    log-odds every measurement contributes, its probability, and its score:
+    the log-odds above the model's acceptance threshold.
+    """
     if not candidates:
         return []
+    if not isinstance(model, ScoringModel):
+        model = load_model(model or MODEL_PATH)
 
-    radius_t1 = result.diagonal * 0.15
-    radius_t2 = radius_t1 * 2.0
-    paths = result.paths
-    endpoints = result.endpoints
-    bbox_stats = _path_bbox_stats(paths)
+    measurements = measure_candidates(candidates, result)
+    for c, measured, scaled in zip(candidates, measurements, on_scorecard_scale(measurements)):
+        card = model.scorecards[c.shape]
+        columns = [FEATURE_NAMES.index(name) for name in card.names]
+        terms = card.contributions(scaled[columns])
+        log_odds = card.intercept + float(terms.sum())
+        c.features = dict(zip(card.names, map(float, measured[columns])))
+        c.contributions = dict(zip(card.names, map(float, terms)))
+        c.probability = float(1.0 / (1.0 + np.exp(-log_odds)))
+        c.score = log_odds - model.threshold_log_odds
 
-    all_path_pts = []
-    path_indices = []
-    for idx, p in enumerate(paths):
-        pts = p.sample(pts_per_segment=20)
-        if len(pts) > 0:
-            all_path_pts.append(pts)
-            path_indices.extend([idx] * len(pts))
-    
-    kdtree = None
-    if all_path_pts:
-        all_path_pts = np.vstack(all_path_pts)
-        kdtree = cKDTree(all_path_pts)
-        path_indices = np.array(path_indices)
-
-    # Compute raw metrics on each bridge together with its local path context
-    dense_samples = [p.sample(pts_per_segment=50) for p in paths]
-    raw_dtw: List[float] = []
-    raw_jerk: List[float] = []
-    for c in candidates:
-        combined = context_curve(c, dense_samples)
-        raw_dtw.append(compute_mdtw(combined))
-        raw_jerk.append(compute_mjerk(combined))
-
-    # Normalize costs
-    norm_dtw = _normalize_metric(raw_dtw)
-    norm_jerk = _normalize_metric(raw_jerk)
-
-    # Score each candidate
-    for idx, c in enumerate(candidates):
-        radius = radius_t1 if c.tier == 1 else radius_t2
-        weights = WEIGHTS_TIER1 if c.tier == 1 else WEIGHTS_TIER2
-
-        prox = _gestalt_proximity(c.distance, radius)
-        direction_ab = c.ep_b.position - c.ep_a.position
-        cont = _gestalt_continuation(c.ep_a.tangent, direction_ab)
-        clos = _gestalt_closure(c.ep_a, c.ep_b, endpoints)
-
-        c.score = (
-            weights["proximity"] * prox
-            + weights["continuation"] * max(0.0, cont)
-            + weights["closure"] * clos
-            - weights["dtw"] * norm_dtw[idx]
-            - weights["jerk"] * norm_jerk[idx]
-        )
-
-        # PR2 tie-break refinements: prioritize robust local closure, suppress spur links.
-        c.score += 0.16 * max(0.0, float(c.bilateral_alignment))
-        if c.same_path_closure:
-            c.score += 0.20
-        if c.spur_involved:
-            c.score -= 0.22
-
-        misalignment_deg = float(c.misalignment_deg)
-        if misalignment_deg > 70.0:
-            c.score -= 0.08 * min(1.0, (misalignment_deg - 70.0) / 60.0)
-
-        if c.tier == 2 and float(c.bilateral_alignment) < 0.25:
-            c.score -= 0.06
-
-        ext_quality = float(np.clip(c.extension_quality, 0.0, 1.0))
-        if c.scenario == "extension_intersection":
-            if c.same_path_closure:
-                # Favor extension for sharp same-path closures only when alignment evidence is strong.
-                corner_factor = float(np.clip((misalignment_deg - 55.0) / 60.0, 0.0, 1.0))
-                continuation_strength = float(np.clip(c.bilateral_alignment, 0.0, 1.0))
-                extension_need = 1.0 - continuation_strength
-                context_conf = min(
-                    float(np.clip(c.ep_a.tangent_confidence, 0.0, 1.0)),
-                    float(np.clip(c.ep_b.tangent_confidence, 0.0, 1.0)),
-                )
-                c.score += (0.26 + 0.10 * corner_factor) * ext_quality * (extension_need ** 2) * context_conf
-                if continuation_strength > 0.60:
-                    c.score -= 0.16 * ((continuation_strength - 0.60) / 0.40)
-                if 70.0 <= misalignment_deg <= 100.0 and continuation_strength > 0.60:
-                    c.score -= 0.08 * ((continuation_strength - 0.60) / 0.40)
-                if ext_quality < 0.40:
-                    c.score -= 0.06 * ((0.40 - ext_quality) / 0.40)
-            else:
-                c.score += 0.04 * ext_quality
-                # Recover short corner-like cross-path closures that are geometrically
-                # plausible but under-scored by continuation-based penalties.
-                bilateral = float(np.clip(c.bilateral_alignment, -1.0, 1.0))
-                if (
-                    c.tier == 1
-                    and c.distance <= min(60.0, radius_t1 * 0.42)
-                    and ext_quality >= 0.90
-                    and 125.0 <= misalignment_deg <= 165.0
-                    and 0.0 <= bilateral <= 0.18
-                ):
-                    c.score += 0.20 * ext_quality
-
-                # Sparse-scene Tier-2 fallback removed to prevent massive false connections.
-                
-                # Penalize extension intersections that cross other paths.
-                if c.tier == 2 and kdtree is not None:
-                    dists, idxs = kdtree.query(c.bridge_points)
-                    closest_paths = path_indices[idxs]
-                    mask = (closest_paths != int(c.ep_a.path_index)) & (closest_paths != int(c.ep_b.path_index))
-                    if np.any(dists[mask] < 3.0):
-                        c.score -= 0.60
-
-    # PR4b: suppress cross-shape links when a path has strong self-closure support.
-    best_self_closure_by_path: Dict[int, Tuple[float, float]] = {}
-    affinity_by_candidate: Dict[int, float] = {}
-
-    for c in candidates:
-        if not c.same_path_closure:
-            continue
-        path_idx = int(c.ep_a.path_index)
-        current = best_self_closure_by_path.get(path_idx)
-        candidate_data = (float(c.score), float(c.distance))
-        if current is None or candidate_data[0] > current[0]:
-            best_self_closure_by_path[path_idx] = candidate_data
-
-    for c in candidates:
-        if c.same_path_closure:
-            continue
-        if c.ep_a.path_index == c.ep_b.path_index:
-            continue
-
-        suppression = 0.0
-        touched_paths = (int(c.ep_a.path_index), int(c.ep_b.path_index))
-        for path_idx in touched_paths:
-            self_info = best_self_closure_by_path.get(path_idx)
-            if self_info is None:
-                continue
-            self_score, self_dist = self_info
-            distance_ratio = float(c.distance / max(self_dist, 1e-6))
-
-            if self_score >= 0.60 and distance_ratio >= 0.95:
-                suppression = max(suppression, 0.18)
-            elif self_score >= 0.45 and distance_ratio >= 1.02:
-                suppression = max(suppression, 0.12)
-
-        if suppression > 0.0:
-            c.score -= suppression
-
-        # PR4b: boost likely same-shape fragment links (e.g. split bubble parts).
-        affinity = _same_shape_affinity(
-            int(c.ep_a.path_index),
-            int(c.ep_b.path_index),
-            bbox_stats,
-        )
-        affinity_by_candidate[int(c.id)] = affinity
-        if affinity >= 0.18 and c.distance <= (result.diagonal * 0.22):
-            c.score += 0.16 * affinity
-
-    # PR4b: if a path has a strong high-affinity option, suppress low-affinity competitors.
-    best_high_affinity_score_by_path: Dict[int, float] = {}
-    for c in candidates:
-        if c.same_path_closure:
-            continue
-        affinity = affinity_by_candidate.get(int(c.id), 0.0)
-        if affinity < 0.22:
-            continue
-        for pidx in (int(c.ep_a.path_index), int(c.ep_b.path_index)):
-            best_high_affinity_score_by_path[pidx] = max(
-                best_high_affinity_score_by_path.get(pidx, -1e9),
-                float(c.score),
-            )
-
-    for c in candidates:
-        if c.same_path_closure:
-            continue
-        affinity = affinity_by_candidate.get(int(c.id), 0.0)
-        if affinity >= 0.10:
-            continue
-
-        suppression = 0.0
-        for pidx in (int(c.ep_a.path_index), int(c.ep_b.path_index)):
-            support_score = best_high_affinity_score_by_path.get(pidx)
-            if support_score is None:
-                continue
-            if float(c.score) <= support_score + 0.18:
-                suppression = max(suppression, 0.10)
-
-        if suppression > 0.0:
-            c.score -= suppression
-
-    # Sort best-first
-    candidates.sort(
-        key=lambda c: (
-            -c.score,
-            int(not c.same_path_closure),
-            -float(c.extension_quality),
-            c.distance,
-            c.misalignment_deg,
-            -c.bilateral_alignment,
-            c.id,
-        )
-    )
+    candidates.sort(key=lambda c: (-c.score, c.distance, c.id))
     return candidates

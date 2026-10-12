@@ -15,17 +15,19 @@ Usage:
     python evaluate_gaps.py                         # all matched pairs
     python evaluate_gaps.py --filter ankh --limit 5
     python evaluate_gaps.py --output-dir results/
+    python evaluate_gaps.py --models cv_models/     # each drawing scored by a model that never saw it
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import json
 import os
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
@@ -37,6 +39,7 @@ from restoration.candidates import generate_candidates
 from restoration.extraction import extract_paths
 from restoration.pipeline import _iter_changes, default_workers, map_in_processes, restore
 from restoration.render_restored_sketch import estimate_line_width
+from restoration.scoring import MODEL_PATH, held_out_models
 
 # A gap counts as covered when this share of its centre line lies within the
 # tolerance of a drawn stroke; the tolerance is this many line widths.
@@ -75,6 +78,17 @@ class GroundTruth:
     def stroke_thickness(self) -> int:
         """Thickness that makes a drawn centre line cover its tolerance band."""
         return 2 * self.tolerance + 1
+
+    @functools.cached_property
+    def gap_pixels(self) -> Tuple[np.ndarray, np.ndarray]:
+        """(rows, columns) of all gap pixels."""
+        return np.nonzero(self.gap_mask)
+
+    @functools.cached_property
+    def gap_pixel_tree(self) -> cKDTree:
+        """Nearest-neighbour index over the gap pixels, as (x, y), in the order of gap_pixels."""
+        ys, xs = self.gap_pixels
+        return cKDTree(np.column_stack([xs, ys]))
 
 
 def stroke_mask(gray: np.ndarray) -> np.ndarray:
@@ -236,12 +250,75 @@ def _polyline_length(points: np.ndarray) -> float:
     return float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
 
 
+def gaps_at_positions(gt: GroundTruth, positions: np.ndarray) -> List[Set[int]]:
+    """Ids of the gaps each position lies next to."""
+    if len(positions) == 0 or not gt.gaps:
+        return [set() for _ in positions]
+    ys, xs = gt.gap_pixels
+    nearby = gt.gap_pixel_tree.query_ball_point(positions, gt.tolerance + 6)
+    return [{int(gt.gap_labels[ys[j], xs[j]]) for j in indices} for indices in nearby]
+
+
+def erased_stroke_shares(gt: GroundTruth, points: np.ndarray) -> np.ndarray:
+    """Of what a stroke adds (its part not on surviving strokes), the share lying on each gap's erased stroke.
+
+    Indexed by gap id; index 0 is unused.
+    """
+    shares = np.zeros(len(gt.gaps) + 1)
+    if not gt.gaps:
+        return shares
+    surviving = gt.original_strokes & ~gt.gap_mask
+    ij = np.clip(np.round(points).astype(int), 0, [gt.shape[1] - 1, gt.shape[0] - 1])
+    added = ij[~surviving[ij[:, 1], ij[:, 0]]]
+    if len(added):
+        # Nearest gap pixel of every added point, and how far away it is.
+        distance, nearest = gt.gap_pixel_tree.query(added)
+        ys, xs = gt.gap_pixels
+        on_gap = nearest[distance <= gt.tolerance]
+        shares = np.bincount(gt.gap_labels[ys[on_gap], xs[on_gap]], minlength=len(shares)) / len(added)
+    return shares
+
+
+def label_candidates(
+    gt: GroundTruth,
+    candidates: List[Any],
+    coverage_threshold: float = COVERAGE_THRESHOLD,
+) -> List[Dict[str, Any]]:
+    """What the ground truth says about each candidate bridge.
+
+    correct:   the bridge redraws the erased stroke of one true gap: both of
+               its ends lie next to that gap, and at least 80% of what it adds
+               lies on the gap.
+    unfounded: less than 80% of the bridge lies on the original drawing, or it
+               neither covers a true gap nor adds mostly erased stroke.
+    A bridge can be neither: one that runs across two gaps and the stroke
+    between them repairs something without being the repair of either gap.
+    """
+    positions = np.array([[c.ep_a.position, c.ep_b.position] for c in candidates]).reshape(-1, 2)
+    beside = gaps_at_positions(gt, positions)
+    rows = []
+    for i, candidate in enumerate(candidates):
+        points = candidate.bridge_points
+        covered = set((np.flatnonzero(gap_coverage(gt, [points]) >= coverage_threshold) + 1).tolist())
+        on_drawing = on_drawing_fraction(gt, points)
+        shares = erased_stroke_shares(gt, points)
+        redrawn = set(np.flatnonzero(shares >= 0.8).tolist())
+        rows.append({
+            "gaps": sorted(covered),
+            "on_drawing": on_drawing,
+            "length_widths": _polyline_length(points) / gt.line_width,
+            "correct": bool(redrawn & beside[2 * i] & beside[2 * i + 1]),
+            "unfounded": on_drawing < 0.8 or not (covered or shares.sum() >= 0.8),
+        })
+    return rows
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # One image pair
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _stroke_rows(gt: GroundTruth, restored_paths) -> List[Dict[str, Any]]:
-    """One row per restoration stroke: how much of it lies on the original drawing."""
+def _stroke_rows(gt: GroundTruth, restored_paths, coverage_threshold: float) -> List[Dict[str, Any]]:
+    """One row per restoration stroke: how much of it lies on the original drawing, and whether it repairs anything."""
     rows = []
     for source, _, points in _iter_changes(restored_paths):
         on_drawing = on_drawing_fraction(gt, points)
@@ -249,6 +326,9 @@ def _stroke_rows(gt: GroundTruth, restored_paths) -> List[Dict[str, Any]]:
         rows.append({
             "source": source,
             "on_drawing": on_drawing,
+            # It repairs something: it covers a true gap, or what it adds is mostly erased stroke.
+            "repairs": bool(np.any(gap_coverage(gt, [points]) >= coverage_threshold)
+                            or erased_stroke_shares(gt, points).sum() >= 0.8),
             "length_widths": length / gt.line_width,
             "off_drawing_widths": length * (1.0 - on_drawing) / gt.line_width,
         })
@@ -262,6 +342,7 @@ def evaluate_pair(
     output_dir: str,
     coverage_threshold: float = COVERAGE_THRESHOLD,
     tolerance_line_widths: float = TOLERANCE_LINE_WIDTHS,
+    model_path: str = MODEL_PATH,
 ) -> Dict[str, Any]:
     """Run the pipeline on one damaged image and on its original; compare with ground truth."""
     original, damaged, agreement = load_pair(original_path, damaged_path)
@@ -270,7 +351,8 @@ def evaluate_pair(
     gt = build_ground_truth(original, damaged, tolerance_line_widths)
 
     # ---- damaged image
-    result = restore(damaged_path, output_dir=os.path.join(output_dir, "reports"), save_images=False)
+    result = restore(damaged_path, model_path=model_path,
+                     output_dir=os.path.join(output_dir, "reports"), save_images=False)
     strokes = [points for _, _, points in _iter_changes(result.restored_paths)]
     restored = gap_coverage(gt, strokes)
     any_path = gap_coverage(gt, [p.sample(30) for p in result.restored_paths])
@@ -309,7 +391,8 @@ def evaluate_pair(
             gap["deviation_widths"] = float(np.mean(distance) / gt.line_width)
 
     # ---- the undamaged original: everything drawn there is unnecessary
-    clean = restore(original_path, output_dir=os.path.join(output_dir, "reports_undamaged"), save_images=False)
+    clean = restore(original_path, model_path=model_path,
+                    output_dir=os.path.join(output_dir, "reports_undamaged"), save_images=False)
     clean_original = cv2.imread(original_path, cv2.IMREAD_GRAYSCALE)
     clean_gt = build_ground_truth(clean_original, clean_original, tolerance_line_widths)
     clean_extraction_endpoints = clean.report["analysis"]["extraction"]["endpoints"]
@@ -318,12 +401,12 @@ def evaluate_pair(
         "name": name,
         "line_width": gt.line_width,
         "gaps": gt.gaps,
-        "strokes": _stroke_rows(gt, result.restored_paths),
+        "strokes": _stroke_rows(gt, result.restored_paths, coverage_threshold),
         "endpoints": int(len(positions)),
         "endpoints_at_gaps": int(at_gap.sum()),
         "candidates": len(candidates),
         "strokes_missed_by_extraction": strokes_missed,
-        "undamaged_strokes": _stroke_rows(clean_gt, clean.restored_paths),
+        "undamaged_strokes": _stroke_rows(clean_gt, clean.restored_paths, coverage_threshold),
         "undamaged_endpoints": int(clean_extraction_endpoints),
     }
 
@@ -347,6 +430,8 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             "strokes": len(selection),
             "wrong_strokes": sum(s["on_drawing"] < 0.5 for s in selection),
             "partly_off_strokes": sum(0.5 <= s["on_drawing"] < 0.8 for s in selection),
+            # Strokes that repair nothing, or leave the drawing.
+            "unfounded_strokes": sum(s["on_drawing"] < 0.8 or not s["repairs"] for s in selection),
             "off_drawing_widths": round(sum(s["off_drawing_widths"] for s in selection), 1),
             "drawn_widths": round(sum(s["length_widths"] for s in selection), 1),
         }
@@ -418,6 +503,7 @@ def print_summary(summary: Dict[str, Any], skipped: List[Dict[str, Any]]) -> Non
         print(f"  {title}: {s['strokes']}")
         print(f"    wrong (under 50% on the drawing)   {s['wrong_strokes']}")
         print(f"    partly off (50-80%)                {s['partly_off_strokes']}")
+        print(f"    unfounded (repair nothing, or off) {s['unfounded_strokes']}")
         print(f"    line drawn off the drawing         {s['off_drawing_widths']} line widths (of {s['drawn_widths']} drawn)")
     print(f"    undamaged images with off-drawing strokes: {summary['undamaged']['images_with_off_drawing_strokes']}")
     print(f"  Endpoints: {summary['endpoints']} extracted, {summary['endpoints_at_gaps']} at a true gap; "
@@ -469,6 +555,9 @@ def main() -> None:
                         help="Share of a gap's centre line that must be covered.")
     parser.add_argument("--tolerance", type=float, default=TOLERANCE_LINE_WIDTHS,
                         help="How close a stroke must be to count, in line widths.")
+    parser.add_argument("--models", type=str, default=None,
+                        help="Directory written by train_scoring.py --cv-dir: every drawing is then "
+                             "scored by the model fitted without it.")
     args = parser.parse_args()
 
     pairs = discover_pairs(name_filter=args.filter)
@@ -476,7 +565,10 @@ def main() -> None:
         pairs = pairs[:args.limit]
     os.makedirs(args.output_dir, exist_ok=True)
 
-    jobs = [(name, orig, dmg, args.output_dir, args.coverage, args.tolerance) for name, orig, dmg in pairs]
+    model_of = held_out_models(args.models, [name for name, _, _ in pairs]) if args.models else {}
+
+    jobs = [(name, orig, dmg, args.output_dir, args.coverage, args.tolerance, model_of.get(name, MODEL_PATH))
+            for name, orig, dmg in pairs]
     rows = []
     for i, row in enumerate(map_in_processes(_evaluate_quietly, jobs, args.workers), 1):
         rows.append(row)

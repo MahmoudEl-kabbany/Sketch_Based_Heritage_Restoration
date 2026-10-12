@@ -35,9 +35,11 @@ SPUR_RADIUS_FACTOR = 1.5
 #    such branches, up to this many radii long.
 CORNER_TIP_RADIUS_RATIO = 0.5
 CORNER_BRANCH_MAX_RADII = 3.0
-#  - A skeleton cannot be trusted within one radius of a stroke's free end,
-#    and never within a few pixels of it, whatever the stroke width.
-END_TRIM_RADII = 1.0
+#  - At a stroke's free end the skeleton leaves the centre line: at a blunt end
+#    it runs into a corner of the outline, 1.4 radii of skeleton for one radius
+#    of stroke. The skeleton is trusted from this many stroke radii behind the
+#    tip, and never within a few pixels of it.
+END_TRIM_RADII = 1.5
 END_TRIM_MIN_PX = 3.0
 #  - Blobs smaller than this many squared line widths are specks, not strokes.
 SPECK_AREA_WIDTHS2 = 0.5
@@ -768,22 +770,32 @@ def _prune_skeleton_spurs(graph: Any, radius_map: np.ndarray, fallback_radius: f
             changed = True
 
 
-def _trim_free_ends(chain: _SkeletonChain, radius_map: np.ndarray, fallback_radius: float) -> np.ndarray:
-    """Chain points without the stretch within about one stroke radius of each free end.
+def stroke_radius(points: np.ndarray, radius_map: np.ndarray, fallback: float) -> float:
+    """Typical radius of a stroke: the median distance to the background along its centre line."""
+    h, w = radius_map.shape
+    xy = np.round(points).astype(int)
+    values = radius_map[np.clip(xy[:, 1], 0, h - 1), np.clip(xy[:, 0], 0, w - 1)]
+    values = values[values > 0]
+    return float(np.median(values)) if len(values) else fallback
 
-    Near a stroke's end the skeleton bends towards the outline and says little
-    about the stroke's direction. Ends on a junction are kept as they are.
+
+def _trim_free_ends(chain: _SkeletonChain, radius_map: np.ndarray, fallback_radius: float) -> np.ndarray:
+    """Chain points without the stretch at each free end where the skeleton leaves the centre line.
+
+    The stretch is END_TRIM_RADII radii of the stroke long. The stroke's
+    radius is taken along the whole chain: at the tip itself the radius says
+    nothing, it is zero in a corner. Ends on a junction are kept as they are.
     """
     pts = chain.points
     steps = np.linalg.norm(np.diff(pts, axis=0), axis=1)
     max_drop = len(pts) // 4   # never trim away more than a quarter of the chain per end
+    reach = max(END_TRIM_RADII * stroke_radius(pts, radius_map, fallback_radius), END_TRIM_MIN_PX)
 
-    def points_within(radius: float, step_lengths: np.ndarray) -> int:
-        reach = max(END_TRIM_RADII * radius, END_TRIM_MIN_PX)
+    def points_within_reach(step_lengths: np.ndarray) -> int:
         return min(int(np.searchsorted(np.cumsum(step_lengths), reach)), max_drop)
 
-    first = points_within(_radius_at(radius_map, pts[0], fallback_radius), steps) if chain.start_free else 0
-    last = points_within(_radius_at(radius_map, pts[-1], fallback_radius), steps[::-1]) if chain.end_free else 0
+    first = points_within_reach(steps) if chain.start_free else 0
+    last = points_within_reach(steps[::-1]) if chain.end_free else 0
     return pts[first:len(pts) - last]
 
 

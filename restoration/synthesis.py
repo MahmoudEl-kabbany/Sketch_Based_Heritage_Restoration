@@ -1,7 +1,8 @@
 """Phase 5 — Synthesis.
 
-Construct final bridge Bezier curves from accepted candidates, merge
-into the restored path set.
+Merge the bridges of the accepted candidates into the restored path set.
+A candidate's bridge is built when the candidate is generated, so that what
+is scored is exactly what is drawn.
 """
 
 from __future__ import annotations
@@ -10,142 +11,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from bezier_curves.bezier import BezierPath, BezierSegment, fit_straight_cubic
-from restoration.extraction import EndpointInfo
+from bezier_curves.bezier import BezierPath, BezierSegment
 from restoration.candidates import ConnectionCandidate
-from restoration.geometry import g1_control_points, polyline_length, safe_normalize
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _stabilize_bridge_control_points(cp: np.ndarray) -> np.ndarray:
-    """Clamp handle geometry to prevent local hook/backtracking artifacts."""
-    p0, p1, p2, p3 = cp.astype(np.float64)
-    chord_vec = p3 - p0
-    chord = float(np.linalg.norm(chord_vec))
-    if chord < 1e-6:
-        return cp
-
-    chord_dir = chord_vec / chord
-    min_forward = 0.02 * chord
-    rescue_forward = 0.08 * chord
-    max_side = 0.60 * chord
-
-    def clamp(handle: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Split a handle into (along-chord, sideways) parts, each kept in range."""
-        proj = float(np.dot(handle, chord_dir))
-        side = handle - proj * chord_dir
-        side_norm = float(np.linalg.norm(side))
-        if proj < min_forward:
-            proj = rescue_forward
-        if side_norm > max_side and side_norm > 1e-12:
-            side = side * (max_side / side_norm)
-        return proj * chord_dir, side
-
-    along1, side1 = clamp(p1 - p0)
-    along2, side2 = clamp(p3 - p2)
-    return np.vstack([p0, p0 + along1 + side1, p3 - (along2 + side2), p3])
-
-
-def _bridge(cp: np.ndarray) -> BezierSegment:
-    """Bridge segment from raw control points, with stabilized handles."""
-    return BezierSegment(
-        control_points=_stabilize_bridge_control_points(cp),
-        source_type="bridge",
-    )
-
-
-def _is_straight(curvature_a: float, curvature_b: float,
-                  tangent_a: np.ndarray, tangent_b: np.ndarray) -> bool:
-    """Both endpoints are straight and tangents are nearly collinear."""
-    both_flat = curvature_a < 0.005 and curvature_b < 0.005
-    aligned = abs(float(np.dot(tangent_a, -tangent_b))) > 0.95
-    return both_flat and aligned
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Bridge construction — production quality
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _build_straight_bridge(ep_a: EndpointInfo, ep_b: EndpointInfo) -> BezierSegment:
-    """Exactly straight cubic Bezier between two endpoints."""
-    return _bridge(fit_straight_cubic(ep_a.position, ep_b.position))
-
-
-def _build_g1_bridge(ep_a: EndpointInfo, ep_b: EndpointInfo) -> BezierSegment:
-    """Single cubic Bezier with G1-continuous handles driven by curvature."""
-    return _bridge(g1_control_points(
-        ep_a.position, ep_a.tangent, ep_a.curvature,
-        ep_b.position, ep_b.tangent, ep_b.curvature,
-    ))
-
-
-def _build_intersection_bridge_linear(
-    ep_a: EndpointInfo, ep_b: EndpointInfo, intersection: np.ndarray,
-) -> List[BezierSegment]:
-    """Two straight-ish segments through an intersection point (corner)."""
-    segments: List[BezierSegment] = []
-    # (start, end, tangent leaving the start endpoint, outward tangent of the end endpoint)
-    legs: Tuple[Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]], ...] = (
-        (ep_a.position, intersection, ep_a.tangent, None),
-        (intersection, ep_b.position, None, ep_b.tangent),
-    )
-    for p0, p3, start_tangent, end_tangent in legs:
-        chord = float(np.linalg.norm(p3 - p0))
-        if chord <= 1e-6:
-            continue
-        alpha = chord / 3.0
-        toward_end = safe_normalize(p3 - p0)
-        p1 = p0 + alpha * (toward_end if start_tangent is None else start_tangent)
-        if end_tangent is None:
-            p2 = p3 - alpha * toward_end
-        else:
-            # The tangent is outward; the incoming derivative at p3 should align with -tangent.
-            p2 = p3 + alpha * end_tangent
-        segments.append(_bridge(np.vstack([p0, p1, p2, p3])))
-
-    return segments
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Synthesis dispatcher
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _synthesize_single(candidate: ConnectionCandidate) -> List[BezierSegment]:
-    """Build the final bridge segment(s) for one accepted candidate."""
-    ep_a = candidate.ep_a
-    ep_b = candidate.ep_b
-
-    if candidate.scenario == "continuation":
-        if _is_straight(ep_a.curvature, ep_b.curvature,
-                        ep_a.tangent, ep_b.tangent):
-            return [_build_straight_bridge(ep_a, ep_b)]
-        return [_build_g1_bridge(ep_a, ep_b)]
-
-    # Two straight strokes that meet at an extension intersection form a sharp
-    # corner through that point; everything else gets a smooth G1 bridge.
-    if (
-        candidate.scenario == "extension_intersection"
-        and ep_a.curvature < 0.008
-        and ep_b.curvature < 0.008
-    ):
-        intersection = np.asarray(candidate.intersection_point, dtype=np.float64).reshape(2)
-        return _build_intersection_bridge_linear(ep_a, ep_b, intersection)
-
-    return [_build_g1_bridge(ep_a, ep_b)]
+from restoration.geometry import polyline_length
 
 
 def synthesize_bridges(
     accepted: List[ConnectionCandidate],
 ) -> List[BezierSegment]:
-    """Build all bridge segments for the accepted candidates."""
-    all_bridges: List[BezierSegment] = []
-    for c in accepted:
-        c.bridge_bezier = _synthesize_single(c)
-        all_bridges.extend(c.bridge_bezier)
-    return all_bridges
+    """The bridge segments of the accepted candidates, in order."""
+    return [segment for c in accepted for segment in c.bridge_bezier]
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -18,16 +18,16 @@ from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass
 from itertools import groupby
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
 from bezier_curves.bezier import BezierPath, BezierSegment
-from restoration.extraction import ExtractionResult, extract_paths
+from restoration.extraction import EndpointInfo, ExtractionResult, extract_paths
 from restoration.candidates import ConnectionCandidate, generate_candidates
-from restoration.scoring import score_candidates
-from restoration.asp_engine import decode_solution, solve_candidates, RULES_PATH
+from restoration.scoring import FEATURE_SCALES, FEATURES, MODEL_PATH, ScoringModel, load_model, score_candidates
+from restoration.asp_engine import decode_solution, solve_candidates, utility, RULES_PATH
 from restoration.synthesis import synthesize_bridges, merge_restored_paths
 from restoration.efd_closure import close_single_gaps
 from restoration.geometry import polyline_length, safe_normalize, visual_order_key
@@ -36,6 +36,9 @@ OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
 
 # Segment source types that mark a restoration change (anything not original).
 CHANGE_SOURCES = ("bridge", "efd_closure")
+
+# A measurement is named among a bridge's reasons when it moves the log-odds by at least this much.
+MIN_REPORTED_LOG_ODDS = 0.25
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -51,52 +54,6 @@ class RestorationResult:
     restored_paths: List[BezierPath]
     bridges: List[BezierSegment]
     report: Dict[str, Any]
-
-
-def _sanitize_accepted_candidates(
-    accepted: List[ConnectionCandidate],
-) -> Tuple[List[ConnectionCandidate], int]:
-    """Drop accepted candidates that reuse an endpoint already consumed."""
-    used: Set[int] = set()
-    sanitized: List[ConnectionCandidate] = []
-    for c in sorted(accepted, key=lambda c: (-c.score, c.distance, c.id)):
-        pair = {c.ep_a.endpoint_id, c.ep_b.endpoint_id}
-        if len(pair) == 2 and not (pair & used):
-            used |= pair
-            sanitized.append(c)
-    return sanitized, len(accepted) - len(sanitized)
-
-
-def _bridge_crosses_image_mask(
-    bridge_points: np.ndarray,
-    dist_map: Optional[np.ndarray],
-    ep_a: Any,
-    ep_b: Any,
-    proximity_px: float = 4.0,
-    exclusion_radius: float = 12.0,
-) -> bool:
-    """Return True if the bridge passes too close to original image lines.
-
-    Ignores bridge points that are within *exclusion_radius* of either endpoint.
-    If dist_map is None, falls back to returning False.
-    """
-    if dist_map is None or len(bridge_points) < 2:
-        return False
-
-    h, w = dist_map.shape
-
-    for pt in bridge_points:
-        x, y = pt
-        if x < 0 or y < 0 or x >= w - 1 or y >= h - 1:
-            continue
-        if float(np.linalg.norm(pt - ep_a.position)) < exclusion_radius:
-            continue
-        if float(np.linalg.norm(pt - ep_b.position)) < exclusion_radius:
-            continue
-        if dist_map[int(round(y)), int(round(x))] < proximity_px:
-            return True
-
-    return False
 
 
 @contextmanager
@@ -131,33 +88,78 @@ def _iter_changes(
                 yield source, segments, np.vstack([s.sample(n=30) for s in segments])
 
 
+def _endpoint_ref(ep: EndpointInfo) -> Dict[str, Any]:
+    return {"path_index": int(ep.path_index), "end": str(ep.end), "endpoint_id": int(ep.endpoint_id)}
+
+
+def _endpoint_name(ep: EndpointInfo) -> str:
+    return f"the {ep.end} of path {ep.path_index}"
+
+
+def _candidate_ref(c: ConnectionCandidate) -> Dict[str, Any]:
+    """Short description of a candidate, for lists of alternatives."""
+    return {
+        "id": int(c.id),
+        "shape": str(c.shape),
+        "endpoint_a": _endpoint_ref(c.ep_a),
+        "endpoint_b": _endpoint_ref(c.ep_b),
+        "probability": round(float(c.probability), 4),
+    }
+
+
+def _reasons(c: ConnectionCandidate, sign: int) -> List[Dict[str, Any]]:
+    """Up to three measurements that argue most for (sign = 1) or against (sign = -1) a candidate."""
+    ranked = sorted(c.contributions.items(), key=lambda item: -sign * item[1])
+    return [
+        {
+            "feature": name,
+            "meaning": FEATURES[name],
+            "value": float(f"{c.features[name]:.4g}"),
+            "log_odds": round(float(value), 2),
+        }
+        for name, value in ranked[:3]
+        if sign * value >= MIN_REPORTED_LOG_ODDS
+    ]
+
+
+def _reasons_text(reasons: List[Dict[str, Any]]) -> str:
+    if not reasons:
+        return "no single measurement stands out"
+    return "; ".join(f"{r['meaning']} = {r['value']:.3g} ({r['log_odds']:+.1f})" for r in reasons)
+
+
+def _candidates_by_endpoint(candidates: List[ConnectionCandidate]) -> Dict[int, List[ConnectionCandidate]]:
+    by_endpoint: Dict[int, List[ConnectionCandidate]] = {}
+    for c in candidates:
+        for ep in (c.ep_a, c.ep_b):
+            by_endpoint.setdefault(ep.endpoint_id, []).append(c)
+    return by_endpoint
+
+
 def _build_bridge_event_explanation(
     label_id: str,
     candidate: ConnectionCandidate,
-    segment_count: int,
+    threshold: float,
     approx_length_px: float,
+    rivals: List[ConnectionCandidate],
 ) -> str:
     """Create a detailed, human-readable explanation for an ASP bridge event."""
-    quality = max(0.0, min(1.0, (float(candidate.bilateral_alignment) + max(0.0, 1.0 - float(candidate.misalignment_deg) / 180.0)) / 2.0))
-    scenario_desc = f"'{candidate.scenario}' scenario"
-    if candidate.scenario == "extension_intersection" and candidate.same_path_closure:
-        scenario_desc = "extension-based same-path closure"
-
-    extension_suffix = ""
-    if candidate.scenario == "extension_intersection":
-        extension_suffix = f" Extension convergence quality is {float(candidate.extension_quality):.2f}."
-
-    return (
-        f"{label_id} is an ASP-selected bridge from candidate C{candidate.id}. "
-        f"It links path {candidate.ep_a.path_index} ({candidate.ep_a.end}) to "
-        f"path {candidate.ep_b.path_index} ({candidate.ep_b.end}) using the "
-        f"{scenario_desc}. Gap distance is {candidate.distance:.1f}px, "
-        f"directional alignment is {candidate.bilateral_alignment:.3f}, and endpoint "
-        f"misalignment is {candidate.misalignment_deg:.1f} deg. The accepted score is "
-        f"{candidate.score:.3f} (tier {candidate.tier}), producing {segment_count} bridge "
-        f"segment(s) with an estimated repaired length of {approx_length_px:.1f}px. "
-        f"Estimated geometric confidence is {quality:.2f}.{extension_suffix}"
+    widths = candidate.distance / max(candidate.ep_a.radius + candidate.ep_b.radius, 1e-6)
+    text = (
+        f"{label_id} joins {_endpoint_name(candidate.ep_a)} to {_endpoint_name(candidate.ep_b)} with a "
+        f"{candidate.shape} bridge (candidate C{candidate.id}) across a gap of {candidate.distance:.1f}px, "
+        f"{widths:.1f} stroke widths, drawing about {approx_length_px:.1f}px of line. "
+        f"The estimated probability that it redraws a missing stroke is {candidate.probability:.2f}; "
+        f"bridges are drawn above {threshold:.2f}. "
+        f"In its favour: {_reasons_text(_reasons(candidate, 1))}. "
+        f"Against it: {_reasons_text(_reasons(candidate, -1))}."
     )
+    if rivals:
+        text += (
+            f" It was preferred to {len(rivals)} other candidate(s) for these two stroke ends; "
+            f"the most likely of them, C{rivals[0].id}, has probability {rivals[0].probability:.2f}."
+        )
+    return text
 
 
 def _build_efd_event_explanation(
@@ -175,41 +177,49 @@ def _build_efd_event_explanation(
     )
 
 
-def _candidate_event_details(c: ConnectionCandidate) -> Dict[str, Any]:
+def _candidate_event_details(
+    c: ConnectionCandidate,
+    threshold: float,
+    rivals: List[ConnectionCandidate],
+) -> Dict[str, Any]:
     """Report metadata of the candidate behind a bridge event."""
-    def endpoint(ep) -> Dict[str, Any]:
-        return {"path_index": int(ep.path_index), "end": str(ep.end), "endpoint_id": int(ep.endpoint_id)}
-
     details: Dict[str, Any] = {
-        "id": int(c.id),
-        "scenario": str(c.scenario),
-        "tier": int(c.tier),
+        **_candidate_ref(c),
+        "threshold": round(float(threshold), 4),
+        "log_odds_above_threshold": round(float(c.score), 3),
         "distance_px": round(float(c.distance), 2),
-        "score": round(float(c.score), 4),
-        "extension_quality": round(float(c.extension_quality), 4),
-        "bilateral_alignment": round(float(c.bilateral_alignment), 4),
-        "misalignment_deg": round(float(c.misalignment_deg), 2),
         "same_path_closure": bool(c.same_path_closure),
-        "spur_involved": bool(c.spur_involved),
-        "endpoint_a": endpoint(c.ep_a),
-        "endpoint_b": endpoint(c.ep_b),
+        "in_favour": _reasons(c, 1),
+        "against": _reasons(c, -1),
+        # Every measurement with the log-odds it adds, relative to an average candidate.
+        "measurements": {
+            name: {"value": float(f"{c.features[name]:.4g}"), "log_odds": round(float(value), 3)}
+            for name, value in c.contributions.items()
+        },
+        "alternatives": [_candidate_ref(rival) for rival in rivals[:3]],
     }
-    if c.intersection_point is not None:
-        ip = np.asarray(c.intersection_point, dtype=np.float64).reshape(2)
-        details["intersection_point"] = [round(float(ip[0]), 2), round(float(ip[1]), 2)]
+    if c.corner_point is not None:
+        corner = np.asarray(c.corner_point, dtype=np.float64).reshape(2)
+        details["corner_point"] = [round(float(corner[0]), 2), round(float(corner[1]), 2)]
     return details
+
+
+def _segment_key(segment: BezierSegment) -> frozenset:
+    """Identity of a segment by where it starts and ends, whichever way round it is stored."""
+    cp = segment.control_points
+    return frozenset((tuple(np.round(cp[0], 3)), tuple(np.round(cp[3], 3))))
 
 
 def _change_events(
     final_paths: List[BezierPath],
+    candidates: List[ConnectionCandidate],
     accepted: List[ConnectionCandidate],
+    threshold: float,
     efd_phase_diagnostics: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """Describe every restoration change for the report's ``detailed_events``."""
-    # Bridge segments are matched back to their candidate by object identity,
-    # so a bridge whose path was reversed during merging (copied segments)
-    # has no candidate link.
-    bridge_owner = {id(seg): c for c in accepted for seg in c.bridge_bezier}
+    bridge_owner = {_segment_key(seg): c for c in accepted for seg in c.bridge_bezier}
+    by_endpoint = _candidates_by_endpoint(candidates)
     efd_accepted = iter([e for e in efd_phase_diagnostics if e["accepted"]])
 
     events: List[Dict[str, Any]] = []
@@ -232,17 +242,24 @@ def _change_events(
         }
 
         if is_bridge:
-            candidate = next((bridge_owner[id(s)] for s in segments if id(s) in bridge_owner), None)
+            candidate = next(
+                (bridge_owner[key] for key in map(_segment_key, segments) if key in bridge_owner), None,
+            )
             if candidate is not None:
-                event["candidate"] = _candidate_event_details(candidate)
+                # The other candidates for the same two stroke ends, most likely first.
+                rivals = {
+                    other.id: other
+                    for ep in (candidate.ep_a, candidate.ep_b)
+                    for other in by_endpoint[ep.endpoint_id]
+                    if other.id != candidate.id
+                }
+                ranked = sorted(rivals.values(), key=lambda c: (-c.probability, c.id))
+                event["candidate"] = _candidate_event_details(candidate, threshold, ranked)
                 event["explanation"] = _build_bridge_event_explanation(
-                    label_id, candidate, len(segments), approx_length,
+                    label_id, candidate, threshold, approx_length, ranked,
                 )
             else:
-                event["explanation"] = (
-                    f"{label_id} is an ASP-generated bridge segment group, but no direct "
-                    "candidate metadata link was available after path merging."
-                )
+                event["explanation"] = f"{label_id} is a bridge whose candidate could not be identified."
         else:
             event["explanation"] = _build_efd_event_explanation(label_id, len(segments), approx_length)
             efd_diag = next(efd_accepted, None)
@@ -257,6 +274,50 @@ def _change_events(
 
         events.append(event)
     return events
+
+
+def _open_ends(
+    extraction: ExtractionResult,
+    candidates: List[ConnectionCandidate],
+    accepted: List[ConnectionCandidate],
+    threshold: float,
+) -> List[Dict[str, Any]]:
+    """Every free stroke end that was left open, with its best candidate and why it was not drawn."""
+    by_endpoint = _candidates_by_endpoint(candidates)
+    used_by = {ep.endpoint_id: c for c in accepted for ep in (c.ep_a, c.ep_b)}
+
+    open_ends: List[Dict[str, Any]] = []
+    for ep in extraction.endpoints:
+        if ep.endpoint_id in used_by:
+            continue
+        entry: Dict[str, Any] = {
+            "endpoint": _endpoint_ref(ep),
+            "coordinates": [round(float(ep.position[0]), 1), round(float(ep.position[1]), 1)],
+        }
+        options = by_endpoint.get(ep.endpoint_id, [])
+        if not options:
+            entry["reason"] = "No other free stroke end lies within reach."
+        else:
+            best = max(options, key=lambda c: (c.probability, -c.id))
+            partner = best.ep_b if best.ep_a.endpoint_id == ep.endpoint_id else best.ep_a
+            entry["best_candidate"] = _candidate_ref(best)
+            described = f"Its most likely bridge, C{best.id} to {_endpoint_name(partner)}, has probability {best.probability:.2f}"
+            if utility(best.score) <= 0:
+                entry["against"] = _reasons(best, -1)
+                entry["reason"] = (
+                    f"{described}, not above the {threshold:.2f} needed to draw it. "
+                    f"Against it: {_reasons_text(entry['against'])}."
+                )
+            elif partner.endpoint_id in used_by:
+                winner = used_by[partner.endpoint_id]
+                entry["reason"] = (
+                    f"{described}, but that end is joined by the more plausible bridge C{winner.id} "
+                    f"(probability {winner.probability:.2f})."
+                )
+            else:
+                entry["reason"] = f"{described}, but the solver found a better overall set of bridges without it."
+        open_ends.append(entry)
+    return open_ends
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -466,12 +527,12 @@ def _build_report(
     image_path: str,
     result: ExtractionResult,
     candidates: List[ConnectionCandidate],
-    candidate_diagnostics: Dict[str, Any],
     accepted: List[ConnectionCandidate],
     final_paths: List[BezierPath],
     events: List[Dict[str, Any]],
+    open_ends: List[Dict[str, Any]],
     efd_phase_summary: Dict[str, Any],
-    dropped_after_sanitize: int,
+    model: ScoringModel,
     stage_timings: Dict[str, float],
     asp_solver_summary: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -482,11 +543,12 @@ def _build_report(
     final_closed = len(final_paths) - final_open
 
     return {
-        "schema_version": "2.1",
+        "schema_version": "3.0",
         "image": {
             "name": os.path.basename(image_path),
             "shape": list(result.image_shape),
             "diagonal_px": round(result.diagonal, 1),
+            "line_width_px": round(result.line_width, 2),
         },
         "summary": {
             "processing_time_s": round(stage_timings["total_pipeline_s"], 3),
@@ -497,6 +559,7 @@ def _build_report(
             "closed_paths_before": extraction_closed,
             "closed_paths_after": final_closed,
             "net_open_path_change": final_open - extraction_open,
+            "free_ends_left_open": len(open_ends),
         },
         "analysis": {
             "extraction": {
@@ -507,26 +570,33 @@ def _build_report(
             },
             "candidate_generation": {
                 "total": len(candidates),
-                "tier_distribution": {
-                    "tier1": sum(1 for c in candidates if c.tier == 1),
-                    "tier2": sum(1 for c in candidates if c.tier == 2),
+                "shape_distribution": dict(Counter(c.shape for c in candidates)),
+                "probability_summary": _numeric_summary([c.probability for c in candidates], digits=4),
+                "above_threshold": sum(1 for c in candidates if utility(c.score) > 0),
+            },
+            "scoring_model": {
+                "threshold": round(float(model.threshold), 4),
+                # log-odds = intercept + sum of weight * (transform(value) - mean) / scale, on the scorecard of the bridge's shape
+                "scorecards": {
+                    shape: {
+                        "intercept": round(float(card.intercept), 4),
+                        "features": {
+                            name: {"meaning": FEATURES[name], "transform": FEATURE_SCALES.get(name, "x"),
+                                   "weight": round(float(weight), 4),
+                                   "mean": round(float(mean), 4), "scale": round(float(scale), 4)}
+                            for name, weight, mean, scale in zip(card.names, card.weights, card.mean, card.scale)
+                        },
+                    }
+                    for shape, card in model.scorecards.items()
                 },
-                "scenario_distribution": dict(Counter(c.scenario for c in candidates)),
-                "score_summary": _numeric_summary([c.score for c in candidates], digits=4),
-                "alignment_summary": _numeric_summary([c.bilateral_alignment for c in candidates], digits=4),
-                "misalignment_deg_summary": _numeric_summary([c.misalignment_deg for c in candidates], digits=2),
-                "diagnostics": candidate_diagnostics,
             },
             "selection": {
                 "accepted_total": len(accepted),
-                "dropped_after_endpoint_sanitize": dropped_after_sanitize,
                 "acceptance_rate_percent": round(len(accepted) / max(len(candidates), 1) * 100, 1),
                 "accepted_candidate_ids": [int(c.id) for c in accepted],
                 "accepted_endpoint_pairs": sorted(_candidate_endpoint_pair_key(c) for c in accepted),
-                "accepted_scenarios": dict(Counter(c.scenario for c in accepted)),
-                "accepted_score_summary": _numeric_summary([c.score for c in accepted], digits=4),
-                "accepted_alignment_summary": _numeric_summary([c.bilateral_alignment for c in accepted], digits=4),
-                "accepted_misalignment_deg_summary": _numeric_summary([c.misalignment_deg for c in accepted], digits=2),
+                "accepted_shapes": dict(Counter(c.shape for c in accepted)),
+                "accepted_probability_summary": _numeric_summary([c.probability for c in accepted], digits=4),
             },
             "asp_solver": asp_solver_summary,
             "restoration_outcome": {
@@ -540,6 +610,7 @@ def _build_report(
             "efd_closure_phase": efd_phase_summary,
         },
         "detailed_events": events,
+        "open_ends": open_ends,
     }
 
 
@@ -549,8 +620,8 @@ def _build_report(
 
 def restore(
     image_path: str,
-    lookahead_fraction: float = 0.15,
-    max_candidates_per_endpoint: int = 5,
+    model_path: str = MODEL_PATH,
+    efd_closure: bool = False,
     efd_gap_threshold: float = 0.30,
     efd_validity_check_enabled: bool = True,
     efd_plausibility_threshold: float = 0.50,
@@ -563,8 +634,10 @@ def restore(
 
     Args:
         image_path: path to the damaged sketch
-        lookahead_fraction: endpoint search radius as fraction of image diagonal
-        max_candidates_per_endpoint: ASP candidate cap per endpoint
+        model_path: the fitted scoring model (see train_scoring.py)
+        efd_closure: also run Phase 6, which closes single-gap contours by
+            symmetry. Off by default: on the test drawings it repaired a few
+            more gaps but drew more line off the drawing than it was worth.
         efd_gap_threshold: max gap/perimeter ratio for EFD closure
         efd_validity_check_enabled: enable semantic plausibility gate in Phase 6
         efd_plausibility_threshold: minimum plausibility score required for Phase 6 closure
@@ -586,6 +659,7 @@ def restore(
         "accepted_id_count_before_decode": 0,
     }
     name = os.path.splitext(os.path.basename(image_path))[0]
+    model = load_model(model_path)
 
     print(f"\n{'=' * 60}")
     print(f"  Restoring: {image_path}")
@@ -596,30 +670,22 @@ def restore(
     with _timed(stage_timings, "phase1_extraction_s"):
         extraction = extract_paths(image_path)
     print(f"    {len(extraction.paths)} paths, "
-          f"{len(extraction.endpoints)} endpoints, "
-          f"diagonal = {extraction.diagonal:.0f}px")
+          f"{len(extraction.endpoints)} free ends, "
+          f"line width = {extraction.line_width:.1f}px")
 
     # Phase 2: Candidate Generation
     print("  Phase 2: Generating connection candidates...")
-    candidate_diagnostics: Dict[str, Any] = {}
     with _timed(stage_timings, "phase2_candidate_generation_s"):
-        candidates = generate_candidates(
-            extraction,
-            lookahead_fraction,
-            max_candidates_per_endpoint,
-            diagnostics=candidate_diagnostics,
-        )
-    t1_count = sum(1 for c in candidates if c.tier == 1)
-    t2_count = sum(1 for c in candidates if c.tier == 2)
-    print(f"    {len(candidates)} candidates (Tier1={t1_count}, Tier2={t2_count})")
+        candidates = generate_candidates(extraction)
+    print(f"    {len(candidates)} candidates")
 
     # Phase 3: Scoring
     print("  Phase 3: Scoring candidates...")
     with _timed(stage_timings, "phase3_scoring_s"):
-        scored = score_candidates(candidates, extraction)
+        scored = score_candidates(candidates, extraction, model)
     if scored:
-        print(f"    Best score: {scored[0].score:.3f}, "
-              f"Worst score: {scored[-1].score:.3f}")
+        print(f"    {sum(1 for c in scored if utility(c.score) > 0)} above the "
+              f"{model.threshold:.2f} probability needed to draw a bridge")
 
     # Phase 4: ASP Decision
     print("  Phase 4: Solving with ASP...")
@@ -645,25 +711,7 @@ def restore(
         + stage_timings["phase4_asp_solving_s"]
         + stage_timings["phase4_asp_decode_s"]
     )
-
-    accepted, dropped_after_sanitize = _sanitize_accepted_candidates(accepted)
     print(f"    {len(accepted)} connections accepted")
-    if dropped_after_sanitize:
-        print(f"    {dropped_after_sanitize} conflicting connection(s) dropped")
-
-    # Phase 4.5: Post-processing Image Mask Filtering
-    exclusion_radius = max(12.0, extraction.diagonal * 0.015)
-    filtered_accepted = [
-        c for c in accepted
-        if not _bridge_crosses_image_mask(
-            c.bridge_points, extraction.dist_map, c.ep_a, c.ep_b,
-            proximity_px=4.0, exclusion_radius=exclusion_radius,
-        )
-    ]
-    if len(filtered_accepted) < len(accepted):
-        print(f"    {len(accepted) - len(filtered_accepted)} connection(s) dropped "
-              f"by strict image mask post-processing")
-        accepted = filtered_accepted
 
     # Phase 5: Synthesis
     print("  Phase 5: Synthesizing bridges...")
@@ -672,27 +720,31 @@ def restore(
         restored_paths = merge_restored_paths(extraction.paths, accepted)
     print(f"    {len(bridges)} bridge segment(s) created")
 
-    # Phase 6: EFD Gap Closure
-    print("  Phase 6: EFD single-gap closure...")
+    # Phase 6: EFD Gap Closure (only if asked for)
+    final_paths: List[BezierPath] = list(restored_paths)
+    efd_phase_diagnostics: List[Dict[str, Any]] = []
     with _timed(stage_timings, "phase6_efd_closure_s"):
-        final_paths, efd_phase_diagnostics = close_single_gaps(
-            restored_paths, efd_gap_threshold,
-            validity_check_enabled=efd_validity_check_enabled,
-            plausibility_threshold=efd_plausibility_threshold,
-            min_gap_for_validity_check=efd_min_gap_for_validity_check,
-        )
-    closed_by_efd = (
-        sum(1 for p in final_paths if p.is_closed)
-        - sum(1 for p in restored_paths if p.is_closed)
-    )
-    print(f"    {max(0, closed_by_efd)} path(s) closed by EFD")
+        if efd_closure:
+            print("  Phase 6: EFD single-gap closure...")
+            final_paths, efd_phase_diagnostics = close_single_gaps(
+                restored_paths, efd_gap_threshold,
+                validity_check_enabled=efd_validity_check_enabled,
+                plausibility_threshold=efd_plausibility_threshold,
+                min_gap_for_validity_check=efd_min_gap_for_validity_check,
+            )
+            closed_by_efd = (
+                sum(1 for p in final_paths if p.is_closed)
+                - sum(1 for p in restored_paths if p.is_closed)
+            )
+            print(f"    {max(0, closed_by_efd)} path(s) closed by EFD")
 
     # Phase 7: Output
     with _timed(stage_timings, "phase7_output_s"):
         # Ensure visual order for labeling (top-down, left-right)
         final_paths.sort(key=visual_order_key)
 
-        events = _change_events(final_paths, accepted, efd_phase_diagnostics)
+        events = _change_events(final_paths, scored, accepted, model.threshold, efd_phase_diagnostics)
+        open_ends = _open_ends(extraction, scored, accepted, model.threshold)
         if save_images:
             _save_overlay(image_path, final_paths, output_dir, labeled=True)
             _save_overlay(image_path, final_paths, output_dir, labeled=False)
@@ -704,15 +756,15 @@ def restore(
     report = _build_report(
         image_path,
         extraction,
-        candidates,
-        candidate_diagnostics,
+        scored,
         accepted,
         final_paths,
         events,
-        _build_efd_phase_summary(
+        open_ends,
+        {"enabled": bool(efd_closure), **_build_efd_phase_summary(
             efd_phase_diagnostics, efd_validity_check_enabled, efd_plausibility_threshold,
-        ),
-        dropped_after_sanitize,
+        )},
+        model,
         stage_timings,
         asp_solver_summary,
     )

@@ -34,7 +34,7 @@ def evaluate_image(damaged_path: str, orig_path: str, tail_len=20):
     if not dmg_ext.paths:
         return out
 
-    candidates = generate_candidates(dmg_ext, lookahead_fraction=0.15, max_per_endpoint=5)
+    candidates = generate_candidates(dmg_ext)
     scored = score_candidates(candidates, dmg_ext)
     accepted_ids, _ = solve_candidates(scored)
     accepted_ids_set = set(accepted_ids)
