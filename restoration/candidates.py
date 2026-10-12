@@ -7,7 +7,7 @@ with support for both straight and curved extrapolation.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -414,32 +414,40 @@ def _test_extension_intersection_linear(
     return pt
 
 
+def _extrapolate_endpoint(
+    ep: EndpointInfo, path: BezierPath, steps: int, dt: float,
+    cache: Optional[Dict[Tuple[int, str, int, float], np.ndarray]] = None,
+) -> np.ndarray:
+    """Points continuing *path* beyond the endpoint *ep*.
+
+    They depend only on the endpoint, so a *cache* dict shared across the
+    pairs of one image avoids recomputing them for every partner.
+    """
+    key = (ep.path_index, ep.end, steps, dt)
+    if cache is not None and key in cache:
+        return cache[key]
+
+    # Extrapolate the terminal segment at that end of the path.
+    if ep.end == "end":
+        points = _extrapolate_bezier(path.segments[-1].control_points, "forward", steps=steps, dt=dt)
+    else:
+        points = _extrapolate_bezier(path.segments[0].control_points, "backward", steps=steps, dt=dt)
+    if cache is not None:
+        cache[key] = points
+    return points
+
+
 def _test_extension_intersection_curved(
     ep_a: EndpointInfo, ep_b: EndpointInfo,
     path_a: BezierPath, path_b: BezierPath,
     convergence_threshold: float,
     steps: int = 15,
     dt: float = 0.05,
+    cache: Optional[Dict[Tuple[int, str, int, float], np.ndarray]] = None,
 ) -> Optional[np.ndarray]:
     """Extrapolate both curves beyond their endpoints, find convergence."""
-    # Get the relevant terminal segment
-    if ep_a.end == "end":
-        cp_a = path_a.segments[-1].control_points
-        dir_a = "forward"
-    else:
-        cp_a = path_a.segments[0].control_points
-        dir_a = "backward"
-
-    if ep_b.end == "end":
-        cp_b = path_b.segments[-1].control_points
-        dir_b = "forward"
-    else:
-        cp_b = path_b.segments[0].control_points
-        dir_b = "backward"
-
-    ext_a = _extrapolate_bezier(cp_a, dir_a, steps=steps, dt=dt)
-    ext_b = _extrapolate_bezier(cp_b, dir_b, steps=steps, dt=dt)
-
+    ext_a = _extrapolate_endpoint(ep_a, path_a, steps, dt, cache)
+    ext_b = _extrapolate_endpoint(ep_b, path_b, steps, dt, cache)
     return _nearest_approach(ext_a, ext_b, convergence_threshold)
 
 
@@ -448,6 +456,7 @@ def _find_extension_intersection(
     path_a: BezierPath, path_b: BezierPath,
     max_reach: float,
     convergence_threshold: float,
+    cache: Optional[Dict[Tuple[int, str, int, float], np.ndarray]] = None,
 ) -> Optional[np.ndarray]:
     """Linear tangent-ray intersection, falling back to curved extrapolation."""
     intersection = _test_extension_intersection_linear(ep_a, ep_b, max_reach)
@@ -455,6 +464,7 @@ def _find_extension_intersection(
         intersection = _test_extension_intersection_curved(
             ep_a, ep_b, path_a, path_b,
             convergence_threshold=convergence_threshold,
+            cache=cache,
         )
     return intersection
 
@@ -463,69 +473,74 @@ def _find_extension_intersection(
 # Bridge-body crossing filter
 # ═══════════════════════════════════════════════════════════════════════════
 
+class PathBodies(NamedTuple):
+    """Sampled bodies of all paths, with their bounding boxes, for proximity tests."""
+
+    indices: List[int]            # path index of each body, ascending
+    samples: List[np.ndarray]     # (N, 2) points of each body
+    mins: np.ndarray              # (K, 2) bounding-box minimum of each body
+    maxs: np.ndarray              # (K, 2) bounding-box maximum of each body
+
+
 def _build_path_samples_cache(
     paths: List[BezierPath],
     pts_per_segment: int = 16,
-) -> Dict[int, np.ndarray]:
+) -> PathBodies:
     """Pre-sample all path bodies for fast proximity tests."""
-    cache: Dict[int, np.ndarray] = {}
+    indices: List[int] = []
+    samples: List[np.ndarray] = []
     for idx, path in enumerate(paths):
         if not path.segments:
             continue
         pts = path.sample(pts_per_segment=pts_per_segment)
         if len(pts) >= 2:
-            cache[idx] = pts
-    return cache
+            indices.append(idx)
+            samples.append(pts)
+    mins = np.array([np.min(pts, axis=0) for pts in samples]).reshape(-1, 2)
+    maxs = np.array([np.max(pts, axis=0) for pts in samples]).reshape(-1, 2)
+    return PathBodies(indices, samples, mins, maxs)
 
 
 def _bridge_crosses_paths(
     bridge_points: np.ndarray,
-    path_samples: Dict[int, np.ndarray],
+    bodies: PathBodies,
     exclude_path_indices: Set[int],
     proximity_px: float = 4.0,
 ) -> int:
-    """Count how many distinct path bodies the bridge passes near.
+    """Count how many distinct path bodies the bridge passes near, up to two.
 
     A bridge is considered to "cross" a path if any bridge sample point
     is within *proximity_px* of any path body sample point, for paths
-    not in *exclude_path_indices*.
-
-    Returns the number of distinct crossed path indices.
+    not in *exclude_path_indices*. Counting stops at two.
     """
     if len(bridge_points) < 2:
         return 0
 
-    crossed: Set[int] = set()
-    for path_idx, body_pts in path_samples.items():
-        if path_idx in exclude_path_indices:
+    # Bounding-box pre-filter to avoid expensive distance checks.
+    bridge_min = np.min(bridge_points, axis=0)
+    bridge_max = np.max(bridge_points, axis=0)
+    separated = (
+        (bridge_max[0] + proximity_px < bodies.mins[:, 0])
+        | (bodies.maxs[:, 0] + proximity_px < bridge_min[0])
+        | (bridge_max[1] + proximity_px < bodies.mins[:, 1])
+        | (bodies.maxs[:, 1] + proximity_px < bridge_min[1])
+    )
+
+    # Subsample bridge for speed if it has many points.
+    bp = bridge_points
+    if len(bp) > 30:
+        bp = bp[::max(1, len(bp) // 30)]
+
+    crossed = 0
+    for k in np.flatnonzero(~separated):
+        if bodies.indices[k] in exclude_path_indices:
             continue
-        if len(body_pts) < 2:
-            continue
+        if float(np.min(cdist(bp, bodies.samples[k]))) < proximity_px:
+            crossed += 1
+            if crossed >= 2:
+                break
 
-        # Quick AABB pre-filter to avoid expensive distance checks.
-        bridge_min = np.min(bridge_points, axis=0)
-        bridge_max = np.max(bridge_points, axis=0)
-        body_min = np.min(body_pts, axis=0)
-        body_max = np.max(body_pts, axis=0)
-        if (bridge_max[0] + proximity_px < body_min[0]
-                or body_max[0] + proximity_px < bridge_min[0]
-                or bridge_max[1] + proximity_px < body_min[1]
-                or body_max[1] + proximity_px < bridge_min[1]):
-            continue
-
-        # Subsample bridge for speed if it has many points.
-        bp = bridge_points
-        if len(bp) > 30:
-            step = max(1, len(bp) // 30)
-            bp = bp[::step]
-
-        D = cdist(bp, body_pts)
-        if float(np.min(D)) < proximity_px:
-            crossed.add(path_idx)
-            if len(crossed) >= 2:
-                return len(crossed)
-
-    return len(crossed)
+    return crossed
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -633,6 +648,7 @@ def generate_candidates(
 
     # Pre-sample all path bodies for bridge-crossing checks.
     path_samples_cache = _build_path_samples_cache(result.paths, pts_per_segment=16)
+    extrapolations: Dict[Tuple[int, str, int, float], np.ndarray] = {}
     # Distance threshold for strict (>=1) crossing suppression:
     # bridges shorter than this use the lenient (>=2) threshold.
     crossing_long_threshold = max(120.0, result.diagonal * 0.05)
@@ -831,7 +847,7 @@ def generate_candidates(
                 if diagnostics is not None:
                     # Only the diagnostics care whether the rejected rays would have met.
                     has_intersection = _find_extension_intersection(
-                        ep_a, ep_b, path_a, path_b, max_reach, convergence_threshold,
+                        ep_a, ep_b, path_a, path_b, max_reach, convergence_threshold, extrapolations,
                     ) is not None
                     if has_intersection:
                         reasons.append("cross_direction_gate_with_intersection")
@@ -866,7 +882,7 @@ def generate_candidates(
                 # --- Scenario 2: Extension Intersection ---
                 scenario = "extension_intersection"
                 intersection = _find_extension_intersection(
-                    ep_a, ep_b, path_a, path_b, max_reach, convergence_threshold,
+                    ep_a, ep_b, path_a, path_b, max_reach, convergence_threshold, extrapolations,
                 )
                 fields = dict(fields_ext, intersection_available=intersection is not None)
                 if intersection is None:
