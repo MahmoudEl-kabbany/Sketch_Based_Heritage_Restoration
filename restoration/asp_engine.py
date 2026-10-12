@@ -12,7 +12,6 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List, Set, Tuple
 
-import cv2
 import numpy as np
 
 from restoration.candidates import ConnectionCandidate
@@ -39,39 +38,8 @@ def _to_int_score(value: float, scale: int = 100) -> int:
     return max(0, min(scale, int(round(value * scale))))
 
 
-def _compute_nested_shape_pairs(
-    candidates: List[ConnectionCandidate],
-    extraction: "ExtractionResult",
-) -> Set[Tuple[int, int]]:
-    """Path pairs where one path starts inside the convex hull of the other, closed, path."""
-    hulls = {}
-    for i, path in enumerate(extraction.paths):
-        if not path.is_closed or not path.segments:
-            continue
-        samples = path.sample(20)
-        if len(samples) > 2:
-            hulls[i] = cv2.convexHull(samples.astype(np.float32))
-
-    nested_pairs = set()
-    for c in candidates:
-        idx_a = int(c.ep_a.path_index)
-        idx_b = int(c.ep_b.path_index)
-        if idx_a == idx_b:
-            continue
-
-        for inner, outer in ((idx_a, idx_b), (idx_b, idx_a)):
-            inner_segments = extraction.paths[inner].segments
-            if outer in hulls and inner_segments:
-                pt = inner_segments[0].control_points[0]
-                if cv2.pointPolygonTest(hulls[outer], (float(pt[0]), float(pt[1])), False) >= 0:
-                    nested_pairs.add((min(idx_a, idx_b), max(idx_a, idx_b)))
-
-    return nested_pairs
-
-
 def encode_facts(
     candidates: List[ConnectionCandidate],
-    nested_pairs: Set[Tuple[int, int]] = None,
 ) -> str:
     """Convert scored candidates into ASP fact strings."""
     lines: List[str] = []
@@ -95,11 +63,6 @@ def encode_facts(
         lines.append(f"candidate_utility({c.id},{utility}).")
 
         lines.append("")
-
-    if nested_pairs:
-        for pa, pb in nested_pairs:
-            lines.append(f"nested_shape({pa},{pb}).")
-            lines.append(f"nested_shape({pb},{pa}).")
 
     return "\n".join(lines)
 
@@ -261,7 +224,6 @@ def _solve_facts(
 
 def solve_candidates(
     candidates: List[ConnectionCandidate],
-    extraction: "ExtractionResult",
     rules_path: str = RULES_PATH,
     max_solutions: int = 1,
     timeout_s: float = 30.0,
@@ -274,11 +236,10 @@ def solve_candidates(
     """
     start_total = time.perf_counter()
 
-    nested_pairs = _compute_nested_shape_pairs(candidates, extraction)
     working, pruned_count = _prune_strictly_dominated_candidates(list(candidates))
 
     t_encode = time.perf_counter()
-    facts = encode_facts(working, nested_pairs)
+    facts = encode_facts(working)
     encoding_time_s = time.perf_counter() - t_encode
 
     t_solve = time.perf_counter()

@@ -625,7 +625,6 @@ def restore(
     if scored:
         accepted_ids, solver_summary = solve_candidates(
             scored,
-            extraction,
             RULES_PATH,
             timeout_s=asp_timeout_s,
         )

@@ -34,7 +34,7 @@ def evaluate_image(damaged_path: str, orig_path: str, tail_len=20):
 
     candidates = generate_candidates(dmg_ext, lookahead_fraction=0.15, max_per_endpoint=5)
     scored = score_candidates(candidates, dmg_ext)
-    accepted_ids, _ = solve_candidates(scored, dmg_ext)
+    accepted_ids, _ = solve_candidates(scored)
     accepted_ids_set = set(accepted_ids)
 
     # Sample the original's paths and remember which path each sample came from.
