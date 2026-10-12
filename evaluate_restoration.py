@@ -8,6 +8,7 @@ Usage:
     python evaluate_restoration.py                  # run all 32 pairs
     python evaluate_restoration.py --limit 5        # run first 5 pairs only
     python evaluate_restoration.py --filter ankh    # run only pairs matching 'ankh'
+    python evaluate_restoration.py --save-images    # also write the overlay figures
 """
 
 from __future__ import annotations
@@ -178,6 +179,7 @@ def evaluate_single(
     original_path: str,
     damaged_path: str,
     output_dir: str = OUTPUT_DIR,
+    save_images: bool = False,
 ) -> ImageMetrics:
     """Run restoration on one image pair and compute metrics.
 
@@ -186,6 +188,7 @@ def evaluate_single(
         original_path: Path to the ground truth original image.
         damaged_path: Path to the damaged image.
         output_dir: Directory to save outputs.
+        save_images: Also write the pipeline's overlay and comparison figures.
 
     Returns:
         ImageMetrics with before/after PSNR and SSIM.
@@ -211,7 +214,7 @@ def evaluate_single(
     # Run restoration
     t0 = time.perf_counter()
     try:
-        result = restore(damaged_path, output_dir=output_dir)
+        result = restore(damaged_path, output_dir=output_dir, save_images=save_images)
     except Exception as e:
         metrics.restoration_time_s = time.perf_counter() - t0
         metrics.error = f"Restoration failed: {e}"
@@ -454,6 +457,10 @@ def main() -> None:
         "--output-dir", type=str, default=OUTPUT_DIR,
         help="Directory for output files.",
     )
+    parser.add_argument(
+        "--save-images", action="store_true",
+        help="Also write the pipeline's overlay and comparison figures for each image.",
+    )
     args = parser.parse_args()
 
     # Discover pairs
@@ -476,7 +483,8 @@ def main() -> None:
 
     for i, (name, orig_path, dmg_path) in enumerate(pairs, 1):
         print(f"\n  [{i}/{len(pairs)}] Processing: {name}")
-        metrics = evaluate_single(name, orig_path, dmg_path, output_dir=args.output_dir)
+        metrics = evaluate_single(name, orig_path, dmg_path, output_dir=args.output_dir,
+                                  save_images=args.save_images)
         results.append(metrics)
         print_table_row(metrics)
 

@@ -553,6 +553,7 @@ def restore(
     efd_min_gap_for_validity_check: float = 3.0,
     output_dir: str = OUTPUT_DIR,
     asp_timeout_s: float = 30.0,
+    save_images: bool = True,
 ) -> RestorationResult:
     """Restore a single damaged sketch image.
 
@@ -566,6 +567,8 @@ def restore(
         efd_min_gap_for_validity_check: bypass plausibility check for tiny gaps (pixels)
         output_dir: where to save visualization outputs
         asp_timeout_s: max time in seconds for the ASP solver
+        save_images: write the two overlays and the comparison figure; the
+            JSON report is written either way
 
     Returns:
         RestorationResult with original paths, restored paths, bridges, and report
@@ -686,9 +689,10 @@ def restore(
         final_paths.sort(key=visual_order_key)
 
         events = _change_events(final_paths, accepted, efd_phase_diagnostics)
-        _save_overlay(image_path, final_paths, output_dir, labeled=True)
-        _save_overlay(image_path, final_paths, output_dir, labeled=False)
-        _save_visualization(image_path, extraction.paths, final_paths, output_dir)
+        if save_images:
+            _save_overlay(image_path, final_paths, output_dir, labeled=True)
+            _save_overlay(image_path, final_paths, output_dir, labeled=False)
+            _save_visualization(image_path, extraction.paths, final_paths, output_dir)
 
     elapsed = time.perf_counter() - t0
     stage_timings["total_pipeline_s"] = elapsed
