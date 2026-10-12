@@ -166,15 +166,15 @@ def merge_restored_paths(
     Returns the new set of paths (some merged, some untouched).
     """
     # A component is a chain of segments plus the tokens of its two free ends.
-    # A token is the (path_index, end) of an original open path end; it is None
-    # for closed paths and once a bridge has closed the component.
+    # A token is the (path_index, end) of an original free path end; it is None
+    # for an end on a junction, for closed paths, and once a bridge has used it.
     active: Dict[int, Dict[str, Any]] = {}
     for i, path in enumerate(original_paths):
         is_open = not path.is_closed and bool(path.segments)
         active[i] = {
             "segments": list(path.segments),
-            "start_token": (i, "start") if is_open else None,
-            "end_token": (i, "end") if is_open else None,
+            "start_token": (i, "start") if is_open and path.start_free else None,
+            "end_token": (i, "end") if is_open and path.end_free else None,
         }
 
     def component_with(token: Tuple[int, str]) -> Optional[int]:
@@ -229,6 +229,8 @@ def merge_restored_paths(
             segments=segs,
             is_closed=is_closed,
             source_type="restored",
+            start_free=comp["start_token"] is not None,
+            end_free=comp["end_token"] is not None,
         ))
 
     return result

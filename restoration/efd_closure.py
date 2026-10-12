@@ -445,7 +445,7 @@ def close_single_gaps(
     """Detect and close single-gap contours.
 
     A path qualifies if:
-      - It is open (not already closed)
+      - It is open (not already closed) and both of its ends are free
       - Its start and end points are within gap_threshold * perimeter of each other
         (default 0.30 = Tier 3 large-gap support)
       - It has enough segments to be a meaningful shape
@@ -459,7 +459,7 @@ def close_single_gaps(
 
     for path_index, path in enumerate(paths):
         result.append(path)  # replaced below if the path gets closed
-        if path.is_closed or len(path.segments) < 3:
+        if path.is_closed or len(path.segments) < 3 or not (path.start_free and path.end_free):
             continue
 
         start_pt = path.segments[0].control_points[0]

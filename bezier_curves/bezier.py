@@ -24,6 +24,16 @@ import sknw
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
 
+# Sizes used while extracting paths are multiples of the local stroke radius,
+# so that thin and thick drawings are treated alike.
+#  - A terminal skeleton branch no longer than this many radii does not reach
+#    beyond the body of the stroke it hangs off: it is a thinning artefact.
+SPUR_RADIUS_FACTOR = 1.5
+#  - A skeleton cannot be trusted within one radius of a stroke's free end.
+END_TRIM_RADII = 1.0
+#  - Blobs smaller than this many squared line widths are specks, not strokes.
+SPECK_AREA_WIDTHS2 = 0.5
+
 # sknw compiles its numba functions without an on-disk cache, which costs a few
 # seconds in every new process. Turn the cache on so only the first run compiles.
 for _name in ("mark", "idx2rc", "fill", "trace", "parse_struc"):
@@ -74,6 +84,10 @@ class BezierPath:
     segments: List[BezierSegment] = field(default_factory=list)
     is_closed: bool = False
     source_type: str = "unknown"
+    # A free end is where a stroke stops; an end that is not free sits on a
+    # junction with other strokes and is connected, not open.
+    start_free: bool = True
+    end_free: bool = True
 
     @property
     def control_points(self) -> np.ndarray:
@@ -98,6 +112,7 @@ class BezierPath:
         for seg in self.segments:
             seg.reverse()
         self.segments = self.segments[::-1]
+        self.start_free, self.end_free = self.end_free, self.start_free
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -456,6 +471,8 @@ class _SkeletonChain:
     points: np.ndarray
     node_sequence: List[int]
     is_closed: bool
+    start_free: bool = False   # the chain starts at a degree-1 node of the skeleton graph
+    end_free: bool = False     # ... and ends at one
 
 
 def _safe_normalize_vector(vec: np.ndarray) -> np.ndarray:
@@ -625,10 +642,15 @@ def _walk_skeleton_chain(
     if len(chain_points) < 2:
         return None
 
+    # A chain that returns to its first node is a loop, whatever else meets there.
+    end_node = node_sequence[-1]
+    closed = closed or (end_node == start_node and len(chain_points) > 2)
     return _SkeletonChain(
         points=np.asarray(chain_points, dtype=np.float64),
         node_sequence=node_sequence,
         is_closed=closed,
+        start_free=not closed and degree_map.get(start_node, 0) == 1,
+        end_free=not closed and degree_map.get(end_node, 0) == 1,
     )
 
 
@@ -687,27 +709,43 @@ def _build_skeleton_chains(
     return chains
 
 
-def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
-    """Remove short terminal branches (spurs) often created by corners."""
+def _radius_at(radius_map: np.ndarray, xy: np.ndarray, fallback: float) -> float:
+    """Local stroke radius (distance to the background) at an (x, y) position."""
+    h, w = radius_map.shape
+    x, y = int(round(float(xy[0]))), int(round(float(xy[1])))
+    if 0 <= x < w and 0 <= y < h and radius_map[y, x] > 0:
+        return float(radius_map[y, x])
+    return fallback
+
+
+def _prune_skeleton_spurs(graph: Any, radius_map: np.ndarray, fallback_radius: float) -> None:
+    """Remove terminal branches that do not reach beyond the stroke they hang off.
+
+    Thinning leaves short branches at corners, bumps and blunt stroke ends. Such
+    a branch is no longer than about one stroke radius at its junction, while a
+    real stroke stub sticks out of the stroke's body.
+    """
+    is_multi = hasattr(graph, "is_multigraph") and graph.is_multigraph()
     changed = True
     while changed:
         changed = False
         degrees = dict(graph.degree())
-        edges_to_remove = []
-
-        is_multi = hasattr(graph, "is_multigraph") and graph.is_multigraph()
         edges = graph.edges(keys=True, data=True) if is_multi else graph.edges(data=True)
 
+        edges_to_remove = []
         for edge in edges:
             u, v = edge[0], edge[1]
-            deg_u, deg_v = degrees.get(u, 0), degrees.get(v, 0)
-
-            if (deg_u == 1 and deg_v > 1) or (deg_v == 1 and deg_u > 1):
-                data = edge[3] if is_multi else edge[2]
-                pts = data.get("pts", [])
-
-                if len(pts) <= threshold_length:
-                    edges_to_remove.append(edge)
+            if degrees.get(u, 0) == 1 and degrees.get(v, 0) >= 3:
+                junction = v
+            elif degrees.get(v, 0) == 1 and degrees.get(u, 0) >= 3:
+                junction = u
+            else:
+                continue
+            pts = np.asarray(edge[-1].get("pts", []), dtype=np.float64)
+            length = float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1))) if len(pts) >= 2 else 0.0
+            limit = SPUR_RADIUS_FACTOR * _radius_at(radius_map, _node_xy(graph, junction), fallback_radius)
+            if length <= limit:
+                edges_to_remove.append(edge)
 
         for edge in edges_to_remove:
             if is_multi:
@@ -717,80 +755,52 @@ def _prune_skeleton_spurs(graph: Any, threshold_length: float = 15.0) -> None:
             changed = True
 
 
-def _merge_connected_paths(paths: List[BezierPath], merge_radius: float) -> List[BezierPath]:
-    """Merge separate paths that connect end-to-end into single BezierPath objects."""
-    if not paths:
-        return []
+def _trim_free_ends(chain: _SkeletonChain, radius_map: np.ndarray, fallback_radius: float) -> np.ndarray:
+    """Chain points without the stretch within one stroke radius of each free end.
 
-    merged = list(paths)
-    changed = True
+    Near a stroke's end the skeleton bends towards the outline and says little
+    about the stroke's direction. Ends on a junction are kept as they are.
+    """
+    pts = chain.points
+    steps = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    max_drop = len(pts) // 4   # never trim away more than a quarter of the chain per end
 
-    while changed:
-        changed = False
-        best_pair = None
-        best_dist = float('inf')
-        best_config = None
+    def points_within(radius: float, step_lengths: np.ndarray) -> int:
+        return min(int(np.searchsorted(np.cumsum(step_lengths), END_TRIM_RADII * radius)), max_drop)
 
-        n = len(merged)
-        for i in range(n):
-            for j in range(i + 1, n):
-                p_i = merged[i]
-                p_j = merged[j]
+    first = points_within(_radius_at(radius_map, pts[0], fallback_radius), steps) if chain.start_free else 0
+    last = points_within(_radius_at(radius_map, pts[-1], fallback_radius), steps[::-1]) if chain.end_free else 0
+    return pts[first:len(pts) - last]
 
-                if not p_i.segments or not p_j.segments:
-                    continue
-                if p_i.is_closed or p_j.is_closed:
-                    continue
 
-                i_start = p_i.segments[0].control_points[0]
-                i_end = p_i.segments[-1].control_points[3]
-                j_start = p_j.segments[0].control_points[0]
-                j_end = p_j.segments[-1].control_points[3]
+def stroke_geometry(image_path: str) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Binarize a sketch and measure its strokes.
 
-                configs = [
-                    (np.linalg.norm(i_end - j_start), False, False),
-                    (np.linalg.norm(i_end - j_end), False, True),
-                    (np.linalg.norm(i_start - j_start), True, False),
-                    (np.linalg.norm(i_start - j_end), True, True)
-                ]
+    Returns (binary, radius_map, line_width): the stroke mask (255 on strokes)
+    with specks removed, the distance of every stroke pixel to the background,
+    and the typical line width (twice the median radius along the skeleton).
+    """
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(f"Cannot read image: {image_path}")
 
-                for dist, rev_i, rev_j in configs:
-                    if dist <= merge_radius and dist < best_dist:
-                        best_dist = dist
-                        best_pair = (i, j)
-                        best_config = (rev_i, rev_j)
+    _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-        if best_pair is not None:
-            i, j = best_pair
-            rev_i, rev_j = best_config
-            p_i, p_j = merged[i], merged[j]
+    def measure(mask: np.ndarray) -> Tuple[np.ndarray, float]:
+        radius_map = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+        on_skeleton = radius_map[skeletonize(mask > 0)]
+        return radius_map, (2.0 * float(np.median(on_skeleton)) if len(on_skeleton) else 2.0)
 
-            if rev_i: p_i.reverse()
-            if rev_j: p_j.reverse()
+    radius_map, line_width = measure(binary)
 
-            midpoint = (p_i.segments[-1].control_points[3] + p_j.segments[0].control_points[0]) / 2.0
-            p_i.segments[-1].control_points[3] = midpoint
-            p_j.segments[0].control_points[0] = midpoint
+    # Remove specks: blobs much smaller than a piece of stroke one line width long.
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    specks = [i for i in range(1, count) if stats[i, cv2.CC_STAT_AREA] < SPECK_AREA_WIDTHS2 * line_width ** 2]
+    if specks:
+        binary[np.isin(labels, specks)] = 0
+        radius_map, line_width = measure(binary)
 
-            new_path = BezierPath(
-                segments=p_i.segments + p_j.segments,
-                is_closed=False,
-                source_type=p_i.source_type
-            )
-
-            d_close = np.linalg.norm(new_path.segments[0].control_points[0] - new_path.segments[-1].control_points[3])
-            if d_close <= merge_radius:
-                new_path.is_closed = True
-                midpoint = (new_path.segments[0].control_points[0] + new_path.segments[-1].control_points[3]) / 2.0
-                new_path.segments[0].control_points[0] = midpoint
-                new_path.segments[-1].control_points[3] = midpoint
-
-            merged.pop(j)
-            merged.pop(i)
-            merged.append(new_path)
-            changed = True
-
-    return merged
+    return binary, radius_map, line_width
 
 
 def fit_from_image_skeleton(
@@ -798,22 +808,21 @@ def fit_from_image_skeleton(
     max_error: float = 2.0,
     tangent_lookahead: int = 8,
     straightness_scale: float = 0.75,
-    merge_radius: float = 5.0,
     follow_junction_continuation: bool = True,
     junction_min_alignment: float = -0.15,
-    spur_threshold: float = 25.0,
+    geometry: Optional[Tuple[np.ndarray, np.ndarray, float]] = None,
 ) -> List[BezierPath]:
-    """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths."""
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise FileNotFoundError(f"Cannot read image: {image_path}")
+    """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths.
 
-    _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    binary = cv2.medianBlur(binary, 5)
-    skeleton = skeletonize(binary / 255.0).astype(np.uint8)
-    graph = sknw.build_sknw(skeleton)
+    Each path records whether its ends are free (the stroke stops there) or
+    sit on a junction with other strokes. *geometry* is the result of
+    stroke_geometry(image_path) if the caller already has it.
+    """
+    binary, radius_map, line_width = geometry or stroke_geometry(image_path)
+    graph = sknw.build_sknw(skeletonize(binary > 0).astype(np.uint8))
 
-    _prune_skeleton_spurs(graph, threshold_length=spur_threshold)
+    fallback_radius = line_width / 2.0
+    _prune_skeleton_spurs(graph, radius_map, fallback_radius)
 
     chains = _build_skeleton_chains(
         graph,
@@ -824,13 +833,7 @@ def fit_from_image_skeleton(
     paths: List[BezierPath] = []
     lookahead = max(1, int(tangent_lookahead))
     for chain in chains:
-        pts = chain.points
-        
-        # Trim terminal hooks from open paths (3 pixels from each end)
-        trim_len = 3
-        if not chain.is_closed and len(pts) > (trim_len * 2) + 2:
-            pts = pts[trim_len:-trim_len]
-
+        pts = _trim_free_ends(chain, radius_map, fallback_radius)
         if len(pts) < 2:
             continue
 
@@ -853,10 +856,12 @@ def fit_from_image_skeleton(
                 segments=segments,
                 is_closed=chain.is_closed,
                 source_type="skeleton",
+                start_free=chain.start_free,
+                end_free=chain.end_free,
             )
         )
 
-    return _merge_connected_paths(paths, merge_radius=merge_radius)
+    return paths
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -955,7 +960,8 @@ def _print_summary(paths: List[BezierPath], label: str) -> None:
     print(f"  Paths: {len(paths)}  |  Total segments: {total_segs}")
     for i, p in enumerate(paths):
         status = "closed" if p.is_closed else "open"
-        print(f"    Path {i}: {p.num_segments} segments ({status})")
+        free = sum((p.start_free, p.end_free)) if not p.is_closed else 0
+        print(f"    Path {i}: {p.num_segments} segments ({status}, {free} free end(s))")
     print(f"{'═' * 60}\n")
 
 
@@ -972,10 +978,6 @@ if __name__ == "__main__":
                         help="Maximum geometric error (pixels) before splitting")
     parser.add_argument("--straightness-scale", type=float, default=0.75,
                         help="Near-straight tolerance scale (higher favors straight cubics)")
-    parser.add_argument("--merge-radius", type=float, default=5.0,
-                        help="Maximum pixel distance to merge endpoints")
-    parser.add_argument("--spur-threshold", type=float, default=25.0,
-                        help="Maximum length of branches to prune")
     args = parser.parse_args()
 
     paths = fit_from_image_skeleton(
@@ -983,8 +985,6 @@ if __name__ == "__main__":
         max_error=args.max_error,
         tangent_lookahead=args.tangent_lookahead,
         straightness_scale=args.straightness_scale,
-        merge_radius=args.merge_radius,
-        spur_threshold=args.spur_threshold,
     )
     label = f"Skeleton fitting: {args.image_path}"
 

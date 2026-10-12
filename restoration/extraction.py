@@ -11,7 +11,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-from bezier_curves.bezier import BezierPath, fit_from_image_skeleton
+from bezier_curves.bezier import BezierPath, fit_from_image_skeleton, stroke_geometry
 from restoration.geometry import (
     bezier_derivative,
     endpoint_curvature,
@@ -26,7 +26,7 @@ from restoration.geometry import (
 
 @dataclass
 class EndpointInfo:
-    """Geometric descriptor for one end of a BezierPath."""
+    """Geometric descriptor for one free end of a BezierPath."""
 
     endpoint_id: int        # stable endpoint identity within one extraction
     path_index: int          # index into ExtractionResult.paths
@@ -35,6 +35,7 @@ class EndpointInfo:
     tangent: np.ndarray      # unit tangent pointing *outward* from the path
     curvature: float         # unsigned curvature κ at this endpoint
     tangent_confidence: float = 1.0  # confidence in endpoint tangent direction
+    radius: float = 1.0      # local stroke radius (half the stroke width) at this end
 
 
 @dataclass
@@ -42,10 +43,11 @@ class ExtractionResult:
     """Everything extracted from one image."""
 
     paths: List[BezierPath]
-    endpoints: List[EndpointInfo]
+    endpoints: List[EndpointInfo]  # free ends only: where a stroke stops
     image_shape: Tuple[int, int]   # (h, w)
     diagonal: float                # sqrt(h² + w²)
-    dist_map: Optional[np.ndarray] = None  # distance map from lines
+    dist_map: Optional[np.ndarray] = None  # distance of every pixel to the nearest stroke
+    line_width: float = 2.0        # typical stroke width of the drawing, in pixels
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -167,30 +169,43 @@ def _compute_endpoint_tangent(path: BezierPath, end: str) -> Tuple[np.ndarray, f
     return tangent, confidence
 
 
-def _extract_endpoints(paths: List[BezierPath]) -> List[EndpointInfo]:
-    """Build EndpointInfo objects for every open path's start and end."""
+def _extract_endpoints(
+    paths: List[BezierPath],
+    radius_map: np.ndarray,
+    fallback_radius: float,
+) -> List[EndpointInfo]:
+    """Build an EndpointInfo for every free end of every open path.
+
+    An end that sits on a junction is connected to other strokes and is not a
+    place where a stroke could be missing.
+    """
+    h, w = radius_map.shape
     endpoints: List[EndpointInfo] = []
-    next_endpoint_id = 0
     for idx, path in enumerate(paths):
         if path.is_closed or not path.segments:
             continue
-        for end in ("start", "end"):
+        for end, is_free in (("start", path.start_free), ("end", path.end_free)):
+            if not is_free:
+                continue
             pos = (
                 path.segments[0].control_points[0]
                 if end == "start"
                 else path.segments[-1].control_points[3]
-            )
+            ).astype(np.float64)
+            x = int(np.clip(round(pos[0]), 0, w - 1))
+            y = int(np.clip(round(pos[1]), 0, h - 1))
+            radius = float(radius_map[y, x]) if radius_map[y, x] > 0 else fallback_radius
             tangent, tangent_confidence = _compute_endpoint_tangent(path, end)
             endpoints.append(EndpointInfo(
-                endpoint_id=next_endpoint_id,
+                endpoint_id=len(endpoints),
                 path_index=idx,
                 end=end,
-                position=pos.astype(np.float64),
+                position=pos,
                 tangent=tangent,
                 curvature=endpoint_curvature(path, end),
                 tangent_confidence=tangent_confidence,
+                radius=radius,
             ))
-            next_endpoint_id += 1
     return endpoints
 
 
@@ -201,38 +216,24 @@ def _extract_endpoints(paths: List[BezierPath]) -> List[EndpointInfo]:
 def extract_paths(
     image_path: str,
     max_error: float = 2.0,
-    spur_threshold: float = 12.0,
-    merge_radius: float = 5.0,
 ) -> ExtractionResult:
-    """Extract Bezier paths, endpoints, and the line distance map from a raster image."""
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise FileNotFoundError(f"Cannot read image: {image_path}")
-    h, w = img.shape[:2]
-    diagonal = float(np.hypot(h, w))
+    """Extract Bezier paths, free endpoints, and stroke measurements from a raster image."""
+    geometry = stroke_geometry(image_path)
+    binary, radius_map, line_width = geometry
+    h, w = binary.shape[:2]
 
     # Bezier path extraction via skeleton
-    paths = fit_from_image_skeleton(
-        image_path,
-        max_error=max_error,
-        spur_threshold=spur_threshold,
-        merge_radius=merge_radius,
-    )
+    paths = fit_from_image_skeleton(image_path, max_error=max_error, geometry=geometry)
 
     # Ensure visual discovery order (top-down, left-right)
     paths.sort(key=visual_order_key)
 
-    # Endpoint extraction
-    endpoints = _extract_endpoints(paths)
-
-    # Compute distance map from the original image (lines=0, background=255)
-    _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    dist_map = cv2.distanceTransform((255 - binary).astype(np.uint8), cv2.DIST_L2, 5)
-
     return ExtractionResult(
         paths=paths,
-        endpoints=endpoints,
+        endpoints=_extract_endpoints(paths, radius_map, line_width / 2.0),
         image_shape=(h, w),
-        diagonal=diagonal,
-        dist_map=dist_map,
+        diagonal=float(np.hypot(h, w)),
+        # Distance of every pixel to the nearest stroke (0 on strokes)
+        dist_map=cv2.distanceTransform((255 - binary).astype(np.uint8), cv2.DIST_L2, 5),
+        line_width=line_width,
     )

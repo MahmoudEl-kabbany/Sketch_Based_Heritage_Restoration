@@ -281,6 +281,11 @@ def evaluate_pair(
     for candidate in candidates:
         best_candidate = np.maximum(best_candidate, gap_coverage(gt, [candidate.bridge_points]))
     positions = np.array([e.position for e in extraction.endpoints]).reshape(-1, 2)
+
+    # Share of the damaged image's own strokes that no extracted path represents.
+    damaged_skeleton = skeletonize(stroke_mask(damaged))
+    represented = _rasterize(gt.shape, [p.sample(30) for p in extraction.paths], gt.stroke_thickness)
+    strokes_missed = float(1.0 - represented[damaged_skeleton].mean()) if damaged_skeleton.any() else 0.0
     nearby, at_gap = endpoints_near_gaps(gt, positions)
 
     for i, gap in enumerate(gt.gaps):
@@ -310,6 +315,7 @@ def evaluate_pair(
         "endpoints": int(len(positions)),
         "endpoints_at_gaps": int(at_gap.sum()),
         "candidates": len(candidates),
+        "strokes_missed_by_extraction": strokes_missed,
         "undamaged_strokes": _stroke_rows(clean_gt, clean.restored_paths),
         "undamaged_endpoints": int(clean_extraction_endpoints),
     }
@@ -365,6 +371,11 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "endpoints": sum(r["endpoints"] for r in rows),
         "endpoints_at_gaps": sum(r["endpoints_at_gaps"] for r in rows),
         "candidates": sum(r["candidates"] for r in rows),
+        "gaps_with_two_endpoints": sum(g["endpoints"] >= 2 for g in gaps) / max(len(gaps), 1),
+        "strokes_missed_by_extraction": {
+            "mean": float(np.mean([r["strokes_missed_by_extraction"] for r in rows])) if rows else 0.0,
+            "worst": max((r["strokes_missed_by_extraction"] for r in rows), default=0.0),
+        },
         # The number later changes are judged by first: line drawn off the drawing, in line widths.
         "off_drawing_widths_total": round(sum(s["off_drawing_widths"] for s in strokes + undamaged), 1),
     }
@@ -395,6 +406,9 @@ def print_summary(summary: Dict[str, Any], skipped: List[Dict[str, Any]]) -> Non
     print(f"    undamaged images with off-drawing strokes: {summary['undamaged']['images_with_off_drawing_strokes']}")
     print(f"  Endpoints: {summary['endpoints']} extracted, {summary['endpoints_at_gaps']} at a true gap; "
           f"{summary['undamaged']['endpoints']} on undamaged originals")
+    missed = summary["strokes_missed_by_extraction"]
+    print(f"  Extraction: {pct(summary['gaps_with_two_endpoints'])} of gaps have two endpoints next to them; "
+          f"strokes not represented by any path: mean {pct(missed['mean'])}, worst {pct(missed['worst'])}")
     print(f"  Off-drawing line, damaged + undamaged: {summary['off_drawing_widths_total']} line widths")
     for row in skipped:
         print(f"  SKIPPED {row['name']}: {row['skipped']}")
