@@ -227,14 +227,19 @@ results = restore_batch([
     "sketch1_damaged.png",
     "sketch2_damaged.png",
     "sketch3_damaged.png",
-])
+], workers=4)   # optional: restore several images at once, in separate processes
 ```
 
-Or use the batch runner script:
+Or use the batch runner script, which restores the test dataset in parallel:
 
 ```bash
-python run_batch_test.py
+python run_batch_test.py              # uses most CPU cores (at most 8 workers)
+python run_batch_test.py --workers 1  # one image at a time
 ```
+
+Results do not depend on the number of workers. Because the workers are
+separate processes, a script that calls `restore_batch(..., workers=N)` must
+keep its top-level code under `if __name__ == "__main__":`.
 
 ### Damage Simulation
 
@@ -266,6 +271,12 @@ python evaluate_restoration.py --filter ankh --limit 5
 
 # Custom output directory
 python evaluate_restoration.py --output-dir results/
+
+# Also write the overlay figures for every image (skipped by default to save time)
+python evaluate_restoration.py --save-images
+
+# One image at a time instead of in parallel
+python evaluate_restoration.py --workers 1
 ```
 
 This produces:
@@ -279,6 +290,8 @@ For bridge fluidity analysis (MDTW/MJerk vs ground truth segments):
 ```bash
 python evaluate_bridge_vs_original.py --limit 10
 ```
+
+Both evaluation scripts process image pairs in parallel; `--workers N` sets how many at once.
 
 ---
 
@@ -376,6 +389,7 @@ Key parameters of the `restore()` function:
 | `efd_plausibility_threshold` | `0.50` | Minimum plausibility score for EFD closure |
 | `efd_min_gap_for_validity_check` | `3.0` | Bypass plausibility check for very small gaps (pixels) |
 | `asp_timeout_s` | `30.0` | Maximum ASP solver time (seconds) |
+| `save_images` | `True` | Write the two overlays and the comparison figure (the JSON report is always written) |
 
 ---
 
