@@ -17,7 +17,8 @@ from restoration.candidates import generate_candidates
 from restoration.scoring import compute_mdtw, compute_mjerk, context_curve, score_candidates
 from restoration.asp_engine import solve_candidates
 
-MJERK_SCALE = 1e46
+# MJerk (mean squared third derivative, px^-4) is reported in units of 1e-3.
+MJERK_SCALE = 1e-3
 
 # evaluate_image() result keys: one list of per-curve values each.
 RESULT_KEYS = ("chosen_mdtw", "chosen_mjerk", "rejected_mdtw", "rejected_mjerk", "orig_mdtw", "orig_mjerk")
@@ -120,19 +121,19 @@ def main():
     mean_orig_mdtw, mean_orig_mjerk = mean["orig_mdtw"], mean["orig_mjerk"] / MJERK_SCALE
 
     print(f"Total matched bridges evaluated: {len(totals['chosen_mdtw'])}")
-    print(f"Chosen Bridges (ASP)     : Mean MDTW = {mean_dmg_mdtw:7.2f}, Mean MJerk = {mean_dmg_mjerk:6.2f}e46")
-    print(f"Rejected Candidates      : Mean MDTW = {mean_rej_mdtw:7.2f}, Mean MJerk = {mean_rej_mjerk:6.2f}e46")
-    print(f"Intact Human Orig Strokes: Mean MDTW = {mean_orig_mdtw:7.2f}, Mean MJerk = {mean_orig_mjerk:6.2f}e46")
+    print(f"Chosen Bridges (ASP)     : Mean MDTW = {mean_dmg_mdtw:7.2f}, Mean MJerk = {mean_dmg_mjerk:6.2f}e-3")
+    print(f"Rejected Candidates      : Mean MDTW = {mean_rej_mdtw:7.2f}, Mean MJerk = {mean_rej_mjerk:6.2f}e-3")
+    print(f"Intact Human Orig Strokes: Mean MDTW = {mean_orig_mdtw:7.2f}, Mean MJerk = {mean_orig_mjerk:6.2f}e-3")
 
     latex = f"""
 \\begin{{table}}[htbp]
 \\centering
-\\caption{{Quantitative comparison of connection fluidity (Mean MJerk) and approach-path directness (Mean MDTW) comparing the ASP-selected bridges against rejected candidates and their exact corresponding non-damaged ground-truth segments from the original unblemished sketches. The scale for MJerk is presented as $\\times 10^{{46}}$ units. Metrics for both groups evaluate the exact same full approach curves.}}
+\\caption{{Quantitative comparison of connection fluidity (Mean MJerk) and approach-path directness (Mean MDTW) comparing the ASP-selected bridges against rejected candidates and their exact corresponding non-damaged ground-truth segments from the original unblemished sketches. The scale for MJerk is presented as $\\times 10^{{-3}}$ units. Metrics for both groups evaluate the exact same full approach curves.}}
 \\label{{tab:fluidity_metrics}}
 \\renewcommand{{\\arraystretch}}{{1.3}}
 \\begin{{tabular}}{{lcc}}
 \\toprule
-\\textbf{{Connection Strategy}} & \\textbf{{Mean MJerk ($\\times 10^{{46}}$)}} & \\textbf{{Mean MDTW}} \\\\
+\\textbf{{Connection Strategy}} & \\textbf{{Mean MJerk ($\\times 10^{{-3}}$)}} & \\textbf{{Mean MDTW}} \\\\
 \\midrule
 Intact Human Orig Strokes (Ground Truth) & {mean_orig_mjerk:.2f} & {mean_orig_mdtw:.2f} \\\\
 \\textbf{{Chosen Bridges (ASP Selected)}} & \\mathbf{{{mean_dmg_mjerk:.2f}}} & \\mathbf{{{mean_dmg_mdtw:.2f}}} \\\\
@@ -149,7 +150,7 @@ Rejected Candidates & {mean_rej_mjerk:.2f} & {mean_rej_mdtw:.2f} \\\\
     colors = ['#95a5a6', '#2ecc71', '#e74c3c']
     charts = (
         ('Mean MDTW (Lower is better)', [mean_orig_mdtw, mean_dmg_mdtw, mean_rej_mdtw]),
-        ('Mean Mjerk (Lower is better)', [mean_orig_mjerk, mean_dmg_mjerk, mean_rej_mjerk]),
+        ('Mean Mjerk, x1e-3 (Lower is better)', [mean_orig_mjerk, mean_dmg_mjerk, mean_rej_mjerk]),
     )
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=300)

@@ -10,11 +10,15 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 from dtaidistance import dtw
+from scipy.interpolate import CubicSpline
 from scipy.spatial import cKDTree
 
 from bezier_curves.bezier import BezierPath
 from restoration.extraction import EndpointInfo, ExtractionResult
 from restoration.candidates import ConnectionCandidate
+
+# Arc-length spacing (pixels) of the samples MJerk is computed on.
+JERK_STEP_PX = 1.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -81,38 +85,29 @@ def compute_mdtw(combined: np.ndarray) -> float:
 
 
 def compute_mjerk(combined: np.ndarray) -> float:
-    """Mean squared jerk (3rd derivative) along a curve.
+    """Mean squared jerk (3rd derivative with respect to arc length) along a curve.
 
-    Lower = smoother.
+    Lower = smoother. The samples are first replaced by points every
+    JERK_STEP_PX along a cubic spline through them. Differentiating the raw
+    samples measures the sampling instead of the shape: Bezier samples repeat
+    the point at each segment joint (a zero-length step) and are unevenly
+    spaced, and a polyline has a small kink at every sample.
     """
-    if len(combined) < 5:
+    steps = np.linalg.norm(np.diff(combined, axis=0), axis=1)
+    points = combined[np.concatenate(([True], steps > 1e-9))]
+    if len(points) < 4:
         return 0.0
 
-    # Arc-length parameterization
-    diffs = np.diff(combined, axis=0)
-    ds = np.linalg.norm(diffs, axis=1)
-    ds[ds < 1e-12] = 1e-12
-
-    # Velocity (1st derivative)
-    vel = diffs / ds[:, np.newaxis]
-
-    # Acceleration (2nd derivative)
-    if len(vel) < 2:
+    # Chord length along the samples approximates arc length.
+    chord = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))))
+    length = float(chord[-1])
+    if length < 4.0 * JERK_STEP_PX:
         return 0.0
-    d_vel = np.diff(vel, axis=0)
-    ds2 = ds[:-1]
-    ds2[ds2 < 1e-12] = 1e-12
-    acc = d_vel / ds2[:, np.newaxis]
 
-    # Jerk (3rd derivative)
-    if len(acc) < 2:
-        return 0.0
-    d_acc = np.diff(acc, axis=0)
-    ds3 = ds2[:-1]
-    ds3[ds3 < 1e-12] = 1e-12
-    jerk = d_acc / ds3[:, np.newaxis]
-
-    # Mean squared jerk
+    num_points = int(np.ceil(length / JERK_STEP_PX)) + 1
+    step = length / (num_points - 1)
+    resampled = CubicSpline(chord, points)(np.linspace(0.0, length, num_points))
+    jerk = np.diff(resampled, n=3, axis=0) / step ** 3
     return float(np.mean(np.sum(jerk ** 2, axis=1)))
 
 
