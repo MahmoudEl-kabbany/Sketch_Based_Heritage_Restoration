@@ -13,26 +13,23 @@ It guarantees that:
 - No endpoint is connected more than once (degree constraint)
 - The chosen set of bridges maximizes the overall "utility" (sum of candidate scores with context-aware adjustments)
 - Cross-shape false positive connections are mathematically suppressed
+- The same candidates always produce the same set of bridges (the solve is deterministic)
 
 ---
 
 ## 2. Pipeline Overview
 
 ```
-List[ConnectionCandidate]  +  ExtractionResult
+List[ConnectionCandidate]
     │
     ├─► Prune strictly dominated candidates (reduce search space)
     │
-    ├─► Split candidates into independent sub-components
-    │       └─► (Connected components in endpoint-conflict space)
+    ├─► Encode candidates to ASP facts (strings)
+    │       └─► Compute effective utility per candidate
     │
-    ├─► For each component:
-    │       ├─► Encode candidates to ASP facts (strings)
-    │       ├─► Compute effective utility per candidate
-    │       ├─► Call Clingo solver
-    │       └─► Decode accepted candidate IDs
+    ├─► Call Clingo once for the whole image
     │
-    └─► Merge accepted candidates
+    └─► Decode accepted candidate IDs
             └─► List[ConnectionCandidate] (accepted only)
 ```
 
@@ -92,10 +89,6 @@ Generated fact:
 candidate_utility(42, 87).
 ```
 
-### 3.3 Nested Shapes
-
-If a candidate connects an inner shape to an outer shape, a `nested_shape(A, B)` fact is generated. (Computed via OpenCV `pointPolygonTest` on convex hulls).
-
 ---
 
 ## 4. ASP Rules (`restoration.lp`)
@@ -120,36 +113,34 @@ endpoint_key(E) :- uses_endpoint(_, E).
 
 % Prevent trivial 0-length loops (connecting a path to itself if it's not a self_closure)
 :- accept(Id), candidate(Id, P, _, P, _, _), not candidate_self_closure(Id).
-
-% Nested shapes cannot be connected to each other
-:- accept(Id), candidate(Id, P1, _, P2, _, _), nested_shape(P1, P2).
 ```
 
 ### 4.3 Objective Function
 ```prolog
-% Maximize the sum of utilities for all accepted candidates
-#maximize { Utility, Id : accept(Id), candidate_utility(Id, Utility) }.
+% 1st priority: maximize the sum of utilities of all accepted candidates
+#maximize { Utility@2, Id : accept(Id), candidate_utility(Id, Utility) }.
+
+% 2nd priority: prefer answers that connect both ends of more paths
+#maximize { 8@1, P : path_fully_connected(P) }.
+
+% 3rd priority (tie-break): prefer fewer bridges
+#minimize { 1@0, Id : accept(Id) }.
 ```
+
+A bridge with utility 0 that completes no path has nothing in its favour, so the tie-break leaves it out.
 
 ---
 
 ## 5. Optimization & Performance
 
-Solving NP-hard constraints can be slow, so Phase 4 includes three major optimizations:
-
 ### 5.1 Strict Dominance Pruning
 If two candidates use the *exact same two endpoints*, only the one with the highest utility is kept. The other is permanently dropped before solving. (Exception: same-path closures are never pruned, as they influence soft suppression logic).
 
-### 5.2 Component Partitioning
-The candidates are represented as a graph where nodes are endpoints and edges are candidates. The graph is split into independent connected components. 
+### 5.2 One Program per Image
+All candidates of an image are solved together. Splitting them into independent endpoint-conflict components is not valid here: the reward for connecting both ends of a path (`path_fully_connected`) links the two endpoints of that path, and they can fall into different components.
 
-```python
-components = _split_candidates_by_endpoint_component(working_candidates)
-```
-Instead of running one massive solver instance, `clingo` is invoked separately on each independent component, radically reducing exponential branching overhead.
-
-### 5.3 Parallel Clingo
-`clingo` is run with `--opt-mode=optN` and `--parallel-mode=N`, where N is the CPU core count clamped to 2–8. Setting the environment variable `RESTORATION_CLINGO_CONSERVATIVE=1` runs it single-threaded instead.
+### 5.3 Deterministic Solver Settings
+`clingo` is run on a single thread with `--opt-mode=optN --opt-strategy=usc`. Core-guided optimization proves the optimum in milliseconds on these programs (about 0.4 s for the whole 32-image test set). With several threads the answer picked among equally good ones depends on which thread finishes first, so results differed between runs of the same input.
 
 ---
 
@@ -168,13 +159,10 @@ def decode_solution(accepted_ids, candidates):
 ## 7. Entry Point
 
 ```python
-def solve_partitioned(
+def solve_candidates(
     candidates: List[ConnectionCandidate],
-    extraction: ExtractionResult,
     rules_path: str = RULES_PATH,
     max_solutions: int = 1,
-    enable_component_partition: bool = True,
-    enable_dominance_pruning: bool = True,
     timeout_s: float = 30.0,
 ) -> Tuple[List[int], Dict[str, Any]]:
 ```
@@ -186,4 +174,3 @@ def solve_partitioned(
 | Library | Usage |
 |---|---|
 | `clingo` | ASP Grounding and Solving Engine |
-| `cv2` | Convex hull and point-polygon testing (for nested shapes) |

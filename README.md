@@ -90,7 +90,6 @@ Heritage sketches often suffer from physical deterioration. This project provide
               ┌─────────────────────────┐
               │ Clingo optimization     │
               │ Endpoint occupancy      │
-              │ Nested shape exclusion  │
               │ Image mask filtering    │
               └────────────┬────────────┘
                            │
@@ -160,6 +159,7 @@ Sketch_Based_Heritage_Restoration/
 ├── evaluate_restoration.py         # PSNR/SSIM evaluation framework
 ├── evaluate_bridge_vs_original.py  # Fluidity metrics (MDTW/MJerk) vs ground truth
 ├── run_batch_test.py               # Batch restoration runner
+├── test_restoration.py             # Tests (run with: python -m pytest)
 ```
 
 ---
@@ -311,7 +311,7 @@ Multi-factor scoring of each candidate:
 - **Continuation** — cosine alignment of tangent with bridge direction
 - **Closure** — loop completion bonus
 - **MDTW** — Dynamic Time Warping deviation from a straight baseline
-- **MJerk** — Mean squared jerk (3rd derivative) for smoothness
+- **MJerk** — Mean squared jerk (3rd derivative along arc length, on a spline through the samples) for smoothness
 - **Shape affinity** — bounding box overlap for fragment reassembly
 - **Self-closure priority** — boosted scoring for same-path closures
 
@@ -320,9 +320,8 @@ Multi-factor scoring of each candidate:
 Encodes the scored candidates as Answer Set Programming facts and solves for the optimal set:
 - **Endpoint occupancy constraints** — each endpoint used at most once
 - **Self-connection exclusion** — prevents non-closure same-path connections
-- **Nested shape exclusion** — avoids cross-connecting concentric shapes
-- **Utility maximization** — bi-level optimization (candidate utility + path connectivity)
-- **Component partitioning** — splits into independent subproblems for scalability
+- **Utility maximization** — candidate utility first, then path connectivity, then fewer bridges as the tie-break
+- **Deterministic solve** — one program per image, single-threaded, so the same input always gives the same bridges
 - **Image mask post-filtering** — removes bridges crossing original image lines
 
 ### Phase 5 — Synthesis
@@ -376,7 +375,7 @@ Key parameters of the `restore()` function:
 | `efd_validity_check_enabled` | `True` | Enable semantic plausibility gate for EFD closure |
 | `efd_plausibility_threshold` | `0.50` | Minimum plausibility score for EFD closure |
 | `efd_min_gap_for_validity_check` | `3.0` | Bypass plausibility check for very small gaps (pixels) |
-| `asp_timeout_s` | `30.0` | Maximum ASP solver time per component (seconds) |
+| `asp_timeout_s` | `30.0` | Maximum ASP solver time (seconds) |
 
 ---
 

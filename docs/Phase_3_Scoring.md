@@ -48,15 +48,15 @@ List[ConnectionCandidate]  +  ExtractionResult
 
 **Computation:**
 
-1. **Sample context:** Take the last 20 points from the source path (tail) and first 20 points from the target path (head)
-2. **Combine:** `combined = [source_tail, bridge_points, target_head]`
+1. **Sample context:** Take the 20 samples of the source path that run *into* the bridge's start endpoint (tail) and the 20 samples of the target path that run *away from* its end endpoint (head). Which end of each path that is depends on whether the endpoint is the path's start or its end.
+2. **Combine:** `combined = [source_tail, bridge_points, target_head]`, one continuous curve
 3. **Baseline:** A straight line from the first to last point of `combined`, sampled at the same number of points
 4. **DTW distance:** Computed independently for x and y coordinates using the `dtaidistance` library
 5. **Final metric:** `MDTW = √(dtw_x² + dtw_y²)`
 
 ```python
-combined = context_curve(bridge_pts, source_samples, target_samples, tail_len=20)
-#        = vstack([source_tail, bridge_pts, target_head])
+combined = context_curve(candidate, dense_samples, tail_len=20)
+#        = vstack([source_tail, candidate.bridge_points, target_head])
 
 def compute_mdtw(combined):
     baseline = linspace(combined[0], combined[-1], len(combined))
@@ -75,33 +75,28 @@ def compute_mdtw(combined):
 
 **Computation:**
 
-Jerk is the third derivative of position with respect to arc length, computed via finite differences:
+Jerk is the third derivative of position with respect to arc length. It is not taken directly on the samples: Bézier samples repeat the point at every segment joint and are unevenly spaced, and differentiating across those steps measures the sampling instead of the shape. The samples are first replaced by points every 1 px along a cubic spline through them.
 
 ```
-Arc-length parameterization:
-    ds = ||Δposition||
+Remove repeated points
+Fit a cubic spline through the samples, parameterized by chord length
+Evaluate it every 1 px:            p_0, p_1, ..., p_n      (step h ≈ 1 px)
 
-Velocity (1st derivative):
-    v = Δposition / ds
+Jerk (3rd finite difference):      j_i = Δ³p_i / h³
 
-Acceleration (2nd derivative):
-    a = Δv / ds
-
-Jerk (3rd derivative):
-    j = Δa / ds
-
-MJerk = mean(||j||²)
+MJerk = mean(||j||²)               (units: px⁻⁴)
 ```
 
 ```python
 def compute_mjerk(combined):  # the same context curve as for MDTW
-    diffs = diff(combined, axis=0)
-    ds = norm(diffs, axis=1)
-    vel = diffs / ds[:, newaxis]
-    acc = diff(vel) / ds[:-1, newaxis]
-    jerk = diff(acc) / ds[:-2, newaxis]
+    points = drop_repeated(combined)
+    chord = cumulative_chord_length(points)
+    resampled = CubicSpline(chord, points)(linspace(0, chord[-1], num_points))
+    jerk = diff(resampled, n=3, axis=0) / step ** 3
     return mean(sum(jerk ** 2, axis=1))
 ```
+
+A circle of radius R gives exactly 1/R⁴ at any sampling density, and a straight line gives 0. Typical values for bridge contexts are around 10⁻⁴ to 10⁻².
 
 **Interpretation:**
 - Low MJerk: Smooth, flowing transition (like human drawing)
