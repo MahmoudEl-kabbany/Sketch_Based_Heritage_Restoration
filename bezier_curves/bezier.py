@@ -29,8 +29,16 @@ OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
 #  - A terminal skeleton branch no longer than this many radii does not reach
 #    beyond the body of the stroke it hangs off: it is a thinning artefact.
 SPUR_RADIUS_FACTOR = 1.5
-#  - A skeleton cannot be trusted within one radius of a stroke's free end.
+#  - A longer terminal branch is still an artefact if it runs into a corner of
+#    the outline: its radius shrinks to under this share of the radius at its
+#    junction, where a real stroke stub keeps its width. Oblique cut ends give
+#    such branches, up to this many radii long.
+CORNER_TIP_RADIUS_RATIO = 0.5
+CORNER_BRANCH_MAX_RADII = 3.0
+#  - A skeleton cannot be trusted within one radius of a stroke's free end,
+#    and never within a few pixels of it, whatever the stroke width.
 END_TRIM_RADII = 1.0
+END_TRIM_MIN_PX = 3.0
 #  - Blobs smaller than this many squared line widths are specks, not strokes.
 SPECK_AREA_WIDTHS2 = 0.5
 
@@ -736,15 +744,20 @@ def _prune_skeleton_spurs(graph: Any, radius_map: np.ndarray, fallback_radius: f
         for edge in edges:
             u, v = edge[0], edge[1]
             if degrees.get(u, 0) == 1 and degrees.get(v, 0) >= 3:
-                junction = v
+                tip, junction = u, v
             elif degrees.get(v, 0) == 1 and degrees.get(u, 0) >= 3:
-                junction = u
+                tip, junction = v, u
             else:
                 continue
             pts = np.asarray(edge[-1].get("pts", []), dtype=np.float64)
             length = float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1))) if len(pts) >= 2 else 0.0
-            limit = SPUR_RADIUS_FACTOR * _radius_at(radius_map, _node_xy(graph, junction), fallback_radius)
-            if length <= limit:
+            junction_radius = _radius_at(radius_map, _node_xy(graph, junction), fallback_radius)
+            tip_radius = _radius_at(radius_map, _node_xy(graph, tip), fallback_radius)
+            runs_into_corner = (
+                tip_radius <= CORNER_TIP_RADIUS_RATIO * junction_radius
+                and length <= CORNER_BRANCH_MAX_RADII * junction_radius
+            )
+            if length <= SPUR_RADIUS_FACTOR * junction_radius or runs_into_corner:
                 edges_to_remove.append(edge)
 
         for edge in edges_to_remove:
@@ -756,7 +769,7 @@ def _prune_skeleton_spurs(graph: Any, radius_map: np.ndarray, fallback_radius: f
 
 
 def _trim_free_ends(chain: _SkeletonChain, radius_map: np.ndarray, fallback_radius: float) -> np.ndarray:
-    """Chain points without the stretch within one stroke radius of each free end.
+    """Chain points without the stretch within about one stroke radius of each free end.
 
     Near a stroke's end the skeleton bends towards the outline and says little
     about the stroke's direction. Ends on a junction are kept as they are.
@@ -766,7 +779,8 @@ def _trim_free_ends(chain: _SkeletonChain, radius_map: np.ndarray, fallback_radi
     max_drop = len(pts) // 4   # never trim away more than a quarter of the chain per end
 
     def points_within(radius: float, step_lengths: np.ndarray) -> int:
-        return min(int(np.searchsorted(np.cumsum(step_lengths), END_TRIM_RADII * radius)), max_drop)
+        reach = max(END_TRIM_RADII * radius, END_TRIM_MIN_PX)
+        return min(int(np.searchsorted(np.cumsum(step_lengths), reach)), max_drop)
 
     first = points_within(_radius_at(radius_map, pts[0], fallback_radius), steps) if chain.start_free else 0
     last = points_within(_radius_at(radius_map, pts[-1], fallback_radius), steps[::-1]) if chain.end_free else 0

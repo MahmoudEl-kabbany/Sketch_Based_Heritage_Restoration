@@ -282,6 +282,9 @@ def evaluate_pair(
         best_candidate = np.maximum(best_candidate, gap_coverage(gt, [candidate.bridge_points]))
     positions = np.array([e.position for e in extraction.endpoints]).reshape(-1, 2)
 
+    # Placement: mean distance from each gap's centre line to the drawn strokes, in line widths.
+    stroke_tree = cKDTree(np.vstack(strokes)) if strokes else None
+
     # Share of the damaged image's own strokes that no extracted path represents.
     damaged_skeleton = skeletonize(stroke_mask(damaged))
     represented = _rasterize(gt.shape, [p.sample(30) for p in extraction.paths], gt.stroke_thickness)
@@ -300,6 +303,10 @@ def evaluate_pair(
         else:
             stage = "endpoints_missing"
         gap.update(stage=stage, coverage=float(restored[i]), endpoints=int(nearby[i]))
+        if stage == "repaired":
+            ys, xs = np.nonzero(gt.center_labels == gap["id"])
+            distance, _ = stroke_tree.query(np.column_stack([xs, ys]))
+            gap["deviation_widths"] = float(np.mean(distance) / gt.line_width)
 
     # ---- the undamaged original: everything drawn there is unnecessary
     clean = restore(original_path, output_dir=os.path.join(output_dir, "reports_undamaged"), save_images=False)
@@ -346,6 +353,7 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     length_bins = (("under 2 widths", 0, 2), ("2-5 widths", 2, 5), ("5-10 widths", 5, 10), ("over 10 widths", 10, float("inf")))
     stage_counts = Counter(g["stage"] for g in gaps)
+    deviations = [g["deviation_widths"] for g in gaps if "deviation_widths" in g]
     return {
         "images": len(rows),
         "gaps": len(gaps),
@@ -371,6 +379,10 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "endpoints": sum(r["endpoints"] for r in rows),
         "endpoints_at_gaps": sum(r["endpoints_at_gaps"] for r in rows),
         "candidates": sum(r["candidates"] for r in rows),
+        "placement_deviation_widths": {
+            "median": float(np.median(deviations)) if deviations else None,
+            "p90": float(np.percentile(deviations, 90)) if deviations else None,
+        },
         "gaps_with_two_endpoints": sum(g["endpoints"] >= 2 for g in gaps) / max(len(gaps), 1),
         "strokes_missed_by_extraction": {
             "mean": float(np.mean([r["strokes_missed_by_extraction"] for r in rows])) if rows else 0.0,
@@ -393,6 +405,10 @@ def print_summary(summary: Dict[str, Any], skipped: List[Dict[str, Any]]) -> Non
     print("  Recall by gap length:")
     for label, row in summary["recall_by_length"].items():
         print(f"    {label:<26s} {pct(row['recall'])}   ({row['gaps']} gaps)")
+    placement = summary["placement_deviation_widths"]
+    if placement["median"] is not None:
+        print(f"  Placement of repaired gaps: {placement['median']:.2f} line widths from the true centre line "
+              f"(median), {placement['p90']:.2f} (90th percentile)")
     print("  Recall by gap type:")
     for label, row in summary["recall_by_stubs"].items():
         print(f"    {label:<26s} {pct(row['recall'])}   ({row['gaps']} gaps)")
