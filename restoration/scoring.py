@@ -20,6 +20,10 @@ from restoration.candidates import ConnectionCandidate
 # Arc-length spacing (pixels) of the samples MJerk is computed on.
 JERK_STEP_PX = 1.0
 
+# dtaidistance's compiled DTW computes the same recurrence as its pure-Python
+# one, about 100x faster. Use it when the C library was built.
+_DTW_OPTIONS = {"use_c": True} if dtw.try_import_c() else {}
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Default scoring weights
@@ -78,9 +82,9 @@ def compute_mdtw(combined: np.ndarray) -> float:
 
     # Compute DTW on x and y independently, then combine
     dtw_x = dtw.distance(combined[:, 0].astype(np.double),
-                         baseline[:, 0].astype(np.double))
+                         baseline[:, 0].astype(np.double), **_DTW_OPTIONS)
     dtw_y = dtw.distance(combined[:, 1].astype(np.double),
-                         baseline[:, 1].astype(np.double))
+                         baseline[:, 1].astype(np.double), **_DTW_OPTIONS)
     return float(np.hypot(dtw_x, dtw_y))
 
 
