@@ -1,0 +1,240 @@
+{
+  "summary": {
+    "gap_recall": 87.24,
+    "off_drawing_widths": 89.4,
+    "off_drawing_widths_damaged": 65.5,
+    "off_drawing_widths_undamaged": 23.9,
+    "wrong_strokes": 5,
+    "strokes_on_undamaged": 23,
+    "placement_median_widths": 0.115,
+    "psnr": 26.057,
+    "ssim": 0.983,
+    "candidate_separation": 96.83
+  },
+  "images": {
+    "ankh": {
+      "gaps": 6,
+      "repaired": 6,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 32.64
+    },
+    "butterfly": {
+      "gaps": 39,
+      "repaired": 29,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 25.92
+    },
+    "da10_gt": {
+      "gaps": 17,
+      "repaired": 17,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 1,
+      "psnr": 25.65
+    },
+    "da12_gt": {
+      "gaps": 48,
+      "repaired": 37,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 2,
+      "psnr": 26.99
+    },
+    "da22_gt": {
+      "gaps": 27,
+      "repaired": 27,
+      "off_drawing_widths": 1.4,
+      "strokes_on_undamaged": 0,
+      "psnr": 21.77
+    },
+    "da37_gt": {
+      "gaps": 52,
+      "repaired": 39,
+      "off_drawing_widths": 0.3,
+      "strokes_on_undamaged": 0,
+      "psnr": 26.1
+    },
+    "da57_gt": {
+      "gaps": 24,
+      "repaired": 18,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 27.36
+    },
+    "da58_gt": {
+      "gaps": 14,
+      "repaired": 9,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 27.28
+    },
+    "da5_gt": {
+      "gaps": 14,
+      "repaired": 13,
+      "off_drawing_widths": 22.7,
+      "strokes_on_undamaged": 7,
+      "psnr": 22.13
+    },
+    "da61_gt": {
+      "gaps": 16,
+      "repaired": 15,
+      "off_drawing_widths": 1.8,
+      "strokes_on_undamaged": 0,
+      "psnr": 23.28
+    },
+    "da6_gt": {
+      "gaps": 16,
+      "repaired": 15,
+      "off_drawing_widths": 4.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 25.79
+    },
+    "da78_gt": {
+      "gaps": 61,
+      "repaired": 28,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 3,
+      "psnr": 23.42
+    },
+    "da79_gt": {
+      "gaps": 31,
+      "repaired": 30,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 2,
+      "psnr": 28.88
+    },
+    "da8_gt": {
+      "gaps": 38,
+      "repaired": 37,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 26.68
+    },
+    "da9_gt": {
+      "gaps": 17,
+      "repaired": 17,
+      "off_drawing_widths": 1.4,
+      "strokes_on_undamaged": 1,
+      "psnr": 23.66
+    },
+    "djed_pillar": {
+      "gaps": 16,
+      "repaired": 15,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 33.73
+    },
+    "enclosed_shapes": {
+      "gaps": 48,
+      "repaired": 45,
+      "off_drawing_widths": 34.4,
+      "strokes_on_undamaged": 0,
+      "psnr": 24.99
+    },
+    "eye": {
+      "gaps": 12,
+      "repaired": 12,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 23.51
+    },
+    "feather": {
+      "gaps": 19,
+      "repaired": 19,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 24.4
+    },
+    "flail": {
+      "gaps": 20,
+      "repaired": 20,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 17.38
+    },
+    "geometric": {
+      "gaps": 16,
+      "repaired": 15,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 23.19
+    },
+    "geometric_art": {
+      "gaps": 26,
+      "repaired": 25,
+      "off_drawing_widths": 4.8,
+      "strokes_on_undamaged": 3,
+      "psnr": 27.99
+    },
+    "grid": {
+      "gaps": 24,
+      "repaired": 24,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 26.57
+    },
+    "grid_square": {
+      "gaps": 17,
+      "repaired": 17,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 29.06
+    },
+    "islamic_art_1": {
+      "gaps": 31,
+      "repaired": 31,
+      "off_drawing_widths": 0.4,
+      "strokes_on_undamaged": 0,
+      "psnr": 18.98
+    },
+    "ra": {
+      "gaps": 34,
+      "repaired": 33,
+      "off_drawing_widths": 7.3,
+      "strokes_on_undamaged": 2,
+      "psnr": 27.58
+    },
+    "restoration_test_big": {
+      "gaps": 7,
+      "repaired": 5,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 28.35
+    },
+    "scarab": {
+      "gaps": 14,
+      "repaired": 14,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 29.67
+    },
+    "shape_set": {
+      "gaps": 43,
+      "repaired": 36,
+      "off_drawing_widths": 3.9,
+      "strokes_on_undamaged": 0,
+      "psnr": 28.58
+    },
+    "simple_cat": {
+      "gaps": 13,
+      "repaired": 13,
+      "off_drawing_widths": 7.0,
+      "strokes_on_undamaged": 2,
+      "psnr": 25.26
+    },
+    "simple_lotus": {
+      "gaps": 17,
+      "repaired": 17,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 33.17
+    },
+    "star_junction": {
+      "gaps": 7,
+      "repaired": 6,
+      "off_drawing_widths": 0.0,
+      "strokes_on_undamaged": 0,
+      "psnr": 23.85
+    }
+  }
+}

@@ -16,6 +16,7 @@ A computational pipeline for automatically restoring damaged heritage sketches. 
   - [Batch Restoration](#batch-restoration)
   - [Damage Simulation](#damage-simulation)
   - [Quantitative Evaluation](#quantitative-evaluation)
+  - [Testing a Change](#testing-a-change)
   - [Fitting the Scorer](#fitting-the-scorer)
 - [Pipeline Phases in Detail](#pipeline-phases-in-detail)
 - [Evaluation Metrics](#evaluation-metrics)
@@ -157,6 +158,7 @@ Sketch_Based_Heritage_Restoration/
 │   └── efd.py                      # Standalone EFD demo (not used by the pipeline)
 │
 ├── add_gaps.py                     # Damage simulation tool (gaps, cracks, scrubs)
+├── check_changes.py                # Tests a code change against the recorded baseline
 ├── train_scoring.py                # Fits the scorecards; cross-validated report
 ├── evaluate_gaps.py                # Gap-level benchmark against ground truth
 ├── evaluate_restoration.py         # PSNR/SSIM evaluation framework
@@ -303,6 +305,19 @@ python evaluate_bridge_vs_original.py --limit 10
 ```
 
 All evaluation scripts process image pairs in parallel; `--workers N` sets how many at once.
+
+### Testing a Change
+
+After changing the code, one command says whether the change helped:
+
+```bash
+python check_changes.py                   # about 2 minutes
+python check_changes.py --save-baseline   # record the current results as the new baseline
+```
+
+It runs the unit tests, refits the scorecards without each drawing, restores every test drawing with a model that has not seen it, and compares the results with `check_baseline.json`: gaps repaired, line drawn off the drawing, wrong strokes, strokes drawn on undamaged originals, PSNR and SSIM, and which drawings changed. It ends with a verdict. Fewer wrong strokes come first: a change that draws less line off the drawing but repairs fewer gaps is kept only when the line off the drawing falls by at least 25% for at most 2 points of gap recall.
+
+Nothing is written to `restoration/outputs/` or to the shipped model; files go to a folder in the system's temp directory (`--output-dir` to choose another). If the change is kept, refit the shipped model with `python train_scoring.py` and record the new baseline.
 
 ### Fitting the Scorer
 

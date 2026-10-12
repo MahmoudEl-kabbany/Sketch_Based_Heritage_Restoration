@@ -105,6 +105,7 @@ def labelled_candidates(drawing: str, kind: str, original_path: str, image_path:
 
 def build_dataset(work_dir: str, workers: int, name_filter: Optional[str] = None) -> List[Dict[str, Any]]:
     """Labelled candidates of every drawing: its provided damage, synthetic damage, and no damage."""
+    os.makedirs(work_dir, exist_ok=True)
     jobs: List[Tuple[str, str, str, str]] = []
     for name, original_path, damaged_path in discover_pairs(name_filter=name_filter):
         original, damaged, agreement = load_pair(original_path, damaged_path)
