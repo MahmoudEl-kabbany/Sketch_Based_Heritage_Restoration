@@ -4,6 +4,14 @@
 
 ---
 
+> **Optional, off by default.** Run it with `restore(..., efd_closure=True)`.
+> On the 32 test drawings it repaired 5 more gaps of 784 (+0.6 points of gap recall) and added 5% to the line
+> drawn off the drawing; in nearby settings its closures were the longest wrong strokes of the whole pipeline
+> (in one such run two closures drew 137 line widths off the drawing, all 773 bridges together 58). Its plausibility
+> check is the one part of the system still built on hand-set thresholds. Since a wrong stroke is worse than an
+> open gap, it is not run unless asked for. A single-gap contour whose two ends face each other is in any case
+> a candidate of Phases 2 to 4 like any other pair of ends.
+
 ## 1. Purpose
 
 Phase 6 addresses open paths that form nearly-closed shapes with a **single remaining gap**. Phase 2/3 candidate generation often ignores these gaps because the endpoints are too far apart for reliable tangent-based extrapolation. Phase 6 analyzes the macro-structure of the whole contour using symmetry detection and curvature heuristics to synthesize a closing arc.

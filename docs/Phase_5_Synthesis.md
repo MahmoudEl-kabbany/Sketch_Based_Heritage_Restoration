@@ -6,86 +6,38 @@
 
 ## 1. Purpose
 
-Phase 5 takes the list of `ConnectionCandidate` objects accepted by the ASP solver and generates the final, production-quality cubic Bézier curves (bridges) that connect them. It then merges these new bridge segments with the original extraction segments to form complete, contiguous paths.
+Phase 5 puts the bridges the solver accepted into the drawing: it merges each bridge with the two paths it joins, so that the result is a set of complete, contiguous paths.
+
+It no longer builds any geometry. A candidate's bridge is built once, when the candidate is generated (Phase 2), so that the bridge Phase 3 scored is exactly the bridge that is drawn. Earlier versions scored a preliminary bridge and then drew a different, refined one.
 
 ---
 
 ## 2. Pipeline Overview
 
 ```
-Accepted Candidates
+Accepted candidates (each with its bridge segments)
     │
-    ├─► For each candidate:
-    │       ├─► Determine scenario (continuation vs extension)
-    │       ├─► Build straight bridge if geometrically straight
-    │       ├─► Build G1-continuous bridge if smooth curve
-    │       ├─► Build 2-segment intersection bridge if corner
-    │       └─► Return List[BezierSegment]
+    ├─► Collect the bridge segments                 synthesize_bridges()
     │
-    ├─► Merge Path Topologies:
-    │       ├─► Track endpoints as connectable tokens
-    │       ├─► For each bridge:
-    │       │       ├─► Connect Source Path + Bridge + Target Path
-    │       │       ├─► Reverse paths if necessary (start-to-start)
-    │       │       └─► Detect if merged path forms a closed loop
-    │       └─► Output updated List[BezierPath]
-    │
-    └─► Final Output: Restored Paths + Independent Bridge Segments
+    └─► Merge path topologies                       merge_restored_paths()
+            ├─► Track the free ends of every path as connectable tokens
+            ├─► For each bridge:
+            │       ├─► Source path + bridge + target path
+            │       ├─► Reverse a path if necessary (start-to-start)
+            │       └─► Detect if the merged path forms a closed loop
+            └─► Output the updated List[BezierPath]
 ```
 
 ---
 
-## 3. Bridge Construction Methods
+## 3. Bridge Shapes
 
-All generated bridges are defined as `BezierSegment` objects containing 4 control points `(P0, P1, P2, P3)`. To prevent kinks, the handles (P1 and P2) are clamped by a stabilization function.
+Both shapes are built in [`restoration/candidates.py`](../restoration/candidates.py) and described in [Phase 2](Phase_2_Candidate_Generation.md):
 
-### 3.1 Control Point Stabilization
+- **Smooth bridge** — one cubic Bézier, G1-continuous with both strokes, handles a third of the gap long and shortened where a stroke is curved, stabilized against hooks.
+- **Corner bridge** — two straight segments through the point where the two tangent rays meet.
 
-`_stabilize_bridge_control_points(cp)` ensures handle geometry doesn't create "hooks" or backtracking curves:
-- Forces minimum forward projection along the chord (at least 2% of chord length, rescued to 8% if below)
-- Clamps maximum lateral deviation to 60% of chord length
-
-### 3.2 Straight Bridges
-
-Used when both endpoint curvatures are near zero (< 0.005) and their tangents are perfectly aligned (> 95% anti-parallel).
-
-```python
-# P1 and P2 are placed exactly 1/3 and 2/3 along the straight line from P0 to P3
-unit = (P3 - P0) / norm(P3 - P0)
-step = norm(P3 - P0) / 3.0
-P1 = P0 + unit * step
-P2 = P3 - unit * step
-```
-
-### 3.3 Smooth G1-Continuous Bridges
-
-The default bridge for organic continuation. It creates a single cubic Bézier segment that maintains first-derivative (G1) continuity with the incoming paths, while scaling the handle lengths based on local curvature to prevent overshooting.
-
-```python
-chord = norm(P3 - P0)
-alpha_a = chord / 3.0
-alpha_b = chord / 3.0
-
-# Curvature-aware scaling: high curvature = shorter handles
-if curvature_a > 0: alpha_a = min(alpha_a, 1.0 / (3.0 * curvature_a))
-if curvature_b > 0: alpha_b = min(alpha_b, 1.0 / (3.0 * curvature_b))
-
-P1 = P0 + alpha_a * tangent_a
-P2 = P3 + alpha_b * tangent_b  (tangent_b points outward, so + is correct for incoming)
-```
-
-### 3.4 Intersection Bridges (Corners)
-
-Used for `extension_intersection` candidates to create sharp corners. Two Bézier segments are generated, meeting at the intersection point `I`.
-
-**Linear Intersection (Sharp Corners):**
-Used when both endpoints are straight lines (< 0.008 curvature).
-- Segment 1: `P0` to `I`
-- Segment 2: `I` to `P3`
-- The handles going toward and away from `I` follow the direct straight-line vectors to `I`.
-
-**Smooth Fallback:**
-If either endpoint is curved (curvature ≥ 0.008), the intersection point is not used and the candidate gets a single smooth **G1 bridge**.
+A corner bridge is a run of two `bridge` segments; a smooth bridge is one.
 
 ---
 
@@ -93,7 +45,7 @@ If either endpoint is curved (curvature ≥ 0.008), the intersection point is no
 
 After the bridge segments are created, the discrete paths must be chained together.
 
-1. **Tokenization:** Every start and end of every open path is identified by the token `(path_index, end)`.
+1. **Tokenization:** Every free end of every open path is identified by the token `(path_index, end)`. An end on a junction has no token: it cannot be bridged.
 2. **Path Storage:** All paths are loaded into an `active` dictionary.
 3. **Bridge Iteration:** For each accepted connection A ↔ B:
    - Look up the active path containing endpoint A.
@@ -112,7 +64,7 @@ After the bridge segments are created, the discrete paths must be chained togeth
 def synthesize_bridges(
     accepted: List[ConnectionCandidate],
 ) -> List[BezierSegment]:
-    # Returns just the new bridge segments
+    # The bridge segments of the accepted candidates, in order
 
 def merge_restored_paths(
     original_paths: List[BezierPath],

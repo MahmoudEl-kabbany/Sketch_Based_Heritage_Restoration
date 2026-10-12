@@ -1,17 +1,19 @@
 # Phase 1 — Extraction
 
-> **Source file:** [`restoration/extraction.py`](../restoration/extraction.py)  
+> **Source file:** [`restoration/extraction.py`](../restoration/extraction.py)
 > **Supporting module:** [`bezier_curves/bezier.py`](../bezier_curves/bezier.py)
 
 ---
 
 ## 1. Purpose
 
-Phase 1 transforms a raw raster sketch image into a structured geometric representation suitable for gap detection and restoration. It produces:
+Phase 1 turns a raster sketch into the geometry the later phases reason about:
 
-- **Bézier paths** — cubic Bézier curve representations of every line in the sketch
-- **Endpoint descriptors** — position, outward tangent, curvature, and tangent confidence for each open path endpoint
-- **Distance map** — pixel-wise distance from the nearest sketch line (for collision detection in later phases)
+- **Bézier paths** — every stroke as a chain of cubic Bézier curves, each knowing whether its two ends are *free* (the stroke stops there) or sit on a *junction* with other strokes
+- **Free ends** — for every place a stroke stops: position, outward direction, curvature and stroke radius. These are the only places a missing stroke can be attached
+- **Stroke measurements** — the line width of the drawing and a distance map
+
+Every size used here is a multiple of the stroke radius, measured from the image itself, so a drawing with 3 px lines and one with 30 px lines are treated alike.
 
 ---
 
@@ -20,41 +22,38 @@ Phase 1 transforms a raw raster sketch image into a structured geometric represe
 ```
 Raster Image (grayscale)
     │
-    ├─► Otsu Binarization (lines = foreground)
+    ├─► Otsu binarization, speck removal
+    ├─► Stroke radius map (distance transform) and line width
     │
     ├─► Skeletonization (scikit-image → 1-pixel medial axis)
+    ├─► Graph construction (sknw → NetworkX graph)
+    ├─► Spur pruning (terminal branches that are thinning artefacts)
     │
-    ├─► Graph Construction (sknw → NetworkX graph)
+    ├─► Chain traversal (junction-continuation; ends marked free / junction)
+    ├─► End trimming (the stretch where the skeleton leaves the centre line)
+    ├─► Schneider fitting (cubic Bézier curves) → BezierPath objects
     │
-    ├─► Chain Traversal (junction-continuation heuristics)
+    ├─► Free-end extraction
+    │       ├─► stroke radius
+    │       └─► direction and curvature from an arc fitted behind the end
     │
-    ├─► Schneider Fitting (cubic Bézier curves)
-    │       └─► BezierPath objects
-    │
-    ├─► Endpoint Extraction
-    │       ├─► Derivative tangent from control points
-    │       ├─► Multi-scale PCA context tangent
-    │       ├─► Blended tangent + confidence score
-    │       └─► EndpointInfo objects
-    │
-    └─► Distance Map Computation
-            └─► cv2.distanceTransform
+    └─► Distance map (cv2.distanceTransform)
 ```
 
 ---
 
 ## 3. Detailed Steps
 
-### 3.1 Image Loading & Binarization
+### 3.1 Binarization and Stroke Measurement
 
 ```python
-img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-_, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+binary, radius_map, line_width = stroke_geometry(image_path)
 ```
 
-- Grayscale loading ensures color images are handled uniformly
-- **Otsu thresholding** automatically selects the optimal binarization threshold
-- `BINARY_INV` means lines (dark pixels) become foreground (255)
+- **Otsu thresholding** with `BINARY_INV`: strokes (dark pixels) become foreground.
+- **Radius map:** the distance of every stroke pixel to the background. Along the skeleton this is the local stroke radius.
+- **Line width:** twice the median radius along the skeleton.
+- **Speck removal:** blobs smaller than half a squared line width are deleted. There is no blur: blurring closes small gaps and moves stroke ends.
 
 ### 3.2 Skeletonization
 
@@ -80,7 +79,18 @@ graph = sknw.build_sknw(skeleton)
 - **Edges** = sequences of skeleton pixels connecting nodes
 - Each edge stores a `pts` attribute: an (N, 2) array of pixel coordinates along the skeleton segment
 
-### 3.4 Chain Traversal
+### 3.4 Spur Pruning
+
+Thinning leaves short branches that are not strokes: at corners, bumps and blunt stroke ends. A terminal branch (one end free, the other on a junction) is removed when either holds:
+
+| Rule | Condition | Why |
+|---|---|---|
+| It does not leave the stroke | length ≤ 1.5 × stroke radius at its junction | a real stub sticks out of the body of the stroke it hangs off |
+| It runs into a corner | radius at its tip < 0.5 × radius at its junction, and length ≤ 3 radii | a real stub keeps its width to its end; an obliquely cut stroke end gives such a branch |
+
+A real stub left by damage next to a junction survives both rules, which a fixed pixel length cannot guarantee.
+
+### 3.5 Chain Traversal
 
 The graph edges are traversed to form continuous chains of pixels:
 
@@ -95,7 +105,13 @@ The graph edges are traversed to form continuous chains of pixels:
 
 **Output:** A list of `_SkeletonChain` objects, each containing an ordered array of (x, y) points.
 
-### 3.5 Schneider's Bézier Fitting Algorithm
+Each chain records for both of its ends whether it is **free** (a degree-1 node of the graph: the stroke stops) or on a **junction**. A chain that returns to its first node is a closed loop.
+
+### 3.6 End Trimming
+
+At a stroke's end the skeleton leaves the centre line. At a blunt end it forks into the two corners of the outline, 1.4 radii of skeleton for one radius of stroke. Each free end is therefore trimmed by 1.5 stroke radii (never by less than 3 px, since pixel quantization does not shrink with the stroke). The stroke radius is the median along the whole chain; the radius at the tip itself says nothing, it is zero in a corner. Junction ends are not trimmed.
+
+### 3.7 Schneider's Bézier Fitting Algorithm
 
 Each chain of pixel coordinates is fitted with one or more cubic Bézier curves using Schneider's algorithm (Philip J. Schneider, "An Algorithm for Automatically Fitting Digitized Curves", Graphics Gems I, 1990).
 
@@ -144,67 +160,26 @@ P₂ = P₃ + α_right · T_right
 t_new = t - (B(t) - point) · B'(t) / (B'(t) · B'(t) + (B(t) - point) · B''(t))
 ```
 
-### 3.6 Endpoint Tangent Estimation
+### 3.8 Free Ends: Direction and Curvature
 
-For each open path, tangent vectors and curvature values are computed at both endpoints:
+Only free ends become endpoints. An end on a junction is connected to other strokes and is not a place where a stroke could be missing; in the test drawings such ends were 43% of all path ends and under 1% of them lay at a true gap.
 
-#### Derivative Tangent
+The direction of a stroke at a free end is taken from the stroke *behind* the end, not from the last few pixels:
 
-Directly from the Bézier control points:
-```
-B'(0) = 3(P₁ - P₀)    → tangent at start
-B'(1) = 3(P₃ - P₂)    → tangent at end
-```
-The tangent is negated to point **outward** (away from the path interior).
+1. Take the stretch of the path within **6 stroke widths** of the end (or the whole path if it is shorter).
+2. Fit the circular arc through three points: the end, the middle of the stretch and its far end. Three points in line give a straight line.
+3. If the stretch does not follow that arc to within **half a stroke radius** (it contains a corner, say), halve the stretch and fit again, at most twice.
+4. The **tangent** is the arc's tangent at the end, pointing outward. The **signed curvature** is the arc's curvature: positive when the stroke, followed towards the end, turns towards `(-tangent.y, tangent.x)`.
 
-#### Multi-Scale PCA Context Tangent
+This is exact for straight strokes and circular arcs, and an error of a pixel in one of the three points turns the tangent by a fraction of a degree, because the points are several stroke widths apart.
 
-A more robust tangent estimate using local path samples:
-
-1. **Sample the path** at 24 points per segment
-2. **Remove duplicate points** (distance < 1e-6)
-3. **Run PCA at 4 window sizes:** 10%, 15%, 20%, 25% of path length
-4. For each window:
-   - Extract local points near the endpoint
-   - Center points (subtract mean)
-   - Compute covariance matrix and eigenvectors
-   - Principal eigenvector = dominant direction
-   - Orient to point outward (dot product with reference direction)
-   - Confidence = `0.5 × linearity + 0.5 × directional_alignment`
-     - Linearity = `eigenvalue_max / sum(eigenvalues)`
-     - Directional alignment = `max(0, dot(principal, outward_ref))`
-5. **Circular mean:** Weighted average of all 4 directional estimates
-6. **Final confidence:** `R × mean(weights)` where R is the resultant length
-
-#### Tangent Blending
-
-The final tangent is a blend of derivative and context tangents:
-
-```python
-if confidence < 0.40:
-    blend = clip(confidence, 0.05, 0.35)  # Low confidence → favor derivative
-else:
-    blend = clip(confidence, 0.40, 0.88)  # High confidence → favor context
-
-tangent = normalize((1 - blend) × derivative_tangent + blend × context_tangent)
-```
-
-**Safety check:** If the blended tangent points into the path interior (dot with interior direction > 0.50), it is flipped and confidence is halved.
-
-#### Curvature
-
-Computed from Bézier first and second derivatives:
-```
-κ = |x'y'' - y'x''| / (x'² + y'²)^(3/2)
-```
-
-### 3.7 Distance Map
+### 3.9 Distance Map
 
 ```python
 dist_map = cv2.distanceTransform((255 - binary), cv2.DIST_L2, 5)
 ```
 
-The distance map stores, for each pixel, the Euclidean distance to the nearest foreground (line) pixel. This is used in Phase 4 for bridge collision detection.
+For each pixel, the distance to the nearest stroke pixel (0 on strokes). Phase 3 uses it to measure how much existing stroke a candidate bridge would run over.
 
 ---
 
@@ -219,9 +194,10 @@ class EndpointInfo:
     path_index: int          # Index into ExtractionResult.paths
     end: str                 # "start" | "end"
     position: np.ndarray     # (x, y) pixel coordinates
-    tangent: np.ndarray      # Unit tangent pointing outward from path
-    curvature: float         # Unsigned curvature κ at endpoint
-    tangent_confidence: float  # 0.0–1.0 confidence in tangent direction
+    tangent: np.ndarray      # Unit tangent pointing outward from the path
+    curvature: float         # Unsigned curvature of the stroke as it reaches this end
+    radius: float            # Radius (half the width) of the stroke
+    signed_curvature: float  # The same curvature with its sign
 ```
 
 ### ExtractionResult
@@ -230,10 +206,11 @@ class EndpointInfo:
 @dataclass
 class ExtractionResult:
     paths: List[BezierPath]          # All extracted Bézier paths
-    endpoints: List[EndpointInfo]    # Endpoints of open paths only
+    endpoints: List[EndpointInfo]    # Free ends only: where a stroke stops
     image_shape: Tuple[int, int]     # (height, width)
     diagonal: float                  # √(h² + w²)
-    dist_map: Optional[np.ndarray]   # Distance map from lines
+    dist_map: Optional[np.ndarray]   # Distance of every pixel to the nearest stroke
+    line_width: float                # Typical stroke width of the drawing, in pixels
 ```
 
 ### BezierSegment & BezierPath
@@ -249,6 +226,8 @@ class BezierPath:
     segments: List[BezierSegment]  # Ordered sequence of cubic segments
     is_closed: bool                # Whether the path forms a loop
     source_type: str               # "skeleton" | "restored"
+    start_free: bool               # The stroke stops at its start (not on a junction)
+    end_free: bool                 # ... and at its end
 ```
 
 ---
@@ -258,21 +237,26 @@ class BezierPath:
 ```python
 def extract_paths(
     image_path: str,
-    max_error: float = 2.0,       # Schneider fitting tolerance (pixels²)
-    spur_threshold: float = 12.0, # Minimum path length to keep
-    merge_radius: float = 5.0,    # Endpoint merge radius
+    max_error: float = 2.0,       # Schneider fitting tolerance (pixels)
 ) -> ExtractionResult:
 ```
 
 ---
 
-## 6. Configuration Parameters
+## 6. Constants
 
-| Parameter | Default | Description |
+All are multiples of the stroke radius or width, set from the geometry described above, not fitted to the test images. The gap benchmark moves little when any of them is set clearly lower or higher (see the README).
+
+| Constant | Value | Meaning |
 |---|---|---|
-| `max_error` | 2.0 | Maximum squared error for Schneider fitting (pixels²) |
-| `spur_threshold` | 12.0 | Minimum path arc length to keep (removes noise spurs) |
-| `merge_radius` | 5.0 | Radius for merging nearby endpoints |
+| `SPUR_RADIUS_FACTOR` | 1.5 radii | longest terminal branch that counts as not leaving its stroke |
+| `CORNER_TIP_RADIUS_RATIO` | 0.5 | tip radius / junction radius below which a branch runs into a corner |
+| `CORNER_BRANCH_MAX_RADII` | 3 radii | longest such corner branch |
+| `END_TRIM_RADII` | 1.5 radii | stretch trimmed from a free end |
+| `END_TRIM_MIN_PX` | 3 px | least trim, whatever the stroke width |
+| `SPECK_AREA_WIDTHS2` | 0.5 widths² | blobs below this area are specks |
+| `DIRECTION_WINDOW_WIDTHS` | 6 widths | stretch behind an end its direction is taken from |
+| `ARC_FIT_RADII` | 0.5 radii | how closely that stretch must follow one arc |
 
 ---
 
@@ -280,7 +264,7 @@ def extract_paths(
 
 | Library | Usage |
 |---|---|
-| `opencv-python` | Image I/O, binarization, morphology, distance transform, contour detection |
+| `opencv-python` | Image I/O, binarization, distance transform |
 | `scikit-image` | Morphological skeletonization |
 | `sknw` | Skeleton-to-graph conversion |
 | `numpy` | Array operations, linear algebra |

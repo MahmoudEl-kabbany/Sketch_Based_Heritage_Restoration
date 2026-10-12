@@ -1,162 +1,99 @@
 # Phase 4 — ASP Decision Engine
 
 > **Source file:** [`restoration/asp_engine.py`](../restoration/asp_engine.py)  
-> **ASP Rules:** [`restoration/asp_rules/restoration.lp`](../restoration/asp_rules/restoration.lp)
+> **Rules:** [`restoration/asp_rules/restoration.lp`](../restoration/asp_rules/restoration.lp)
 
 ---
 
 ## 1. Purpose
 
-Phase 4 frames the candidate selection process as an Answer Set Programming (ASP) problem. Instead of greedily picking connections, it globally optimizes the entire connection set simultaneously. 
+Phase 3 says how likely each candidate bridge is on its own. Candidates compete: a stroke end can be continued by one bridge only. Phase 4 chooses the **most plausible set of bridges that fit together**, with an Answer Set Programming solver (clingo).
 
-It guarantees that:
-- No endpoint is connected more than once (degree constraint)
-- The chosen set of bridges maximizes the overall "utility" (sum of candidate scores with context-aware adjustments)
-- Cross-shape false positive connections are mathematically suppressed
-- The same candidates always produce the same set of bridges (the solve is deterministic)
+The solver's answer is final. Nothing is removed from it afterwards; an earlier version deleted bridges after the solve, which left their stroke ends with no chance to take their next-best partner.
 
 ---
 
 ## 2. Pipeline Overview
 
 ```
-List[ConnectionCandidate]
+Scored candidates
     │
-    ├─► Prune strictly dominated candidates (reduce search space)
-    │
-    ├─► Encode candidates to ASP facts (strings)
-    │       └─► Compute effective utility per candidate
-    │
-    ├─► Call Clingo once for the whole image
-    │
-    └─► Decode accepted candidate IDs
-            └─► List[ConnectionCandidate] (accepted only)
+    ├─► Keep the candidates above the acceptance threshold (positive utility)
+    ├─► Encode them as ASP facts
+    ├─► Solve: maximize total utility, each stroke end used at most once
+    └─► Decode accepted ids back to ConnectionCandidate objects
 ```
 
 ---
 
-## 3. Encoding to ASP Facts
-
-The system converts Python objects into logic programming facts. 
-
-### 3.1 Core Facts
-
-For each candidate, the following facts are generated:
-```prolog
-% candidate(CandidateID, PathIndexA, EndA, PathIndexB, EndB, ScaledScore).
-% End maps: 0 = start, 1 = end. Score is int(float_score * 100).
-candidate(42, 0, 1, 3, 0, 85).
-
-% Maps CandidateID to unique endpoint tokens (stable IDs).
-candidate_endpoint(42, TokenA, TokenB).
-
-% Indicates this candidate closes a loop on a single path.
-candidate_self_closure(42).
-```
-
-### 3.2 Effective Utility
-
-To keep the ASP logic simple, many of the soft constraints and context adjustments are pre-calculated in Python and bundled into a single `candidate_utility` fact.
+## 3. Utility
 
 ```python
-def _candidate_effective_utility(candidate, path_strength):
-    utility = int(candidate.score * 100)
-    
-    # Closure reward (+3 for strong closure, +2 for same-path)
-    if closure_flag: utility += 3
-    if same_path_closure: utility += 2
-    
-    # Cross-shape suppression
-    # If a path has strong self-closure options (bucket 1 or 2), 
-    # cross-path candidates touching it lose utility (-2 or -4).
-    if bucket == 1: utility -= 2
-    elif bucket == 2: utility -= 4
-        
-    # Weak continuation penalty
-    if continuation_int < 40: utility -= 2
-        
-    # Weak extension penalty
-    if extension_quality < 45: utility -= 3
-        
-    # Tier 2 penalty
-    if tier == 2: utility -= 1
-        
-    return utility
+utility = round(candidate.score * 10)
 ```
 
-Generated fact:
-```prolog
-candidate_utility(42, 87).
-```
+`score` is the candidate's log-odds above the acceptance threshold (Phase 3). The utility of a set of bridges is the sum of their utilities, so the solver maximizes the summed log-odds of the bridges it draws.
+
+- A candidate at or below the threshold has no positive utility. Accepting it could only lower the total, so it is not passed to the solver at all. This keeps the program small: a few dozen candidates per image.
+- There are no other terms. The reward for connecting both ends of a path, the bonuses for closures and the penalties by scenario that this phase used to add by hand are gone; what they tried to express is now a fitted measurement in Phase 3 or was measured and found not to help (section 6).
 
 ---
 
 ## 4. ASP Rules (`restoration.lp`)
 
-The core logic is handled by `clingo` using the generated facts.
+Facts, one per candidate:
 
-### 4.1 Choice Rule
 ```prolog
-% We can choose to accept any candidate
-{ accept(Id) } :- candidate(Id, _, _, _, _, _).
+candidate(Id, EndpointA, EndpointB, Utility).
 ```
 
-### 4.2 Hard Constraints
+Rules:
+
 ```prolog
-% Extract all endpoints used by candidates
-uses_endpoint(Id, E) :- candidate_endpoint(Id, E, _).
-uses_endpoint(Id, E) :- candidate_endpoint(Id, _, E).
-endpoint_key(E) :- uses_endpoint(_, E).
+% Choice: accept or reject each candidate
+{ accept(Id) } :- candidate(Id, _, _, _).
 
-% No endpoint can be used by more than one accepted candidate
-:- endpoint_key(E), 2 { accept(Id) : uses_endpoint(Id, E) }.
+% A stroke end can be continued by at most one bridge
+uses_endpoint(Id, E) :- candidate(Id, E, _, _).
+uses_endpoint(Id, E) :- candidate(Id, _, E, _).
+:- uses_endpoint(_, E), 2 { accept(Id) : uses_endpoint(Id, E) }.
 
-% Prevent trivial 0-length loops (connecting a path to itself if it's not a self_closure)
-:- accept(Id), candidate(Id, P, _, P, _, _), not candidate_self_closure(Id).
-```
+% The most plausible set of bridges
+#maximize { Utility@1, Id : accept(Id), candidate(Id, _, _, Utility) }.
 
-### 4.3 Objective Function
-```prolog
-% 1st priority: maximize the sum of utilities of all accepted candidates
-#maximize { Utility@2, Id : accept(Id), candidate_utility(Id, Utility) }.
-
-% 2nd priority: prefer answers that connect both ends of more paths
-#maximize { 8@1, P : path_fully_connected(P) }.
-
-% 3rd priority (tie-break): prefer fewer bridges
+% Among otherwise equal answers, prefer fewer bridges
 #minimize { 1@0, Id : accept(Id) }.
 ```
 
-A bridge with utility 0 that completes no path has nothing in its favour, so the tie-break leaves it out.
+The two shapes of bridge between the same pair of ends share both ends, so at most one of them is accepted: the more probable one.
 
 ---
 
-## 5. Optimization & Performance
-
-### 5.1 Strict Dominance Pruning
-If two candidates use the *exact same two endpoints*, only the one with the highest utility is kept. The other is permanently dropped before solving. (Exception: same-path closures are never pruned, as they influence soft suppression logic).
-
-### 5.2 One Program per Image
-All candidates of an image are solved together. Splitting them into independent endpoint-conflict components is not valid here: the reward for connecting both ends of a path (`path_fully_connected`) links the two endpoints of that path, and they can fall into different components.
-
-### 5.3 Deterministic Solver Settings
-`clingo` is run on a single thread with `--opt-mode=optN --opt-strategy=usc`. Core-guided optimization proves the optimum in milliseconds on these programs (about 0.4 s for the whole 32-image test set). With several threads the answer picked among equally good ones depends on which thread finishes first, so results differed between runs of the same input.
-
----
-
-## 6. Decoding
-
-After `clingo` finds the optimal model, it outputs `accept(Id)` atoms. These integer IDs are mapped back to the original `ConnectionCandidate` objects in Python.
+## 5. Deterministic Solving
 
 ```python
-def decode_solution(accepted_ids, candidates):
-    id_set = set(accepted_ids)
-    return [c for c in candidates if c.id in id_set]
+["--models=1", "--opt-mode=optN", "--opt-strategy=usc"]
 ```
+
+- One program per image, on a single thread: the same candidates always give the same bridges. With several threads the choice among equally good answers depends on which thread finishes first.
+- Core-guided optimization (`usc`) proves the optimum in milliseconds on these programs.
+- `asp_timeout_s` (default 30 s) bounds the solve; it is not reached in practice.
 
 ---
 
-## 7. Entry Point
+## 6. Measured and Left Out
+
+Each of these was tried on the benchmark (README) and kept only if it reduced the line drawn off the drawing without losing repaired gaps, or the reverse.
+
+| Idea | Effect | Decision |
+|---|---|---|
+| Accepted bridges may not cross each other | −1.4 points of gap recall, no fewer wrong strokes: it forbids the repair of an erased crossing, which needs two bridges that cross | left out |
+| Reward for a path with both ends bridged | +0.5 to +1.1 points of gap recall, 33% to 80% more line off the drawing | left out |
+| Image-mask veto after the solve | replaced by the `crossed_ink` measurement, which the solver sees | removed |
+
+---
+
+## 7. Entry Points
 
 ```python
 def solve_candidates(
@@ -164,7 +101,9 @@ def solve_candidates(
     rules_path: str = RULES_PATH,
     max_solutions: int = 1,
     timeout_s: float = 30.0,
-) -> Tuple[List[int], Dict[str, Any]]:
+) -> Tuple[List[int], Dict[str, Any]]:      # accepted ids, solver statistics
+
+def decode_solution(accepted_ids, candidates) -> List[ConnectionCandidate]
 ```
 
 ---
@@ -173,4 +112,4 @@ def solve_candidates(
 
 | Library | Usage |
 |---|---|
-| `clingo` | ASP Grounding and Solving Engine |
+| `clingo` | ASP grounding and solving |
