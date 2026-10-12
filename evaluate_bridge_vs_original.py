@@ -14,33 +14,13 @@ from scipy.spatial import cKDTree
 from evaluate_restoration import discover_pairs
 from restoration.extraction import extract_paths
 from restoration.candidates import generate_candidates
-from restoration.scoring import compute_mdtw, compute_mjerk, score_candidates
+from restoration.scoring import compute_mdtw, compute_mjerk, context_curve, score_candidates
 from restoration.asp_engine import solve_candidates
 
 MJERK_SCALE = 1e46
 
 # evaluate_image() result keys: one list of per-curve values each.
 RESULT_KEYS = ("chosen_mdtw", "chosen_mjerk", "rejected_mdtw", "rejected_mjerk", "orig_mdtw", "orig_mjerk")
-
-
-def _bridge_with_context(c, paths, tail_len):
-    """The candidate's bridge with *tail_len* samples of each connected path."""
-    source_samples = paths[c.ep_a.path_index].sample(pts_per_segment=50)
-    target_samples = paths[c.ep_b.path_index].sample(pts_per_segment=50)
-
-    # NOTE: EndpointInfo.end is only ever "start" or "end", so both conditions
-    # below are always False and the else branches always run.
-    if c.ep_a.end == "back":
-        source_tail = source_samples[-tail_len:]
-    else:
-        source_tail = source_samples[:tail_len][::-1]
-
-    if c.ep_b.end == "front":
-        target_head = target_samples[:tail_len]
-    else:
-        target_head = target_samples[-tail_len:][::-1]
-
-    return np.vstack([source_tail, c.bridge_points, target_head])
 
 
 def evaluate_image(damaged_path: str, orig_path: str, tail_len=20):
@@ -67,8 +47,9 @@ def evaluate_image(damaged_path: str, orig_path: str, tail_len=20):
         return out
     kdtree = cKDTree(np.vstack(orig_path_samples))
 
+    dense_samples = [p.sample(pts_per_segment=50) for p in dmg_ext.paths]
     for c in scored:
-        combined_dmg = _bridge_with_context(c, dmg_ext.paths, tail_len)
+        combined_dmg = context_curve(c, dense_samples, tail_len)
         c_mdtw = compute_mdtw(combined_dmg)
         c_mjerk = compute_mjerk(combined_dmg)
 

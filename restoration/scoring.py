@@ -43,13 +43,22 @@ WEIGHTS_TIER2 = {
 # ═══════════════════════════════════════════════════════════════════════════
 
 def context_curve(
-    bridge_pts: np.ndarray,
-    source_samples: np.ndarray,
-    target_samples: np.ndarray,
+    candidate: ConnectionCandidate,
+    dense_samples: List[np.ndarray],
     tail_len: int = 20,
 ) -> np.ndarray:
-    """The bridge with its local context: source tail + bridge + target head."""
-    return np.vstack([source_samples[-tail_len:], bridge_pts, target_samples[:tail_len]])
+    """The candidate's bridge with its local context, as one continuous curve.
+
+    *dense_samples[i]* are the samples of path i from its start to its end.
+    The curve is the last *tail_len* samples of the source path running into
+    ep_a, the bridge from ep_a to ep_b, then the first *tail_len* samples of
+    the target path running away from ep_b.
+    """
+    source = dense_samples[candidate.ep_a.path_index]
+    target = dense_samples[candidate.ep_b.path_index]
+    into_a = source[-tail_len:] if candidate.ep_a.end == "end" else source[:tail_len][::-1]
+    away_from_b = target[:tail_len] if candidate.ep_b.end == "start" else target[-tail_len:][::-1]
+    return np.vstack([into_a, candidate.bridge_points, away_from_b])
 
 
 def compute_mdtw(combined: np.ndarray) -> float:
@@ -259,17 +268,11 @@ def score_candidates(
         path_indices = np.array(path_indices)
 
     # Compute raw metrics on each bridge together with its local path context
-    dense_samples: Dict[int, np.ndarray] = {}
-
-    def dense(path_index: int) -> np.ndarray:
-        if path_index not in dense_samples:
-            dense_samples[path_index] = paths[path_index].sample(pts_per_segment=50)
-        return dense_samples[path_index]
-
+    dense_samples = [p.sample(pts_per_segment=50) for p in paths]
     raw_dtw: List[float] = []
     raw_jerk: List[float] = []
     for c in candidates:
-        combined = context_curve(c.bridge_points, dense(c.ep_a.path_index), dense(c.ep_b.path_index))
+        combined = context_curve(c, dense_samples)
         raw_dtw.append(compute_mdtw(combined))
         raw_jerk.append(compute_mjerk(combined))
 
