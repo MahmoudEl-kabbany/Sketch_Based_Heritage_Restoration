@@ -24,6 +24,13 @@ import sknw
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
 
+# sknw compiles its numba functions without an on-disk cache, which costs a few
+# seconds in every new process. Turn the cache on so only the first run compiles.
+for _name in ("mark", "idx2rc", "fill", "trace", "parse_struc"):
+    _compiled = getattr(sknw.sknw, _name, None)
+    if hasattr(_compiled, "enable_caching"):
+        _compiled.enable_caching()
+
 
 def bezier_eval(cp: np.ndarray, ts: np.ndarray) -> np.ndarray:
     """Evaluate the cubic Bezier with control points *cp* (4, 2) at parameters *ts* (n,)."""
@@ -109,17 +116,18 @@ def _chord_length_parameterize(points: np.ndarray) -> np.ndarray:
     return cumlen / total
 
 
-def _turning_angles_deg(vectors: np.ndarray) -> List[Optional[float]]:
-    """Angle between each consecutive pair of vectors (None where one is degenerate)."""
-    angles: List[Optional[float]] = []
-    for a, b in zip(vectors[:-1], vectors[1:]):
-        na = np.linalg.norm(a)
-        nb = np.linalg.norm(b)
-        if na < 1e-12 or nb < 1e-12:
-            angles.append(None)
-            continue
-        dot = float(np.clip(np.dot(a / na, b / nb), -1.0, 1.0))
-        angles.append(float(np.degrees(np.arccos(dot))))
+def _turning_angles_deg(vectors: np.ndarray) -> np.ndarray:
+    """Angle between each consecutive pair of vectors (NaN where one is degenerate)."""
+    if len(vectors) < 2:
+        return np.empty(0, dtype=np.float64)
+
+    a, b = vectors[:-1], vectors[1:]
+    na = np.sqrt(np.einsum("ij,ij->i", a, a))
+    nb = np.sqrt(np.einsum("ij,ij->i", b, b))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        dot = np.einsum("ij,ij->i", a / na[:, np.newaxis], b / nb[:, np.newaxis])
+        angles = np.degrees(np.arccos(np.clip(dot, -1.0, 1.0)))
+    angles[(na < 1e-12) | (nb < 1e-12)] = np.nan
     return angles
 
 
@@ -157,11 +165,10 @@ def _estimate_tangent(points: np.ndarray, end: str, lookahead: int = 10, skip_ti
     weights = np.exp(-decay_rate * np.arange(n_vecs))
 
     # Down-weight vectors at high local curvature (turning angle > 25°).
-    for i, angle in enumerate(_turning_angles_deg(vectors)):
-        if angle is not None and angle > 25.0:
-            # Reduce influence of vectors around the turning point.
-            weights[i] *= 0.3
-            weights[i + 1] *= 0.3
+    for i in np.flatnonzero(_turning_angles_deg(vectors) > 25.0):
+        # Reduce influence of vectors around the turning point.
+        weights[i] *= 0.3
+        weights[i + 1] *= 0.3
 
     tangent = np.zeros(2, dtype=np.float64)
     for vec, w in zip(vectors, weights):
@@ -298,8 +305,9 @@ def _point_line_distances_sq(points: np.ndarray, p0: np.ndarray, p1: np.ndarray)
 
 def _max_turning_angle_deg(points: np.ndarray) -> float:
     """Maximum local turning angle in degrees for a polyline."""
-    angles = [a for a in _turning_angles_deg(np.diff(points, axis=0)) if a is not None]
-    return max(angles, default=0.0)
+    angles = _turning_angles_deg(np.diff(points, axis=0))
+    angles = angles[~np.isnan(angles)]
+    return float(angles.max()) if len(angles) else 0.0
 
 
 def _dominant_turn_index(points: np.ndarray, angle_threshold_deg: float = 70.0) -> Optional[int]:
@@ -309,15 +317,12 @@ def _dominant_turn_index(points: np.ndarray, angle_threshold_deg: float = 70.0) 
 
     # The turn at point i is the angle between the steps into and out of it;
     # the turn at the last interior point is not considered.
-    best_angle = angle_threshold_deg
-    best_idx: Optional[int] = None
-    for i, angle in enumerate(_turning_angles_deg(np.diff(points, axis=0))[:-1], 1):
-        if angle is not None and angle > best_angle:
-            best_angle = angle
-            best_idx = i
-
-    if best_idx is None:
+    angles = _turning_angles_deg(np.diff(points, axis=0))[:-1]
+    angles = np.where(np.isnan(angles), -np.inf, angles)
+    if angles.max() <= angle_threshold_deg:
         return None
+
+    best_idx = int(np.argmax(angles)) + 1  # first point with the sharpest turn
     return max(1, min(best_idx, len(points) - 2))
 
 
