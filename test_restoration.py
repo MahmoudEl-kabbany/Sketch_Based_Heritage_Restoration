@@ -229,3 +229,30 @@ def test_spline_matches_scipy_bit_for_bit():
             x = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))))
             at = np.linspace(0.0, x[-1], 3 * n)
             assert np.array_equal(not_a_knot_spline(x, points, at), CubicSpline(x, points)(at))
+
+
+def test_preprocessing_variants_are_validated_and_run(tmp_path, monkeypatch):
+    import json
+
+    import pytest
+
+    from restoration.preprocess import ENV_VAR, PreprocessConfig
+
+    with pytest.raises(ValueError):
+        PreprocessConfig(threshold="nope")
+    with pytest.raises(ValueError):
+        PreprocessConfig.from_dict({"no_such_option": 1})
+    monkeypatch.setenv(ENV_VAR, json.dumps({"threshold": "sauvola"}))
+    assert PreprocessConfig.from_env().threshold == "sauvola"
+    monkeypatch.delenv(ENV_VAR)
+    assert PreprocessConfig.from_env() == PreprocessConfig()
+
+    image = draw(tmp_path / "gap.png", [[[30, 120], [130, 120]], [[160, 120], [290, 120]], [[30, 60], [290, 60]]])
+    variants = [
+        {}, {"threshold": "sauvola"}, {"threshold": "niblack"}, {"threshold": "adaptive_gaussian"},
+        {"denoise": "median"}, {"denoise": "nlmeans", "denoise_size": 10}, {"close_px": 3},
+        {"skeleton": "lee"}, {"junction_aware_pruning": True},
+    ]
+    for overrides in variants:
+        extraction = extract_paths(image, preprocess=PreprocessConfig(**overrides))
+        assert len(extraction.endpoints) == 6, overrides     # three lines, two free ends each

@@ -1,7 +1,7 @@
 # Phase 1 — Extraction
 
 > **Source file:** [`restoration/extraction.py`](../restoration/extraction.py)
-> **Supporting module:** [`bezier_curves/bezier.py`](../bezier_curves/bezier.py)
+> **Supporting modules:** [`bezier_curves/bezier.py`](../bezier_curves/bezier.py), [`restoration/preprocess.py`](../restoration/preprocess.py)
 
 ---
 
@@ -54,6 +54,21 @@ binary, radius_map, line_width = stroke_geometry(image_path)
 - **Radius map:** the distance of every stroke pixel to the background. Along the skeleton this is the local stroke radius.
 - **Line width:** twice the median radius along the skeleton.
 - **Speck removal:** blobs smaller than half a squared line width are deleted. There is no blur: blurring closes small gaps and moves stroke ends.
+- The skeleton used for the line width is the same one the graph is built from (§3.2): the mask, the radius map, the skeleton and the distance map all come from one binarization.
+
+#### Preprocessing variants (experimental, off by default)
+
+`restoration/preprocess.py` holds this step. `PreprocessConfig()` is exactly the behaviour above; its fields select variants for experiments, passed as `extract_paths(..., preprocess=cfg)` / `restore(..., preprocess=cfg)`, or for whole benchmark runs as JSON in the environment variable `SKETCH_PREPROCESS` (`check_changes.py --preprocess '{...}'` sets it):
+
+| Field | Default | Options |
+|---|---|---|
+| `threshold` | `"otsu"` | `"sauvola"`, `"niblack"` (scikit-image, `window`, `k`), `"adaptive_gaussian"` (OpenCV, `window`, `adaptive_c`) |
+| `denoise` | `"none"` | `"median"` (kernel `denoise_size`), `"nlmeans"` (strength `denoise_size`), on the gray image before thresholding |
+| `close_px` | `0` | morphological closing of the mask with an elliptical kernel of this size |
+| `skeleton` | `"zhang"` | `"lee"` |
+| `junction_aware_pruning` | `False` | prune a spur (§3.4) only where its junction keeps two other branches longer than 3 junction radii |
+
+The measured effect of each is in [experiments/WP-3.md](experiments/WP-3.md).
 
 ### 3.2 Skeletonization
 

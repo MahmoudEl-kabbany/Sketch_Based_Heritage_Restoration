@@ -37,6 +37,7 @@ import train_scoring
 from evaluate_gaps import COVERAGE_THRESHOLD, TOLERANCE_LINE_WIDTHS, evaluate_pair, summarize
 from evaluate_restoration import discover_pairs, evaluate_single
 from restoration.pipeline import default_workers, map_in_processes
+from restoration.preprocess import ENV_VAR as PREPROCESS_ENV_VAR, PreprocessConfig
 from restoration.scoring import MODEL_PATH
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -149,6 +150,8 @@ def measure(model_of: Dict[str, str], output_dir: str, workers: int) -> Dict[str
             "psnr": round(float(np.mean([m.psnr_after for m in metrics])), 3),
             "ssim": round(float(np.mean([m.ssim_after for m in metrics])), 4),
         },
+        # Share of the true gaps by how far the pipeline got (endpoints_missing = extraction misses).
+        "stages": {stage: round(100.0 * share, 2) for stage, share in summary["stages"].items()},
         "images": {
             row["name"]: {
                 "gaps": len(row["gaps"]),
@@ -256,7 +259,17 @@ def main() -> None:
                         help=f"Where reports and intermediate files go (default: {DEFAULT_OUTPUT_DIR}).")
     parser.add_argument("--workers", type=int, default=default_workers(),
                         help="Images processed in parallel (1 = one at a time).")
+    parser.add_argument("--preprocess", default=None, metavar="JSON",
+                        help="Preprocessing variant to test, as PreprocessConfig overrides, "
+                             "e.g. '{\"threshold\": \"sauvola\"}' (see restoration/preprocess.py).")
     args = parser.parse_args()
+    if args.preprocess:
+        # Validate now; the variable reaches every worker process, which calls extract_paths itself.
+        variant = PreprocessConfig.from_dict(json.loads(args.preprocess))
+        os.environ[PREPROCESS_ENV_VAR] = json.dumps(variant.to_dict())
+        print(f"  Preprocessing variant: {args.preprocess}")
+        if args.save_baseline:
+            print("  Note: the baseline is being saved for a non-default preprocessing variant.")
     os.makedirs(args.output_dir, exist_ok=True)
     started = time.perf_counter()
 

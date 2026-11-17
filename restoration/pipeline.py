@@ -26,6 +26,7 @@ import numpy as np
 
 from bezier_curves.bezier import BezierPath, BezierSegment
 from restoration.extraction import EndpointInfo, ExtractionResult, extract_paths
+from restoration.preprocess import PreprocessConfig
 from restoration.candidates import ConnectionCandidate, generate_candidates
 from restoration.scoring import FEATURE_SCALES, FEATURES, MODEL_PATH, ScoringModel, load_model, score_candidates
 from restoration.asp_engine import decode_solution, solve_candidates, utility, RULES_PATH
@@ -655,6 +656,7 @@ def restore(
     output_dir: str = OUTPUT_DIR,
     asp_timeout_s: float = 30.0,
     save_images: bool = True,
+    preprocess: Optional[PreprocessConfig] = None,
 ) -> RestorationResult:
     """Restore a single damaged sketch image.
 
@@ -673,6 +675,8 @@ def restore(
         asp_timeout_s: max time in seconds for the ASP solver
         save_images: write the two overlays and the comparison figure; the
             JSON report is written either way
+        preprocess: preprocessing variant (restoration.preprocess); default
+            the original behaviour, or the one named by SKETCH_PREPROCESS
 
     Returns:
         RestorationResult with original paths, restored paths, bridges, and report
@@ -695,7 +699,7 @@ def restore(
     # Phase 1: Extraction
     print("  Phase 1: Extracting paths and endpoints...")
     with _timed(stage_timings, "phase1_extraction_s"):
-        extraction = extract_paths(image_path)
+        extraction = extract_paths(image_path, preprocess=preprocess)
     print(f"    {len(extraction.paths)} paths, "
           f"{len(extraction.endpoints)} free ends, "
           f"line width = {extraction.line_width:.1f}px")

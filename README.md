@@ -139,6 +139,7 @@ Sketch_Based_Heritage_Restoration/
 ├── restoration/                    # Core restoration engine
 │   ├── __init__.py                 # Package entry point & API reference
 │   ├── pipeline.py                 # Phase 7 — Pipeline orchestrator (main API)
+│   ├── preprocess.py               # Phase 1 — Binarization, stroke mask, skeleton (with experimental variants)
 │   ├── extraction.py               # Phase 1 — Skeleton → Bézier extraction
 │   ├── candidates.py               # Phase 2 — Candidate bridges between free stroke ends
 │   ├── scoring.py                  # Phase 3 — Measurements and fitted scorecards
@@ -169,7 +170,8 @@ Sketch_Based_Heritage_Restoration/
 ├── test_regression.py              # Output identical to the snapshot; determinism
 ├── regression_snapshot.py          # Records / compares the exact-output snapshot
 ├── regression/snapshot/            # The recorded snapshot (one JSON per benchmark image)
-└── scripts/profile_pipeline.py     # Per-stage timings vs. drawing size; cProfile
+├── scripts/profile_pipeline.py     # Per-stage timings vs. drawing size; cProfile
+└── scripts/compare_preprocessing.py # Benchmarks preprocessing variants, each with a refitted scorer
 ```
 
 ---

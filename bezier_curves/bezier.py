@@ -22,6 +22,15 @@ import numpy as np
 from skimage.morphology import skeletonize
 import sknw
 
+from restoration.preprocess import (
+    SPECK_AREA_WIDTHS2,
+    PreprocessConfig,
+    StrokeGeometry,
+    resolve as resolve_preprocess,
+    skeleton_of,
+    stroke_geometry_from_file,
+)
+
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
 
 # Sizes used while extracting paths are multiples of the local stroke radius,
@@ -41,8 +50,12 @@ CORNER_BRANCH_MAX_RADII = 3.0
 #    tip, and never within a few pixels of it.
 END_TRIM_RADII = 1.5
 END_TRIM_MIN_PX = 3.0
-#  - Blobs smaller than this many squared line widths are specks, not strokes.
-SPECK_AREA_WIDTHS2 = 0.5
+#  - Blobs smaller than SPECK_AREA_WIDTHS2 (0.5) squared line widths are specks,
+#    not strokes; the constant lives in restoration.preprocess.
+#  - With junction-aware pruning (PreprocessConfig.junction_aware_pruning), a
+#    branch counts as long, i.e. as a real stroke leaving a junction, beyond
+#    this many radii at the junction.
+JUNCTION_LONG_BRANCH_RADII = 3.0
 
 # sknw compiles its numba functions without an on-disk cache, which costs a few
 # seconds in every new process. Turn the cache on so only the first run compiles.
@@ -728,12 +741,24 @@ def _radius_at(radius_map: np.ndarray, xy: np.ndarray, fallback: float) -> float
     return fallback
 
 
-def _prune_skeleton_spurs(graph: Any, radius_map: np.ndarray, fallback_radius: float) -> None:
+def _edge_length(edge: Any) -> float:
+    pts = np.asarray(edge[-1].get("pts", []), dtype=np.float64)
+    return float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1))) if len(pts) >= 2 else 0.0
+
+
+def _prune_skeleton_spurs(
+    graph: Any, radius_map: np.ndarray, fallback_radius: float, junction_aware: bool = False,
+) -> None:
     """Remove terminal branches that do not reach beyond the stroke they hang off.
 
     Thinning leaves short branches at corners, bumps and blunt stroke ends. Such
     a branch is no longer than about one stroke radius at its junction, while a
     real stroke stub sticks out of the stroke's body.
+
+    With *junction_aware*, a branch that qualifies is removed only if at least
+    two other branches longer than JUNCTION_LONG_BRANCH_RADII junction radii
+    leave its junction: a thinning artefact sits on a stroke that runs on
+    through the junction, a short real stroke end may not.
     """
     is_multi = hasattr(graph, "is_multigraph") and graph.is_multigraph()
     changed = True
@@ -751,16 +776,25 @@ def _prune_skeleton_spurs(graph: Any, radius_map: np.ndarray, fallback_radius: f
                 tip, junction = v, u
             else:
                 continue
-            pts = np.asarray(edge[-1].get("pts", []), dtype=np.float64)
-            length = float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1))) if len(pts) >= 2 else 0.0
+            length = _edge_length(edge)
             junction_radius = _radius_at(radius_map, _node_xy(graph, junction), fallback_radius)
             tip_radius = _radius_at(radius_map, _node_xy(graph, tip), fallback_radius)
             runs_into_corner = (
                 tip_radius <= CORNER_TIP_RADIUS_RATIO * junction_radius
                 and length <= CORNER_BRANCH_MAX_RADII * junction_radius
             )
-            if length <= SPUR_RADIUS_FACTOR * junction_radius or runs_into_corner:
-                edges_to_remove.append(edge)
+            if not (length <= SPUR_RADIUS_FACTOR * junction_radius or runs_into_corner):
+                continue
+            if junction_aware:
+                others = graph.edges(junction, keys=True, data=True) if is_multi else graph.edges(junction, data=True)
+                long_branches = sum(
+                    1 for other in others
+                    if {other[0], other[1]} != {u, v}
+                    and _edge_length(other) > JUNCTION_LONG_BRANCH_RADII * junction_radius
+                )
+                if long_branches < 2:
+                    continue
+            edges_to_remove.append(edge)
 
         for edge in edges_to_remove:
             if is_multi:
@@ -799,34 +833,17 @@ def _trim_free_ends(chain: _SkeletonChain, radius_map: np.ndarray, fallback_radi
     return pts[first:len(pts) - last]
 
 
-def stroke_geometry(image_path: str) -> Tuple[np.ndarray, np.ndarray, float]:
+def stroke_geometry(image_path: str, preprocess: Optional["PreprocessConfig"] = None) -> Tuple[np.ndarray, np.ndarray, float]:
     """Binarize a sketch and measure its strokes.
 
     Returns (binary, radius_map, line_width): the stroke mask (255 on strokes)
     with specks removed, the distance of every stroke pixel to the background,
     and the typical line width (twice the median radius along the skeleton).
+    The work is done by restoration.preprocess; *preprocess* selects a variant
+    (default: PreprocessConfig.from_env(), i.e. the original behaviour).
+    The returned tuple also carries the skeleton (a StrokeGeometry).
     """
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise FileNotFoundError(f"Cannot read image: {image_path}")
-
-    _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    def measure(mask: np.ndarray) -> Tuple[np.ndarray, float]:
-        radius_map = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-        on_skeleton = radius_map[skeletonize(mask > 0)]
-        return radius_map, (2.0 * float(np.median(on_skeleton)) if len(on_skeleton) else 2.0)
-
-    radius_map, line_width = measure(binary)
-
-    # Remove specks: blobs much smaller than a piece of stroke one line width long.
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
-    specks = [i for i in range(1, count) if stats[i, cv2.CC_STAT_AREA] < SPECK_AREA_WIDTHS2 * line_width ** 2]
-    if specks:
-        binary[np.isin(labels, specks)] = 0
-        radius_map, line_width = measure(binary)
-
-    return binary, radius_map, line_width
+    return stroke_geometry_from_file(image_path, preprocess)
 
 
 def fit_from_image_skeleton(
@@ -837,18 +854,23 @@ def fit_from_image_skeleton(
     follow_junction_continuation: bool = True,
     junction_min_alignment: float = -0.15,
     geometry: Optional[Tuple[np.ndarray, np.ndarray, float]] = None,
+    preprocess: Optional["PreprocessConfig"] = None,
 ) -> List[BezierPath]:
     """End-to-end: raster image → skeleton → graph → fitted cubic Bezier paths.
 
     Each path records whether its ends are free (the stroke stops there) or
     sit on a junction with other strokes. *geometry* is the result of
-    stroke_geometry(image_path) if the caller already has it.
+    stroke_geometry(image_path) if the caller already has it; *preprocess*
+    selects the preprocessing variant (see restoration.preprocess).
     """
-    binary, radius_map, line_width = geometry or stroke_geometry(image_path)
-    graph = sknw.build_sknw(skeletonize(binary > 0).astype(np.uint8))
+    cfg = resolve_preprocess(preprocess)
+    geometry = geometry or stroke_geometry(image_path, cfg)
+    binary, radius_map, line_width = geometry[:3]
+    skeleton = geometry.skeleton if isinstance(geometry, StrokeGeometry) else skeleton_of(binary, cfg)
+    graph = sknw.build_sknw(skeleton.astype(np.uint8))
 
     fallback_radius = line_width / 2.0
-    _prune_skeleton_spurs(graph, radius_map, fallback_radius)
+    _prune_skeleton_spurs(graph, radius_map, fallback_radius, junction_aware=cfg.junction_aware_pruning)
 
     chains = _build_skeleton_chains(
         graph,

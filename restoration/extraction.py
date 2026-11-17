@@ -13,6 +13,7 @@ import numpy as np
 
 from bezier_curves.bezier import BezierPath, fit_from_image_skeleton, stroke_geometry, stroke_radius
 from restoration.geometry import safe_normalize, visual_order_key
+from restoration.preprocess import PreprocessConfig, resolve as resolve_preprocess
 
 # The direction of a stroke at a free end is that of the longest stretch behind
 # the end, up to this many stroke widths, that follows a single circular arc to
@@ -167,14 +168,20 @@ def _extract_endpoints(
 def extract_paths(
     image_path: str,
     max_error: float = 2.0,
+    preprocess: Optional[PreprocessConfig] = None,
 ) -> ExtractionResult:
-    """Extract Bezier paths, free endpoints, and stroke measurements from a raster image."""
-    geometry = stroke_geometry(image_path)
-    binary, radius_map, line_width = geometry
+    """Extract Bezier paths, free endpoints, and stroke measurements from a raster image.
+
+    *preprocess* selects the preprocessing variant (default: the original
+    behaviour, or the one named by SKETCH_PREPROCESS; see restoration.preprocess).
+    """
+    cfg = resolve_preprocess(preprocess)
+    geometry = stroke_geometry(image_path, cfg)
+    binary, radius_map, line_width = geometry[:3]
     h, w = binary.shape[:2]
 
     # Bezier path extraction via skeleton
-    paths = fit_from_image_skeleton(image_path, max_error=max_error, geometry=geometry)
+    paths = fit_from_image_skeleton(image_path, max_error=max_error, geometry=geometry, preprocess=cfg)
 
     # Ensure visual discovery order (top-down, left-right)
     paths.sort(key=visual_order_key)
