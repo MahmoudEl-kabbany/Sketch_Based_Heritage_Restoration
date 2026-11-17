@@ -100,8 +100,8 @@ The graph edges are traversed to form continuous chains of pixels:
    - Incoming direction is computed from the last ~4 pixels of the current edge
    - Each candidate outgoing edge's direction is computed similarly
    - The edge with the highest `cos(angle)` alignment is chosen
-   - Minimum alignment threshold: `cos(angle) ≥ 0.5` (60° deviation max)
-4. **Cycle collection:** Any unused edges after the main traversal are collected as cycles
+   - Minimum alignment: `cos(angle) ≥ -0.15` (`junction_min_alignment`, default of `fit_from_image_skeleton`), i.e. the chain may turn by up to about 99° through a junction; below that it stops there
+4. **Leftover edges:** edges not used by the walks above (cycles, and the remainder at junctions) are walked in a second pass that follows the best continuation at every junction, with no alignment threshold
 
 **Output:** A list of `_SkeletonChain` objects, each containing an ordered array of (x, y) points.
 
@@ -109,7 +109,7 @@ Each chain records for both of its ends whether it is **free** (a degree-1 node 
 
 ### 3.6 End Trimming
 
-At a stroke's end the skeleton leaves the centre line. At a blunt end it forks into the two corners of the outline, 1.4 radii of skeleton for one radius of stroke. Each free end is therefore trimmed by 1.5 stroke radii (never by less than 3 px, since pixel quantization does not shrink with the stroke). The stroke radius is the median along the whole chain; the radius at the tip itself says nothing, it is zero in a corner. Junction ends are not trimmed.
+At a stroke's end the skeleton leaves the centre line. At a blunt end it forks into the two corners of the outline, 1.4 radii of skeleton for one radius of stroke. Each free end is therefore trimmed by 1.5 stroke radii (never by less than 3 px, since pixel quantization does not shrink with the stroke, and never by more than a quarter of the chain's points). The stroke radius is the median along the whole chain; the radius at the tip itself says nothing, it is zero in a corner. Junction ends are not trimmed.
 
 ### 3.7 Schneider's Bézier Fitting Algorithm
 
@@ -118,21 +118,24 @@ Each chain of pixel coordinates is fitted with one or more cubic Bézier curves 
 #### Core Algorithm
 
 1. **Chord-length parameterization:** Assigns parameter values `t ∈ [0, 1]` to each point based on cumulative arc length
-2. **Tangent estimation:** Weighted tangent at each endpoint using exponential decay and curvature down-weighting:
-   - Lookahead window: 10 points
+2. **Tangent estimation:** Weighted tangent at each end of the chain using exponential decay and curvature down-weighting (`_estimate_tangent`). These tangents only shape the fit; the endpoint direction used by later phases comes from §3.8:
+   - Lookahead window: 8 points (`tangent_lookahead` of `fit_from_image_skeleton`; `_estimate_tangent`'s own default of 10 is not used by the pipeline)
    - Skip tip: 2 pixels (to avoid noisy terminal pixels)
-   - Turning angle > 25° → weight reduced by 70%
+   - Weights decay exponentially so the farthest step weighs about 30% of the nearest
+   - Turning angle > 25° → weight of the steps around it reduced by 70%
 3. **Least-squares fit:** Solves a 2×2 linear system to find optimal control point positions P₁ and P₂ that minimize the sum of squared distances
 4. **Newton-Raphson reparameterization:** Iteratively improves parameter values (up to 4 iterations)
 5. **Error evaluation:** Computes max and mean squared error between the fitted curve and original points
 
-#### Splitting Strategy
+#### Fitting and Splitting
 
-If the fit error exceeds the tolerance (default: `max_error = 2.0` pixels²):
+`max_error` (default 2.0) is a distance in **pixels**; it is squared before it is passed to `_fit_cubic_single`, which compares it with squared point-to-curve distances. For each run of points, in this order:
 
-- **Corner detection first:** If a dominant turning angle > 72° exists, split there
-- **Near-straight detection:** If the points are nearly linear (max deviation ≤ √max_error × 0.75, mean deviation ≤ 70% of that, turning angle ≤ 32°), use an exactly straight cubic
-- **Recursive splitting:** Split at the point of maximum error and recursively fit each half
+1. **Near-straight:** if the points are nearly linear (max deviation from the chord ≤ max(0.5 px, 0.75 × `max_error`), RMS deviation ≤ 70% of that, turning angle ≤ 32°), use an exactly straight cubic.
+2. **Corner:** if a turning angle > 72° exists, split at the sharpest one.
+3. **Straight preference:** if the straight cubic's max squared error is ≤ 1.35 × `max_error`², keep it unless the free cubic lowers the mean squared error by at least 15%.
+4. **Accept** the free cubic when its max squared error < `max_error`² and its mean squared error < 0.38 × `max_error`²; otherwise, if it is within 4× of either bound, try up to 4 Newton–Raphson reparameterizations.
+5. **Split** at the point of maximum error and fit each half recursively, the halves sharing the tangent at the split point.
 
 #### Mathematical Details
 

@@ -50,7 +50,7 @@ Heritage sketches often suffer from physical deterioration. This project provide
 - **ASP-based global optimization** — Clingo selects the set of bridges with the highest total log-odds in which every stroke end is used at most once. Its answer is final.
 - **Explanations** — For each bridge: its probability, the measurements for and against it, and the alternatives it beat. For each stroke end left open: its best candidate and why it was not drawn.
 - **Evaluation against ground truth** — A gap-level benchmark (which missing strokes were redrawn, how much line was drawn where the original has none), next to PSNR/SSIM.
-- **EFD gap closure (optional)** — Detects nearly-closed shapes and closes them by symmetry-based mirroring or curvature-aware arcs.
+- **Symmetry-guided single-gap closure (optional)** — Detects nearly-closed shapes and closes them by symmetry-based mirroring or curvature-aware arcs.
 
 ---
 
@@ -102,7 +102,7 @@ Heritage sketches often suffer from physical deterioration. This project provide
               │ Closure detection       │
               └────────────┬────────────┘
                            │
-                   Phase 6   EFD Gap Closure (optional)
+                   Phase 6   Single-Gap Closure (optional)
                            ▼
               ┌─────────────────────────┐
               │ Symmetry detection      │
@@ -145,7 +145,7 @@ Sketch_Based_Heritage_Restoration/
 │   ├── scoring_model.json          # The fitted scorecards (written by train_scoring.py)
 │   ├── asp_engine.py               # Phase 4 — ASP fact encoding, Clingo solver
 │   ├── synthesis.py                # Phase 5 — Merging bridges into paths
-│   ├── efd_closure.py              # Phase 6 — EFD single-gap closure (optional)
+│   ├── efd_closure.py              # Phase 6 — Symmetry-guided single-gap closure (optional)
 │   ├── geometry.py                 # Geometry helpers shared by the phases
 │   ├── render_restored_sketch.py   # Draws restoration bridges onto the damaged image for evaluation
 │   └── asp_rules/
@@ -394,7 +394,7 @@ Puts the accepted bridges into the drawing:
 - **Path merging** — concatenates each bridge with the two paths it joins, reversing a path where needed
 - **Closure detection** for paths whose ends now meet
 
-### Phase 6 — EFD Gap Closure (optional)
+### Phase 6 — Symmetry-Guided Single-Gap Closure (optional)
 
 Closes remaining open contours with a single gap; run with `restore(..., efd_closure=True)`:
 - **Gap qualification** — gap/perimeter ratio threshold (default ≤ 30%)
@@ -402,7 +402,7 @@ Closes remaining open contours with a single gap; run with `restore(..., efd_clo
 - **Mirror-based closure** — reflects the opposite contour arc to fill the gap
 - **Curvature-aware arc** fallback and **plausibility validation**
 
-Off by default: on the test drawings it repaired a few more gaps but drew more line off the drawing than that was worth (see [docs/Phase_6_EFD_Closure.md](docs/Phase_6_EFD_Closure.md)).
+Off by default: on the test drawings it repaired a few more gaps but drew more line off the drawing than that was worth (see [docs/Phase_6_Single_Gap_Closure.md](docs/Phase_6_Single_Gap_Closure.md)).
 
 ### Phase 7 — Output
 
@@ -475,10 +475,10 @@ Key parameters of the `restore()` function:
 | Parameter | Default | Description |
 |---|---|---|
 | `model_path` | `restoration/scoring_model.json` | The fitted scorecards and the acceptance threshold |
-| `efd_closure` | `False` | Also run Phase 6 (EFD single-gap closure) |
-| `efd_gap_threshold` | `0.30` | Maximum gap/perimeter ratio for EFD closure |
-| `efd_validity_check_enabled` | `True` | Enable semantic plausibility gate for EFD closure |
-| `efd_plausibility_threshold` | `0.50` | Minimum plausibility score for EFD closure |
+| `efd_closure` | `False` | Also run Phase 6 (symmetry-guided single-gap closure) |
+| `efd_gap_threshold` | `0.30` | Maximum gap/perimeter ratio for single-gap closure |
+| `efd_validity_check_enabled` | `True` | Enable the plausibility check for single-gap closure |
+| `efd_plausibility_threshold` | `0.50` | Minimum plausibility score for single-gap closure |
 | `efd_min_gap_for_validity_check` | `3.0` | Bypass plausibility check for very small gaps (pixels) |
 | `asp_timeout_s` | `30.0` | Maximum ASP solver time (seconds) |
 | `save_images` | `True` | Write the two overlays and the comparison figure (the JSON report is always written) |

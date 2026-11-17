@@ -18,7 +18,7 @@ Final paths + accepted candidates + Phase 6 diagnostics
     ├─► Sort final paths (top-down, then left-right)
     │
     ├─► Explain each restoration change           _change_events()
-    │       └─► one entry per run of bridge / EFD-closure segments: R1, R2, ...
+    │       └─► one entry per run of bridge / single-gap-closure segments: R1, R2, ...
     ├─► Explain each free end left open           _open_ends()
     │
     ├─► Save labeled overlay                      _save_overlay(labeled=True)

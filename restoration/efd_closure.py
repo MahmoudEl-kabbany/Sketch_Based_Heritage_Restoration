@@ -1,7 +1,9 @@
-"""Phase 6 — EFD Single-Gap Closure.
+"""Phase 6 — Symmetry-guided single-gap closure.
 
-Detects open paths that form nearly-closed shapes (single gap),
-uses symmetry detection or curvature-aware arc interpolation to close them.
+Detects open paths that form nearly-closed shapes (single gap) and closes
+them by mirroring the contour across a reflection-symmetry axis, or with a
+curvature-aware G1 arc. No Fourier descriptors are involved; the module keeps
+its historical name (it was called "EFD closure").
 """
 
 from __future__ import annotations
@@ -385,7 +387,7 @@ def _evaluate_closure_validity(
     plausibility_threshold: float,
     min_gap_for_check: float,
 ) -> Tuple[bool, str]:
-    """Return (accepted, reason) for semantic EFD closure validation."""
+    """Return (accepted, reason) for the plausibility check of a single-gap closure."""
     if gap_dist <= min_gap_for_check:
         return True, "tiny_gap_bypass"
 

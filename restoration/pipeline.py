@@ -167,10 +167,10 @@ def _build_efd_event_explanation(
     segment_count: int,
     approx_length_px: float,
 ) -> str:
-    """Create a detailed explanation for an EFD closure event."""
+    """Create a detailed explanation for a single-gap closure event."""
     return (
-        f"{label_id} is an EFD single-gap closure applied after bridge synthesis. "
-        f"The contour remained open with one recoverable gap, so the EFD closure stage "
+        f"{label_id} is a symmetry-guided single-gap closure applied after bridge synthesis. "
+        f"The contour remained open with one recoverable gap, so the single-gap closure stage "
         f"inserted {segment_count} closure segment(s) covering approximately "
         f"{approx_length_px:.1f}px to complete the shape boundary while preserving local "
         f"curvature continuity."
@@ -232,7 +232,7 @@ def _change_events(
         event: Dict[str, Any] = {
             "id": label_id,
             "source": "asp_bridge" if is_bridge else "efd_gap_closure",
-            "type": "ASP Junction Bridge" if is_bridge else "EFD Gap Closure",
+            "type": "ASP Junction Bridge" if is_bridge else "Single-Gap Closure",
             "coordinates": [round(float(pos[0]), 1), round(float(pos[1]), 1)],
             "segment_count": len(segments),
             "geometry": {
@@ -505,7 +505,7 @@ def _build_efd_phase_summary(
     validity_enabled: bool,
     plausibility_threshold: float,
 ) -> Dict[str, Any]:
-    """Summarize Phase 6 EFD validity diagnostics for report analysis."""
+    """Summarize Phase 6 (single-gap closure) validity diagnostics for report analysis."""
     accepted = [e for e in efd_phase_diagnostics if e["accepted"]]
     rejected = [e for e in efd_phase_diagnostics if not e["accepted"]]
     return {
@@ -635,10 +635,11 @@ def restore(
     Args:
         image_path: path to the damaged sketch
         model_path: the fitted scoring model (see train_scoring.py)
-        efd_closure: also run Phase 6, which closes single-gap contours by
-            symmetry. Off by default: on the test drawings it repaired a few
+        efd_closure: also run Phase 6, symmetry-guided single-gap closure,
+            which closes contours with one remaining gap by mirroring or a
+            curvature-aware arc. Off by default: on the test drawings it repaired a few
             more gaps but drew more line off the drawing than it was worth.
-        efd_gap_threshold: max gap/perimeter ratio for EFD closure
+        efd_gap_threshold: max gap/perimeter ratio for single-gap closure
         efd_validity_check_enabled: enable semantic plausibility gate in Phase 6
         efd_plausibility_threshold: minimum plausibility score required for Phase 6 closure
         efd_min_gap_for_validity_check: bypass plausibility check for tiny gaps (pixels)
@@ -720,12 +721,12 @@ def restore(
         restored_paths = merge_restored_paths(extraction.paths, accepted)
     print(f"    {len(bridges)} bridge segment(s) created")
 
-    # Phase 6: EFD Gap Closure (only if asked for)
+    # Phase 6: single-gap closure (only if asked for)
     final_paths: List[BezierPath] = list(restored_paths)
     efd_phase_diagnostics: List[Dict[str, Any]] = []
     with _timed(stage_timings, "phase6_efd_closure_s"):
         if efd_closure:
-            print("  Phase 6: EFD single-gap closure...")
+            print("  Phase 6: Symmetry-guided single-gap closure...")
             final_paths, efd_phase_diagnostics = close_single_gaps(
                 restored_paths, efd_gap_threshold,
                 validity_check_enabled=efd_validity_check_enabled,
@@ -736,7 +737,7 @@ def restore(
                 sum(1 for p in final_paths if p.is_closed)
                 - sum(1 for p in restored_paths if p.is_closed)
             )
-            print(f"    {max(0, closed_by_efd)} path(s) closed by EFD")
+            print(f"    {max(0, closed_by_efd)} path(s) closed by single-gap closure")
 
     # Phase 7: Output
     with _timed(stage_timings, "phase7_output_s"):

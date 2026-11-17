@@ -202,7 +202,7 @@ class PreprocessConfig:
     sauvola_window: int = 25
     sauvola_k: float = 0.2
     denoise: str = "none"            # "none" | "nlmeans" | "median_gray"
-    binary_median: int = <current>   # match today's behaviour; 0 disables
+    blur: str = "none"               # "none" | "median_gray"  (today: no blur at all)
     close_kernel: int = 0
     min_component_px: int = 0
     skeleton: str = "skimage"        # "skimage" | "skimage_lee"
@@ -212,7 +212,7 @@ def preprocess(img_gray, cfg) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:   # 
 ```
 
 `PreprocessConfig()` must reproduce today's behaviour exactly (snapshot test). Hypotheses, each tested as a variant:
-- H1: a median filter on the binary mask cuts thin strokes. Test it off, and as a gray-level median instead.
+- H1: (first draft: "medianBlur on the binary mask cuts strokes"). Moot on this branch: `stroke_geometry()` does not blur, it removes specks below 0.5 line widths². Test instead whether a light gray-level median *before* Otsu helps on noisy scans.
 - H2: Sauvola/Wolf beats Otsu on stained or unevenly lit scans.
 - H3: nlmeans + adaptive threshold + closing reduces speckle endpoints.
 - H4: junction-aware pruning on top of the current radius-based pruning. A spur is pruned only if its junction keeps
