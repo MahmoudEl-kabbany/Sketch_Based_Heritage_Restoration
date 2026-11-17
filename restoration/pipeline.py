@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import time
+import warnings
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager, redirect_stdout
@@ -29,13 +30,13 @@ from restoration.candidates import ConnectionCandidate, generate_candidates
 from restoration.scoring import FEATURE_SCALES, FEATURES, MODEL_PATH, ScoringModel, load_model, score_candidates
 from restoration.asp_engine import decode_solution, solve_candidates, utility, RULES_PATH
 from restoration.synthesis import synthesize_bridges, merge_restored_paths
-from restoration.efd_closure import close_single_gaps
+from restoration.single_gap_closure import close_single_gaps
 from restoration.geometry import polyline_length, safe_normalize, visual_order_key
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
 
 # Segment source types that mark a restoration change (anything not original).
-CHANGE_SOURCES = ("bridge", "efd_closure")
+CHANGE_SOURCES = ("bridge", "gap_closure")
 
 # A measurement is named among a bridge's reasons when it moves the log-odds by at least this much.
 MIN_REPORTED_LOG_ODDS = 0.25
@@ -162,7 +163,7 @@ def _build_bridge_event_explanation(
     return text
 
 
-def _build_efd_event_explanation(
+def _build_gap_closure_event_explanation(
     label_id: str,
     segment_count: int,
     approx_length_px: float,
@@ -215,12 +216,12 @@ def _change_events(
     candidates: List[ConnectionCandidate],
     accepted: List[ConnectionCandidate],
     threshold: float,
-    efd_phase_diagnostics: List[Dict[str, Any]],
+    gap_closure_diagnostics: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """Describe every restoration change for the report's ``detailed_events``."""
     bridge_owner = {_segment_key(seg): c for c in accepted for seg in c.bridge_bezier}
     by_endpoint = _candidates_by_endpoint(candidates)
-    efd_accepted = iter([e for e in efd_phase_diagnostics if e["accepted"]])
+    closures_accepted = iter([e for e in gap_closure_diagnostics if e["accepted"]])
 
     events: List[Dict[str, Any]] = []
     for number, (source, segments, pts) in enumerate(_iter_changes(final_paths), 1):
@@ -231,7 +232,7 @@ def _change_events(
 
         event: Dict[str, Any] = {
             "id": label_id,
-            "source": "asp_bridge" if is_bridge else "efd_gap_closure",
+            "source": "asp_bridge" if is_bridge else "gap_closure",
             "type": "ASP Junction Bridge" if is_bridge else "Single-Gap Closure",
             "coordinates": [round(float(pos[0]), 1), round(float(pos[1]), 1)],
             "segment_count": len(segments),
@@ -261,11 +262,11 @@ def _change_events(
             else:
                 event["explanation"] = f"{label_id} is a bridge whose candidate could not be identified."
         else:
-            event["explanation"] = _build_efd_event_explanation(label_id, len(segments), approx_length)
-            efd_diag = next(efd_accepted, None)
-            if efd_diag:
-                event["efd_closure_validity"] = {
-                    key: efd_diag[key]
+            event["explanation"] = _build_gap_closure_event_explanation(label_id, len(segments), approx_length)
+            closure_diag = next(closures_accepted, None)
+            if closure_diag:
+                event["gap_closure_validity"] = {
+                    key: closure_diag[key]
                     for key in (
                         "accepted", "closure_method", "reason", "path_index",
                         "gap_distance_px", "gap_ratio", "plausibility_threshold", "metrics",
@@ -500,23 +501,23 @@ def _candidate_endpoint_pair_key(candidate: ConnectionCandidate) -> str:
     return f"{key_a}|{key_b}"
 
 
-def _build_efd_phase_summary(
-    efd_phase_diagnostics: List[Dict[str, Any]],
+def _build_gap_closure_phase_summary(
+    gap_closure_diagnostics: List[Dict[str, Any]],
     validity_enabled: bool,
     plausibility_threshold: float,
 ) -> Dict[str, Any]:
     """Summarize Phase 6 (single-gap closure) validity diagnostics for report analysis."""
-    accepted = [e for e in efd_phase_diagnostics if e["accepted"]]
-    rejected = [e for e in efd_phase_diagnostics if not e["accepted"]]
+    accepted = [e for e in gap_closure_diagnostics if e["accepted"]]
+    rejected = [e for e in gap_closure_diagnostics if not e["accepted"]]
     return {
         "validity_check_enabled": bool(validity_enabled),
         "plausibility_threshold": round(float(plausibility_threshold), 4),
-        "attempted": len(efd_phase_diagnostics),
+        "attempted": len(gap_closure_diagnostics),
         "accepted": len(accepted),
         "rejected": len(rejected),
         "rejection_reasons": dict(Counter(e["reason"] for e in rejected)),
         "plausibility_score_summary": _numeric_summary(
-            [e["metrics"]["plausibility_score"] for e in efd_phase_diagnostics], digits=4,
+            [e["metrics"]["plausibility_score"] for e in gap_closure_diagnostics], digits=4,
         ),
         "accepted_path_indices": [e["path_index"] for e in accepted],
         "rejected_path_indices": [e["path_index"] for e in rejected],
@@ -531,7 +532,7 @@ def _build_report(
     final_paths: List[BezierPath],
     events: List[Dict[str, Any]],
     open_ends: List[Dict[str, Any]],
-    efd_phase_summary: Dict[str, Any],
+    gap_closure_summary: Dict[str, Any],
     model: ScoringModel,
     stage_timings: Dict[str, float],
     asp_solver_summary: Dict[str, Any],
@@ -543,7 +544,7 @@ def _build_report(
     final_closed = len(final_paths) - final_open
 
     return {
-        "schema_version": "3.0",
+        "schema_version": "4.0",
         "image": {
             "name": os.path.basename(image_path),
             "shape": list(result.image_shape),
@@ -605,9 +606,9 @@ def _build_report(
                 "final_closed_paths": final_closed,
                 "bridges_created": len(accepted),
                 "bridge_events_logged": sum(1 for e in events if e["source"] == "asp_bridge"),
-                "efd_closure_events_logged": sum(1 for e in events if e["source"] == "efd_gap_closure"),
+                "gap_closure_events_logged": sum(1 for e in events if e["source"] == "gap_closure"),
             },
-            "efd_closure_phase": efd_phase_summary,
+            "gap_closure_phase": gap_closure_summary,
         },
         "detailed_events": events,
         "open_ends": open_ends,
@@ -618,14 +619,39 @@ def _build_report(
 # Main API
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Phase 6 was called "EFD closure"; its keyword arguments were renamed in schema 4.0.
+RENAMED_KWARGS = {
+    "efd_closure": "gap_closure",
+    "efd_gap_threshold": "gap_closure_threshold",
+    "efd_validity_check_enabled": "gap_closure_validity_check",
+    "efd_plausibility_threshold": "gap_closure_plausibility_threshold",
+    "efd_min_gap_for_validity_check": "gap_closure_min_gap_for_validity_check",
+}
+
+
+def _accept_renamed_kwargs(fn: Callable) -> Callable:
+    """Let *fn* still be called with the old keyword names, with a DeprecationWarning."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        for old, new in RENAMED_KWARGS.items():
+            if old in kwargs:
+                if new in kwargs:
+                    raise TypeError(f"{fn.__name__}() got both {old!r} and its new name {new!r}")
+                warnings.warn(f"{old!r} is deprecated; use {new!r}", DeprecationWarning, stacklevel=2)
+                kwargs[new] = kwargs.pop(old)
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+@_accept_renamed_kwargs
 def restore(
     image_path: str,
     model_path: str = MODEL_PATH,
-    efd_closure: bool = False,
-    efd_gap_threshold: float = 0.30,
-    efd_validity_check_enabled: bool = True,
-    efd_plausibility_threshold: float = 0.50,
-    efd_min_gap_for_validity_check: float = 3.0,
+    gap_closure: bool = False,
+    gap_closure_threshold: float = 0.30,
+    gap_closure_validity_check: bool = True,
+    gap_closure_plausibility_threshold: float = 0.50,
+    gap_closure_min_gap_for_validity_check: float = 3.0,
     output_dir: str = OUTPUT_DIR,
     asp_timeout_s: float = 30.0,
     save_images: bool = True,
@@ -635,14 +661,14 @@ def restore(
     Args:
         image_path: path to the damaged sketch
         model_path: the fitted scoring model (see train_scoring.py)
-        efd_closure: also run Phase 6, symmetry-guided single-gap closure,
+        gap_closure: also run Phase 6, symmetry-guided single-gap closure,
             which closes contours with one remaining gap by mirroring or a
             curvature-aware arc. Off by default: on the test drawings it repaired a few
             more gaps but drew more line off the drawing than it was worth.
-        efd_gap_threshold: max gap/perimeter ratio for single-gap closure
-        efd_validity_check_enabled: enable semantic plausibility gate in Phase 6
-        efd_plausibility_threshold: minimum plausibility score required for Phase 6 closure
-        efd_min_gap_for_validity_check: bypass plausibility check for tiny gaps (pixels)
+        gap_closure_threshold: max gap/perimeter ratio for single-gap closure
+        gap_closure_validity_check: enable the plausibility check in Phase 6
+        gap_closure_plausibility_threshold: minimum plausibility score required for a Phase 6 closure
+        gap_closure_min_gap_for_validity_check: bypass the plausibility check for tiny gaps (pixels)
         output_dir: where to save visualization outputs
         asp_timeout_s: max time in seconds for the ASP solver
         save_images: write the two overlays and the comparison figure; the
@@ -723,28 +749,28 @@ def restore(
 
     # Phase 6: single-gap closure (only if asked for)
     final_paths: List[BezierPath] = list(restored_paths)
-    efd_phase_diagnostics: List[Dict[str, Any]] = []
-    with _timed(stage_timings, "phase6_efd_closure_s"):
-        if efd_closure:
+    gap_closure_diagnostics: List[Dict[str, Any]] = []
+    with _timed(stage_timings, "phase6_gap_closure_s"):
+        if gap_closure:
             print("  Phase 6: Symmetry-guided single-gap closure...")
-            final_paths, efd_phase_diagnostics = close_single_gaps(
-                restored_paths, efd_gap_threshold,
-                validity_check_enabled=efd_validity_check_enabled,
-                plausibility_threshold=efd_plausibility_threshold,
-                min_gap_for_validity_check=efd_min_gap_for_validity_check,
+            final_paths, gap_closure_diagnostics = close_single_gaps(
+                restored_paths, gap_closure_threshold,
+                validity_check_enabled=gap_closure_validity_check,
+                plausibility_threshold=gap_closure_plausibility_threshold,
+                min_gap_for_validity_check=gap_closure_min_gap_for_validity_check,
             )
-            closed_by_efd = (
+            closed_by_phase6 = (
                 sum(1 for p in final_paths if p.is_closed)
                 - sum(1 for p in restored_paths if p.is_closed)
             )
-            print(f"    {max(0, closed_by_efd)} path(s) closed by single-gap closure")
+            print(f"    {max(0, closed_by_phase6)} path(s) closed by single-gap closure")
 
     # Phase 7: Output
     with _timed(stage_timings, "phase7_output_s"):
         # Ensure visual order for labeling (top-down, left-right)
         final_paths.sort(key=visual_order_key)
 
-        events = _change_events(final_paths, scored, accepted, model.threshold, efd_phase_diagnostics)
+        events = _change_events(final_paths, scored, accepted, model.threshold, gap_closure_diagnostics)
         open_ends = _open_ends(extraction, scored, accepted, model.threshold)
         if save_images:
             _save_overlay(image_path, final_paths, output_dir, labeled=True)
@@ -762,8 +788,8 @@ def restore(
         final_paths,
         events,
         open_ends,
-        {"enabled": bool(efd_closure), **_build_efd_phase_summary(
-            efd_phase_diagnostics, efd_validity_check_enabled, efd_plausibility_threshold,
+        {"enabled": bool(gap_closure), **_build_gap_closure_phase_summary(
+            gap_closure_diagnostics, gap_closure_validity_check, gap_closure_plausibility_threshold,
         )},
         model,
         stage_timings,

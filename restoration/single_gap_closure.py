@@ -1,0 +1,580 @@
+"""Phase 6 — Symmetry-guided single-gap closure.
+
+Detects open paths that form nearly-closed shapes (single gap) and closes
+them by mirroring the contour across a reflection-symmetry axis, or with a
+curvature-aware G1 arc. No Fourier descriptors are involved; the phase was
+formerly called "EFD closure" (restoration.efd_closure is a deprecated alias).
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+from scipy.spatial.distance import directed_hausdorff
+
+from bezier_curves.bezier import BezierPath, BezierSegment
+from restoration.geometry import (
+    endpoint_curvature,
+    g1_control_points,
+    polyline_length,
+    safe_normalize,
+)
+
+# Reflection symmetry: minimum Hausdorff tolerance (px) and the gap/perimeter
+# range in which mirroring the opposite side is attempted.
+SYMMETRY_HAUSDORFF_PX = 8.0
+SYMMETRY_GAP_RATIO_RANGE = (0.08, 0.30)
+# A mirrored closure is resampled to this many points and rejected when it is
+# longer than this fraction of the perimeter (and 3x the gap).
+MAX_MIRRORED_POINTS = 80
+MAX_CLOSURE_LENGTH_RATIO = 0.45
+# A gap above the ratio threshold is still closed (with a plain arc, no validity
+# check) when it is this small in pixels on a shape at least this large.
+SMALL_GAP_PX = 20.0
+SMALL_GAP_MAX_RATIO = 0.45
+SMALL_GAP_MIN_PERIMETER = 80.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Symmetry detection
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _reflect_points(points: np.ndarray, axis_angle: float) -> np.ndarray:
+    """Reflect points across a line through the origin at *axis_angle* radians."""
+    c = math.cos(2.0 * axis_angle)
+    s = math.sin(2.0 * axis_angle)
+    R = np.array([[c, s], [s, -c]], dtype=np.float64)
+    return points @ R.T
+
+
+def _detect_symmetry(
+    points: np.ndarray,
+    centroid: np.ndarray,
+    num_axes: int = 24,
+    hausdorff_threshold: float = 8.0,
+    max_points: int = 500,
+) -> Optional[float]:
+    """Test reflection symmetry across evenly-spaced axes through the centroid.
+
+    Returns the axis angle (radians) with best symmetry, or None.
+    Subsamples to *max_points* for performance on dense contours.
+    """
+    centered = points - centroid
+
+    # Subsample to cap Hausdorff O(n²) cost
+    if len(centered) > max_points:
+        indices = np.linspace(0, len(centered) - 1, max_points, dtype=int)
+        centered = centered[indices]
+
+    best_angle: Optional[float] = None
+    best_dist = hausdorff_threshold
+
+    for k in range(num_axes):
+        angle = k * math.pi / num_axes
+        reflected = _reflect_points(centered, angle)
+        # Hausdorff distance between original and reflected
+        d_fwd = directed_hausdorff(centered, reflected)[0]
+        d_bwd = directed_hausdorff(reflected, centered)[0]
+        d = max(d_fwd, d_bwd)
+        if d < best_dist:
+            best_dist = d
+            best_angle = angle
+
+    return best_angle
+
+
+def _resample_polyline(points: np.ndarray, max_points: int) -> np.ndarray:
+    """Downsample or resample a polyline to at most *max_points* samples."""
+    if len(points) <= max_points:
+        return points.copy()
+    if max_points < 2:
+        return points[[0, -1]].copy()
+
+    diffs = np.diff(points, axis=0)
+    d = np.linalg.norm(diffs, axis=1)
+    cumulative = np.concatenate(([0.0], np.cumsum(d)))
+    total = float(cumulative[-1])
+    if total < 1e-9:
+        idx = np.linspace(0, len(points) - 1, max_points, dtype=int)
+        return points[idx].copy()
+
+    targets = np.linspace(0.0, total, max_points)
+    x = np.interp(targets, cumulative, points[:, 0])
+    y = np.interp(targets, cumulative, points[:, 1])
+    return np.column_stack((x, y)).astype(np.float64)
+
+
+def _bridge_overlaps_gap(
+    path: BezierPath,
+    gap_start: np.ndarray,
+    gap_end: np.ndarray,
+    proximity: float,
+) -> bool:
+    """True when a bridge segment appears to already close this specific gap."""
+    for seg in path.segments:
+        if seg.source_type != "bridge":
+            continue
+        b0 = seg.control_points[0]
+        b1 = seg.control_points[3]
+        direct = float(np.linalg.norm(b0 - gap_start) + np.linalg.norm(b1 - gap_end))
+        reverse = float(np.linalg.norm(b0 - gap_end) + np.linalg.norm(b1 - gap_start))
+        if min(direct, reverse) <= 2.0 * proximity:
+            return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Mirroring
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _mirror_gap_from_opposite(
+    points: np.ndarray,
+    centroid: np.ndarray,
+    axis_angle: float,
+    gap_start: np.ndarray,
+    gap_end: np.ndarray,
+) -> np.ndarray:
+    """Mirror the portion of the contour opposite to the gap across the symmetry axis.
+
+    Returns (N, 2) points that fill the gap.
+    """
+    centered = points - centroid
+    gap_start_c = gap_start - centroid
+    gap_end_c = gap_end - centroid
+
+    # Reflect the gap endpoints to find the "opposite" region
+    opp_start = _reflect_points(gap_start_c.reshape(1, 2), axis_angle)[0]
+    opp_end = _reflect_points(gap_end_c.reshape(1, 2), axis_angle)[0]
+
+    # Find the portion of the contour near the opposite region
+    dists_to_opp_start = np.linalg.norm(centered - opp_start, axis=1)
+    dists_to_opp_end = np.linalg.norm(centered - opp_end, axis=1)
+
+    idx_start = int(np.argmin(dists_to_opp_start))
+    idx_end = int(np.argmin(dists_to_opp_end))
+
+    # Extract the opposite arc
+    if idx_start <= idx_end:
+        opposite_arc = centered[idx_start:idx_end + 1]
+    else:
+        opposite_arc = np.vstack([centered[idx_start:], centered[:idx_end + 1]])
+
+    if len(opposite_arc) < 2:
+        return np.empty((0, 2))
+
+    # Reflect the opposite arc — this fills the gap
+    mirrored = _reflect_points(opposite_arc, axis_angle) + centroid
+
+    # Trim/adjust endpoints to match gap_start and gap_end exactly
+    if len(mirrored) >= 2:
+        # Ensure correct direction: mirrored should go from gap_start to gap_end
+        d_fwd = (np.linalg.norm(mirrored[0] - gap_start)
+                 + np.linalg.norm(mirrored[-1] - gap_end))
+        d_rev = (np.linalg.norm(mirrored[-1] - gap_start)
+                 + np.linalg.norm(mirrored[0] - gap_end))
+        if d_rev < d_fwd:
+            mirrored = mirrored[::-1]
+
+        # Snap endpoints
+        mirrored[0] = gap_start
+        mirrored[-1] = gap_end
+
+    return mirrored
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Curvature-aware arc closure (no symmetry)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _curvature_aware_arc(
+    gap_start: np.ndarray,
+    gap_end: np.ndarray,
+    tangent_start: np.ndarray,
+    tangent_end: np.ndarray,
+    curvature_start: float,
+    curvature_end: float,
+) -> List[BezierSegment]:
+    """Build one or more cubic Bezier segments to close a gap respecting curvature.
+
+    Tangent_start points INTO the gap (outward from path end).
+    Tangent_end points INTO the gap (outward from path start, negated).
+    """
+    if float(np.linalg.norm(gap_end - gap_start)) < 1e-6:
+        return []
+
+    cp = g1_control_points(
+        gap_start, tangent_start, curvature_start,
+        gap_end, tangent_end, curvature_end,
+    )
+    return [BezierSegment(control_points=cp, source_type="gap_closure")]
+
+
+def _points_to_bezier_segments(
+    points: np.ndarray,
+    max_segments: int = 16,
+) -> List[BezierSegment]:
+    """Convert a polyline to a sequence of cubic Bezier segments.
+
+    Uses simple chord-based fitting: every ~4 points → 1 cubic segment.
+    """
+    if len(points) < 2:
+        return []
+
+    segments: List[BezierSegment] = []
+    n = len(points)
+    max_segments = max(1, int(max_segments))
+    step = max(2, int(math.ceil((n - 1) / max_segments)))
+
+    i = 0
+    while i < n - 1:
+        end = min(i + step, n - 1)
+        p0 = points[i]
+        p3 = points[end]
+        chord = float(np.linalg.norm(p3 - p0))
+        if chord < 1e-6:
+            i = end
+            continue
+
+        # Estimate tangent direction from local points
+        num = min(3, end - i)
+        t_start = points[i + num] - points[i]
+        n_s = np.linalg.norm(t_start)
+        if n_s > 1e-12:
+            t_start = t_start / n_s
+        else:
+            t_start = (p3 - p0) / chord
+
+        t_end = points[end] - points[max(i, end - num)]
+        n_e = np.linalg.norm(t_end)
+        if n_e > 1e-12:
+            t_end = t_end / n_e
+        else:
+            t_end = (p3 - p0) / chord
+
+        alpha = chord / 3.0
+        p1 = p0 + alpha * t_start
+        p2 = p3 - alpha * t_end
+
+        segments.append(BezierSegment(
+            control_points=np.vstack([p0, p1, p2, p3]),
+            source_type="gap_closure",
+        ))
+        i = end
+
+    return segments
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Endpoint tangent extraction
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _context_endpoint_tangent(path: BezierPath, end: str) -> Tuple[np.ndarray, float]:
+    """Estimate outward tangent from local sampled path context."""
+    sampled = path.sample(pts_per_segment=24)
+    if len(sampled) < 3:
+        return np.array([1.0, 0.0], dtype=np.float64), 0.0
+
+    diffs = np.linalg.norm(np.diff(sampled, axis=0), axis=1)
+    keep = np.ones(len(sampled), dtype=bool)
+    keep[1:] = diffs > 1e-6
+    sampled = sampled[keep]
+    if len(sampled) < 3:
+        return np.array([1.0, 0.0], dtype=np.float64), 0.0
+
+    max_window = max(2, len(sampled) - 1)
+    window = int(round(len(sampled) * 0.12))
+    window = max(6, min(24, max_window, window))
+
+    if end == "end":
+        local = sampled[-(window + 1):]
+        vectors = np.diff(local, axis=0)
+    else:
+        local = sampled[: window + 1]
+        vectors = -np.diff(local, axis=0)
+
+    valid = np.linalg.norm(vectors, axis=1) > 1e-9
+    if not np.any(valid):
+        return np.array([1.0, 0.0], dtype=np.float64), 0.0
+
+    unit = vectors[valid] / np.linalg.norm(vectors[valid], axis=1, keepdims=True)
+    mean_vec = safe_normalize(np.mean(unit, axis=0))
+    consistency = float(np.mean(np.clip(unit @ mean_vec, 0.0, 1.0)))
+    return mean_vec, float(np.clip(consistency, 0.0, 1.0))
+
+def _path_tangent_at(path: BezierPath, end: str) -> np.ndarray:
+    """Unit tangent pointing into the gap (outward from path boundary)."""
+    if end == "end":
+        cp = path.segments[-1].control_points
+        derivative = 3.0 * (cp[3] - cp[2])
+    else:
+        cp = path.segments[0].control_points
+        derivative = 3.0 * (cp[0] - cp[1])
+
+    derivative_tangent = safe_normalize(derivative)
+    context_tangent, confidence = _context_endpoint_tangent(path, end)
+    blend = float(np.clip(confidence, 0.15, 0.90))
+    return safe_normalize((1.0 - blend) * derivative_tangent + blend * context_tangent)
+
+
+def _closure_plausibility_metrics(
+    path: BezierPath,
+    gap_start: np.ndarray,
+    gap_end: np.ndarray,
+    gap_dist: float,
+    gap_ratio: float,
+) -> Dict[str, float]:
+    """Compute semantic closure plausibility metrics for one open path."""
+    t_start = _path_tangent_at(path, "end")
+    t_end = _path_tangent_at(path, "start")
+    _, conf_start = _context_endpoint_tangent(path, "end")
+    _, conf_end = _context_endpoint_tangent(path, "start")
+
+    gap_dir = safe_normalize(gap_end - gap_start)
+    forward_start = float(np.dot(t_start, gap_dir))
+    forward_end = float(np.dot(t_end, -gap_dir))
+    bilateral = float(min(forward_start, forward_end))
+    continuation = float(np.clip(0.5 * (max(0.0, forward_start) + max(0.0, forward_end)), 0.0, 1.0))
+
+    anti_parallel = float(np.clip(np.dot(t_start, -t_end), -1.0, 1.0))
+    misalignment_deg = float(np.degrees(np.arccos(anti_parallel)))
+
+    k_start = endpoint_curvature(path, "end")
+    k_end = endpoint_curvature(path, "start")
+    k_sum = float(k_start + k_end)
+    if k_sum < 1e-9:
+        curvature_coherence = 1.0
+    else:
+        curvature_coherence = float(np.clip(1.0 - abs(k_start - k_end) / k_sum, 0.0, 1.0))
+
+    context_conf = float(np.clip(min(conf_start, conf_end), 0.0, 1.0))
+    confidence_factor = float(np.clip(0.60 + 0.40 * context_conf, 0.0, 1.0))
+    score_raw = (
+        0.45 * continuation
+        + 0.35 * float(np.clip(bilateral, 0.0, 1.0))
+        + 0.20 * curvature_coherence
+    )
+    plausibility_score = float(np.clip(score_raw * confidence_factor, 0.0, 1.0))
+
+    long_gap_semantic_risk = bool(
+        gap_dist > 90.0
+        and gap_ratio > 0.16
+        and plausibility_score < 0.62
+        and (bilateral < 0.12 or misalignment_deg > 95.0)
+    )
+
+    return {
+        "forward_start": forward_start,
+        "forward_end": forward_end,
+        "bilateral_alignment": bilateral,
+        "continuation_score": continuation,
+        "misalignment_deg": misalignment_deg,
+        "curvature_start": float(k_start),
+        "curvature_end": float(k_end),
+        "curvature_coherence": curvature_coherence,
+        "context_confidence": context_conf,
+        "plausibility_score": plausibility_score,
+        "long_gap_semantic_risk": float(1.0 if long_gap_semantic_risk else 0.0),
+    }
+
+
+def _evaluate_closure_validity(
+    metrics: Dict[str, float],
+    gap_dist: float,
+    gap_ratio: float,
+    has_symmetry: bool,
+    plausibility_threshold: float,
+    min_gap_for_check: float,
+) -> Tuple[bool, str]:
+    """Return (accepted, reason) for the plausibility check of a single-gap closure."""
+    if gap_dist <= min_gap_for_check:
+        return True, "tiny_gap_bypass"
+
+    if bool(metrics.get("long_gap_semantic_risk", 0.0) >= 0.5):
+        return False, "long_gap_semantic_risk"
+
+    bilateral = float(metrics.get("bilateral_alignment", 0.0))
+    continuation = float(metrics.get("continuation_score", 0.0))
+    misalignment = float(metrics.get("misalignment_deg", 180.0))
+    score = float(metrics.get("plausibility_score", 0.0))
+    effective_threshold = float(plausibility_threshold)
+
+    # Be slightly more permissive for tiny smooth gaps where tangent evidence is
+    # often unstable but geometric closure is still valid.
+    if (
+        gap_ratio <= 0.035
+        and gap_dist <= 45.0
+        and continuation >= 0.10
+        and misalignment <= 35.0
+    ):
+        effective_threshold = min(effective_threshold, 0.24)
+
+    # Symmetry can rescue a borderline case, but not highly implausible tangent geometry.
+    if has_symmetry and bilateral >= 0.20 and misalignment <= 110.0:
+        if score >= max(0.45, effective_threshold * 0.80):
+            return True, "symmetry_supported"
+
+    if score >= effective_threshold:
+        return True, "plausibility_pass"
+
+    # Borderline pass for moderately long but coherent closures.
+    if (
+        gap_ratio <= 0.16
+        and score >= max(0.42, plausibility_threshold * 0.85)
+        and bilateral >= 0.16
+        and continuation >= 0.35
+        and misalignment <= 132.0
+    ):
+        return True, "borderline_continuation_pass"
+
+    if bilateral < 0.05 and misalignment > 120.0:
+        return False, "weak_continuation_support"
+    return False, "low_plausibility_score"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main entry point
+# ═══════════════════════════════════════════════════════════════════════════
+
+def close_single_gaps(
+    paths: List[BezierPath],
+    gap_threshold: float = 0.30,
+    validity_check_enabled: bool = True,
+    plausibility_threshold: float = 0.50,
+    min_gap_for_validity_check: float = 3.0,
+) -> Tuple[List[BezierPath], List[Dict[str, Any]]]:
+    """Detect and close single-gap contours.
+
+    A path qualifies if:
+      - It is open (not already closed) and both of its ends are free
+      - Its start and end points are within gap_threshold * perimeter of each other
+        (default 0.30 = Tier 3 large-gap support)
+      - It has enough segments to be a meaningful shape
+
+    Multi-gap shapes are left untouched.
+
+    Returns (paths, diagnostics) with one diagnostics entry per closure attempt.
+    """
+    result: List[BezierPath] = []
+    diagnostics: List[Dict[str, Any]] = []
+
+    for path_index, path in enumerate(paths):
+        result.append(path)  # replaced below if the path gets closed
+        if path.is_closed or len(path.segments) < 3 or not (path.start_free and path.end_free):
+            continue
+
+        start_pt = path.segments[0].control_points[0]
+        end_pt = path.segments[-1].control_points[3]
+        gap_dist = float(np.linalg.norm(end_pt - start_pt))
+
+        samples = path.sample(pts_per_segment=30)
+        perimeter = polyline_length(samples)
+        if perimeter < 1e-6:
+            continue
+
+        # PR4 tuning: skip only if a bridge overlaps this same open gap.
+        if _bridge_overlaps_gap(path, end_pt, start_pt, proximity=max(8.0, perimeter * 0.02)):
+            continue
+
+        gap_ratio = gap_dist / perimeter
+        force_small_gap_fallback = gap_ratio > gap_threshold
+        if force_small_gap_fallback and not (
+            gap_dist <= SMALL_GAP_PX
+            and gap_ratio <= SMALL_GAP_MAX_RATIO
+            and perimeter >= SMALL_GAP_MIN_PERIMETER
+        ):
+            continue
+        if gap_ratio < 1e-6:
+            continue
+
+        # This is a single-gap contour — attempt closure
+        centroid = np.mean(samples, axis=0)
+
+        # Try symmetry-based mirroring (Hausdorff threshold scaled for larger shapes)
+        axis_angle = None
+        min_ratio, max_ratio = SYMMETRY_GAP_RATIO_RANGE
+        if not force_small_gap_fallback and min_ratio <= gap_ratio <= max_ratio:
+            axis_angle = _detect_symmetry(
+                samples, centroid,
+                hausdorff_threshold=max(SYMMETRY_HAUSDORFF_PX, perimeter * 0.015),
+            )
+
+        plausibility_metrics = _closure_plausibility_metrics(
+            path=path,
+            gap_start=end_pt,
+            gap_end=start_pt,
+            gap_dist=gap_dist,
+            gap_ratio=gap_ratio,
+        )
+
+        def record(accepted: bool, method: str, reason: str) -> None:
+            diagnostics.append({
+                "path_index": int(path_index),
+                "accepted": accepted,
+                "closure_method": method,
+                "reason": reason,
+                "gap_distance_px": round(float(gap_dist), 3),
+                "gap_ratio": round(float(gap_ratio), 6),
+                "plausibility_threshold": round(float(plausibility_threshold), 4),
+                "metrics": {
+                    k: round(float(v), 6) for k, v in plausibility_metrics.items()
+                },
+            })
+
+        if validity_check_enabled and not force_small_gap_fallback:
+            valid, reject_reason = _evaluate_closure_validity(
+                plausibility_metrics,
+                gap_dist=gap_dist,
+                gap_ratio=gap_ratio,
+                has_symmetry=(axis_angle is not None),
+                plausibility_threshold=plausibility_threshold,
+                min_gap_for_check=min_gap_for_validity_check,
+            )
+            if not valid:
+                record(False, "none", str(reject_reason))
+                continue
+
+        closure_segments: List[BezierSegment] = []
+        closure_method = "curvature_arc"
+
+        if axis_angle is not None:
+            # Mirror the opposite portion
+            mirrored = _mirror_gap_from_opposite(
+                samples, centroid, axis_angle,
+                gap_start=end_pt, gap_end=start_pt,
+            )
+            if len(mirrored) >= 2:
+                mirrored = _resample_polyline(mirrored, max_points=MAX_MIRRORED_POINTS)
+                # PR3: reject mirrored closures that are much too complex for this gap.
+                if polyline_length(mirrored) <= max(gap_dist * 3.0, perimeter * MAX_CLOSURE_LENGTH_RATIO):
+                    closure_segments = _points_to_bezier_segments(
+                        mirrored,
+                        max_segments=max(6, MAX_MIRRORED_POINTS // 8),
+                    )
+                    if closure_segments:
+                        closure_method = "symmetry_mirroring"
+
+        if not closure_segments:
+            # Fallback: curvature-aware arc
+            closure_segments = _curvature_aware_arc(
+                end_pt, start_pt,
+                _path_tangent_at(path, "end"), _path_tangent_at(path, "start"),
+                endpoint_curvature(path, "end"), endpoint_curvature(path, "start"),
+            )
+
+        if not closure_segments:
+            record(False, "none", "no_geometry_constructed")
+            continue
+
+        new_segments = list(path.segments) + closure_segments
+        # Snap closure endpoints
+        new_segments[-1].control_points[3] = new_segments[0].control_points[0].copy()
+        result[-1] = BezierPath(
+            segments=new_segments,
+            is_closed=True,
+            source_type="restored",
+        )
+        record(True, closure_method, "accepted")
+
+    return result, diagnostics

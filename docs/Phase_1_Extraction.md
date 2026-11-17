@@ -222,7 +222,7 @@ class ExtractionResult:
 @dataclass
 class BezierSegment:
     control_points: np.ndarray  # (4, 2) — P₀, P₁, P₂, P₃
-    source_type: str            # "skeleton" | "bridge" | "efd_closure"
+    source_type: str            # "skeleton" | "bridge" | "gap_closure"
 
 @dataclass
 class BezierPath:

@@ -181,7 +181,7 @@ Acceptance: the docs match the code, the snapshot test passes, and every item is
 Fix only what the WP-0 profile shows. The outputs must stay snapshot-identical.
 - `synthesis.merge_restored_paths.component_with` scans linearly for each accepted bridge. Replace it with a
   `token → component id` dict that is updated on merge and orientation.
-- `efd_closure._detect_symmetry` (24 axes × 2 Hausdorff on ≤ 500 points): coarse 200-point pass, then refine the best 3
+- `single_gap_closure._detect_symmetry` (24 axes × 2 Hausdorff on ≤ 500 points): coarse 200-point pass, then refine the best 3
   axes. **This can change results**, so it goes behind a flag. Low priority, since Phase 6 is off by default.
 - Verify that the sknw numba cache works (time a second fresh process start).
 - Report compute time and I/O time separately.
@@ -315,7 +315,7 @@ as a `PreprocessConfig(threshold="unet")` variant. The mean probability along ea
   - nodes: endpoints, junctions, corners, optional stroke samples
   - node features: position, tangent sin/cos, curvature, stroke radius, type one-hot, optional patch embedding
   - typed edges: `stroke`, `candidate` (with `candidate_features()` as attributes), `parallel_to`, `symmetric_with`
-    (from `_detect_symmetry`), `similar_curvature`, `same_region`
+    (from `single_gap_closure._detect_symmetry`), `similar_curvature`, `same_region`
 - **Model:** R-GCN / `HeteroData` in PyG with 3–4 layers and an edge MLP on `candidate` edges → p. Weighted BCE,
   trained on WP-4 data + feedback. `torch.use_deterministic_algorithms(True)`, everything seeded.
 - **Inference:** `scorer="gnn"`, through the same threshold → utility path. ASP and synthesis do not change.

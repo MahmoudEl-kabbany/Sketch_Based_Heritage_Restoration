@@ -32,7 +32,7 @@ TOLERANCE = 1e-6
 # (variant name, restore() keyword arguments)
 VARIANTS: Tuple[Tuple[str, Dict[str, Any]], ...] = (
     ("default", {}),
-    ("phase6", {"efd_closure": True}),
+    ("phase6", {"gap_closure": True}),
 )
 
 
@@ -78,7 +78,7 @@ def snapshot_of(image: str, output_dir: Optional[str] = None) -> Dict[str, Any]:
             record[variant] = {
                 "accepted_endpoint_pairs": analysis["selection"]["accepted_endpoint_pairs"],
                 "paths": _paths_summary(result.restored_paths),
-                "phase6": {k: v for k, v in analysis["efd_closure_phase"].items()},
+                "phase6": {k: v for k, v in analysis["gap_closure_phase"].items()},
             }
     return record
 

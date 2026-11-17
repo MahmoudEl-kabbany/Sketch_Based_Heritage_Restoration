@@ -30,7 +30,7 @@ Final paths + accepted candidates + Phase 6 diagnostics
     └─► Return RestorationResult
 ```
 
-A *change* is a contiguous run of segments of one restoration type (`bridge` or `efd_closure`) inside a final path. `_iter_changes()` yields them in path order; the same numbering is used for the labels in the image and the entries in the report.
+A *change* is a contiguous run of segments of one restoration type (`bridge` or `gap_closure`) inside a final path. `_iter_changes()` yields them in path order; the same numbering is used for the labels in the image and the entries in the report.
 
 ---
 
@@ -73,7 +73,7 @@ The report is the dictionary returned by `_build_report()`. It is saved as `name
 
 ```json
 {
-  "schema_version": "3.0",
+  "schema_version": "4.0",
   "image": { "name": "da9_gt_damaged.png", "shape": [224, 310], "diagonal_px": 382.5, "line_width_px": 4.0 },
   "summary": {
     "processing_time_s": 1.741,
@@ -133,9 +133,9 @@ The report is the dictionary returned by `_build_report()`. It is saved as `name
       "final_closed_paths": 0,
       "bridges_created": 18,
       "bridge_events_logged": 18,
-      "efd_closure_events_logged": 0
+      "gap_closure_events_logged": 0
     },
-    "efd_closure_phase": { "enabled": false, "attempted": 0, "accepted": 0, "rejected": 0, "...": "..." }
+    "gap_closure_phase": { "enabled": false, "attempted": 0, "accepted": 0, "rejected": 0, "...": "..." }
   },
   "detailed_events": [ "... one entry per change, see below ..." ],
   "open_ends": [ "... one entry per free stroke end left open, see below ..." ]
@@ -188,12 +188,26 @@ Each entry of `detailed_events` explains one change and carries the same `id` as
 }
 ```
 
-- `source` is `asp_bridge` for a bridge chosen in Phase 4 and `efd_gap_closure` for a Phase 6 closure.
+- `source` is `asp_bridge` for a bridge chosen in Phase 4 and `gap_closure` for a Phase 6 closure.
 - `probability` is the scorecard's estimate that the bridge redraws a missing stroke; `log_odds_above_threshold` is what the solver maximized.
 - `measurements` lists every measurement of the bridge in its natural unit with the log-odds it adds relative to an average candidate. Their sum plus the scorecard's intercept is the bridge's log-odds.
 - `in_favour` and `against` are the up to three measurements that move the log-odds most in each direction (by at least 0.25).
 - `alternatives` are the three most probable other candidates for the same two stroke ends: what the bridge was preferred to.
-- An `efd_gap_closure` event has `efd_closure_validity` (closure method, reason, gap size and plausibility metrics) instead of `candidate`.
+- A `gap_closure` event has `gap_closure_validity` (closure method, reason, gap size and plausibility metrics) instead of `candidate`.
+
+### Schema 4.0: renamed keys
+
+Phase 6 was renamed from "EFD closure" to symmetry-guided single-gap closure. Schema 4.0 renames everything that carried the old name; nothing else changed from 3.0.
+
+| 3.0 | 4.0 |
+|---|---|
+| event `source`: `efd_gap_closure` | `gap_closure` |
+| event key `efd_closure_validity` | `gap_closure_validity` |
+| `analysis.restoration_outcome.efd_closure_events_logged` | `gap_closure_events_logged` |
+| `analysis.efd_closure_phase` | `analysis.gap_closure_phase` |
+| `summary.stage_timings_s.phase6_efd_closure_s` | `phase6_gap_closure_s` |
+| segment `source_type` `efd_closure` (Python objects) | `gap_closure` |
+| `restore()` arguments `efd_closure`, `efd_gap_threshold`, `efd_validity_check_enabled`, `efd_plausibility_threshold`, `efd_min_gap_for_validity_check` | `gap_closure`, `gap_closure_threshold`, `gap_closure_validity_check`, `gap_closure_plausibility_threshold`, `gap_closure_min_gap_for_validity_check` (the old names still work, with a `DeprecationWarning`) |
 
 ### Open ends
 

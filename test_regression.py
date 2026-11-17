@@ -54,7 +54,7 @@ _FRESH_PROCESS = """
 import contextlib, io, json, sys, tempfile
 from restoration.pipeline import restore
 with tempfile.TemporaryDirectory() as out, contextlib.redirect_stdout(io.StringIO()):
-    report = restore(sys.argv[1], output_dir=out, save_images=False, efd_closure=True).report
+    report = restore(sys.argv[1], output_dir=out, save_images=False, gap_closure=True).report
 print(json.dumps(report))
 """
 
@@ -67,7 +67,7 @@ def test_restoration_is_deterministic():
     reports = []
     with tempfile.TemporaryDirectory() as out:
         for _ in range(2):
-            result = restore(os.path.join(ROOT, image), output_dir=out, save_images=False, efd_closure=True)
+            result = restore(os.path.join(ROOT, image), output_dir=out, save_images=False, gap_closure=True)
             reports.append(_stable(json.loads(json.dumps(result.report))))
     fresh = subprocess.run(
         [sys.executable, "-c", _FRESH_PROCESS, os.path.join(ROOT, image)],

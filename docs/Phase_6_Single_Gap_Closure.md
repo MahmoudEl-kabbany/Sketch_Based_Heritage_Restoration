@@ -1,10 +1,10 @@
 # Phase 6 — Symmetry-Guided Single-Gap Closure
 
-> **Source file:** [`restoration/efd_closure.py`](../restoration/efd_closure.py)
+> **Source file:** [`restoration/single_gap_closure.py`](../restoration/single_gap_closure.py)
 
 ---
 
-> **Optional, off by default.** Run it with `restore(..., efd_closure=True)`.
+> **Optional, off by default.** Run it with `restore(..., gap_closure=True)`.
 > On the 32 test drawings it repaired 5 more gaps of 784 (+0.6 points of gap recall) and added 5% to the line
 > drawn off the drawing; in nearby settings its closures were the longest wrong strokes of the whole pipeline
 > (in one such run two closures drew 137 line widths off the drawing, all 773 bridges together 58). Its plausibility
@@ -14,8 +14,9 @@
 
 > **About the name.** This phase used to be called "EFD Gap Closure". It computes no Elliptic Fourier
 > Descriptors: it closes a gap by mirroring the contour across a reflection-symmetry axis, or with a
-> curvature-aware G1 arc. The module and its parameters (`efd_closure.py`, `efd_closure=...`) still carry the
-> old name. The standalone demo in `eliptic_fourier_descriptors/efd.py` does compute EFDs and is unrelated to this phase.
+> curvature-aware G1 arc. The old names still work but are deprecated: `restoration.efd_closure` re-exports
+> this module, and `restore()` accepts the old `efd_*` arguments with a `DeprecationWarning` (see the key
+> mapping in [Phase 7](Phase_7_Output.md#schema-40-renamed-keys)). The standalone demo in `eliptic_fourier_descriptors/efd.py` does compute EFDs and is unrelated to this phase.
 
 ## 1. Purpose
 
@@ -150,7 +151,7 @@ def close_single_gaps(
 ) -> Tuple[List[BezierPath], List[Dict[str, Any]]]:  # (paths, diagnostics)
 ```
 
-Each diagnostics entry holds `path_index`, `accepted`, `closure_method` (`symmetry_mirroring`, `curvature_arc` or `none`), `reason`, `gap_distance_px`, `gap_ratio`, `plausibility_threshold` and the metrics above. Closure segments have `source_type = "efd_closure"`.
+Each diagnostics entry holds `path_index`, `accepted`, `closure_method` (`symmetry_mirroring`, `curvature_arc` or `none`), `reason`, `gap_distance_px`, `gap_ratio`, `plausibility_threshold` and the metrics above. Closure segments have `source_type = "gap_closure"`.
 
 ---
 

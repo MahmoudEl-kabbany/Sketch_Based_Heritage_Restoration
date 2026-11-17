@@ -107,7 +107,7 @@ def render_bridges_on_damaged(
 ) -> np.ndarray:
     """Draw only restoration bridges onto a copy of the damaged image.
 
-    Only segments with source_type 'bridge' or 'efd_closure' are drawn.
+    Only segments with source_type 'bridge' or 'gap_closure' are drawn.
     The damaged image pixels remain untouched everywhere else, making
     PSNR/SSIM comparisons against the original much more meaningful.
 
@@ -140,13 +140,13 @@ def render_bridges_on_damaged(
 
     thickness = _get_aa_thickness(estimated)
 
-    # Draw only bridge and efd_closure segments
+    # Draw only bridge and gap_closure segments
     for path in restored_paths:
         if not path.segments:
             continue
 
         for seg in path.segments:
-            if seg.source_type not in ("bridge", "efd_closure"):
+            if seg.source_type not in ("bridge", "gap_closure"):
                 continue
 
             pts = seg.sample(n=pts_per_segment)

@@ -190,3 +190,28 @@ def test_fitted_weights_point_the_expected_way():
     # The measurements that carry the scoring do count against a bridge.
     smooth = dict(zip(model.scorecards["smooth"].names, model.scorecards["smooth"].weights))
     assert smooth["aim_best"] < 0.0 and smooth["crossed_ink"] < 0.0
+
+
+def test_old_phase6_names_still_work(tmp_path):
+    import importlib
+    import warnings
+
+    import pytest
+
+    image = draw(tmp_path / "loop.png", [[[60, 40], [260, 40], [260, 200], [60, 200], [60, 60]]])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        old = restore(image, output_dir=str(tmp_path), save_images=False, efd_closure=True, efd_gap_threshold=0.3)
+    assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+    new = restore(image, output_dir=str(tmp_path), save_images=False, gap_closure=True, gap_closure_threshold=0.3)
+    assert old.report["analysis"]["gap_closure_phase"] == new.report["analysis"]["gap_closure_phase"]
+    assert old.report["analysis"]["gap_closure_phase"]["enabled"]
+    with pytest.raises(TypeError):
+        restore(image, efd_closure=True, gap_closure=True)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        legacy = importlib.import_module("restoration.efd_closure")
+    from restoration import single_gap_closure
+    assert legacy.close_single_gaps is single_gap_closure.close_single_gaps
+    assert legacy._detect_symmetry is single_gap_closure._detect_symmetry
