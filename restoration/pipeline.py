@@ -799,7 +799,8 @@ def restore(
     # Save report JSON
     report_path = os.path.join(output_dir, f"{name}_report.json")
     with open(report_path, "w") as f:
-        json.dump(report, f, indent=2)
+        # One write of the whole text: json.dump would write it in thousands of small pieces.
+        f.write(json.dumps(report, indent=2))
     print(f"  -> Report saved -> {report_path}")
 
     print(f"\n  Done in {elapsed:.2f}s")

@@ -215,3 +215,17 @@ def test_old_phase6_names_still_work(tmp_path):
     from restoration import single_gap_closure
     assert legacy.close_single_gaps is single_gap_closure.close_single_gaps
     assert legacy._detect_symmetry is single_gap_closure._detect_symmetry
+
+
+def test_spline_matches_scipy_bit_for_bit():
+    from scipy.interpolate import CubicSpline
+
+    from restoration.scoring import not_a_knot_spline
+
+    rng = np.random.default_rng(0)
+    for n in (4, 5, 17, 64):
+        for _ in range(50):
+            points = np.cumsum(rng.normal(size=(n, 2)), axis=0)
+            x = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))))
+            at = np.linspace(0.0, x[-1], 3 * n)
+            assert np.array_equal(not_a_knot_spline(x, points, at), CubicSpline(x, points)(at))

@@ -17,7 +17,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 from dtaidistance import dtw
-from scipy.interpolate import CubicSpline
+from scipy.linalg import get_lapack_funcs
 from scipy.spatial import cKDTree
 
 from restoration.candidates import ConnectionCandidate
@@ -140,6 +140,51 @@ def compute_mdtw(combined: np.ndarray) -> float:
     return float(np.hypot(dtw_x, dtw_y))
 
 
+# LAPACK's tridiagonal solver, the routine scipy's CubicSpline uses for its spline slopes.
+_GTSV, = get_lapack_funcs(("gtsv",), (np.empty((1, 1)),))
+
+
+def not_a_knot_spline(x: np.ndarray, y: np.ndarray, at: np.ndarray) -> np.ndarray:
+    """Values at *at* of the not-a-knot cubic spline through (x, y), y of shape (n, d).
+
+    The same computation as scipy.interpolate.CubicSpline(x, y)(at), operation
+    for operation, so the result is bit-identical; it skips CubicSpline's input
+    checks and object construction, which cost twice the computation itself.
+    *x* must be strictly increasing with at least 4 values.
+    """
+    n = len(x)
+    dx = np.diff(x)
+    dxr = dx.reshape(-1, 1)
+    slope = np.diff(y, axis=0) / dxr
+
+    # Tridiagonal system for the slopes s at the knots (rows: upper, main, lower diagonal).
+    A = np.zeros((3, n))
+    b = np.empty((n, y.shape[1]))
+    A[1, 1:-1] = 2 * (dx[:-1] + dx[1:])
+    A[0, 2:] = dx[:-1]
+    A[-1, :-2] = dx[1:]
+    b[1:-1] = 3 * (dxr[1:] * slope[:-1] + dxr[:-1] * slope[1:])
+    # Not-a-knot ends: the third derivative is continuous at the second and second-last knot.
+    d = x[2] - x[0]
+    A[1, 0] = dx[1]
+    A[0, 1] = d
+    b[0] = ((dxr[0] + 2 * d) * dxr[1] * slope[0] + dxr[0] ** 2 * slope[1]) / d
+    d = x[-1] - x[-3]
+    A[1, -1] = dx[-2]
+    A[-1, -2] = d
+    b[-1] = (dxr[-1] ** 2 * slope[-2] + (2 * d + dxr[-1]) * dxr[-2] * slope[-1]) / d
+    _, _, _, s, info = _GTSV(A[2, :-1], A[1, :], A[0, 1:], b, True, True, True, True)
+    if info != 0:
+        raise np.linalg.LinAlgError("singular spline system")
+
+    # Hermite coefficients per interval, highest power first, as scipy's PPoly stores them.
+    t = (s[:-1] + s[1:] - 2 * slope) / dxr
+    c0, c1, c2, c3 = t / dxr, (slope - s[:-1]) / dxr - t, s[:-1], y[:-1]
+    i = np.clip(np.searchsorted(x, at, side="right") - 1, 0, n - 2)
+    z = (at - x[i])[:, np.newaxis]
+    return c3[i] + c2[i] * z + c1[i] * (z * z) + c0[i] * (z * z * z)
+
+
 def compute_mjerk(combined: np.ndarray) -> float:
     """Mean squared jerk (3rd derivative with respect to arc length) along a curve.
 
@@ -162,7 +207,7 @@ def compute_mjerk(combined: np.ndarray) -> float:
 
     num_points = int(np.ceil(length / JERK_STEP_PX)) + 1
     step = length / (num_points - 1)
-    resampled = CubicSpline(chord, points)(np.linspace(0.0, length, num_points))
+    resampled = not_a_knot_spline(chord, points, np.linspace(0.0, length, num_points))
     jerk = np.diff(resampled, n=3, axis=0) / step ** 3
     return float(np.mean(np.sum(jerk ** 2, axis=1)))
 

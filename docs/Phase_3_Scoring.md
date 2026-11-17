@@ -79,7 +79,7 @@ All measurements are free of scale: they are in stroke widths, gap lengths, degr
 Both are computed on the bridge **together with its context**: the stretch of stroke one gap length long on either side. This curve is resampled to 64 points at equal arc-length steps and scaled to a length of 100, so that neither the resolution nor the sampling of the path enters.
 
 - **MDTW** — the dynamic-time-warping distance (`dtaidistance`) between that curve and the straight line joining its ends, computed for x and y and combined as `√(dtw_x² + dtw_y²)`. It is small when the bridge continues its strokes directly.
-- **MJerk** — the mean squared third derivative of the curve with respect to arc length. The curve is first replaced by points every unit of length along a cubic spline through it; differentiating raw samples would measure the sampling, not the shape. It is small when curvature changes gently along the bridge.
+- **MJerk** — the mean squared third derivative of the curve with respect to arc length. The curve is first replaced by points every unit of length along a not-a-knot cubic spline through it (`not_a_knot_spline`, the computation of scipy's `CubicSpline` without its per-call overhead, bit-identical); differentiating raw samples would measure the sampling, not the shape. It is small when curvature changes gently along the bridge.
 
 ---
 
@@ -204,5 +204,5 @@ def load_model(path=MODEL_PATH) -> ScoringModel
 | Library | Usage |
 |---|---|
 | `dtaidistance` | DTW distance (compiled version when available) |
-| `scipy` | cubic spline for MJerk, KD-tree for nearest free ends; the fit in `train_scoring.py` |
+| `scipy` | LAPACK tridiagonal solver (`gtsv`) for the MJerk spline, KD-tree for nearest free ends; the fit in `train_scoring.py` |
 | `numpy` | everything else |
