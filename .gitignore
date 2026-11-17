@@ -13,3 +13,9 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+
+# Generated data, models and feedback (see sketch_restoration_plan.md)
+data/
+models/
+feedback/
+*.prof

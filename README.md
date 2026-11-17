@@ -165,6 +165,10 @@ Sketch_Based_Heritage_Restoration/
 ├── evaluate_bridge_vs_original.py  # Fluidity metrics (MDTW/MJerk) vs ground truth
 ├── run_batch_test.py               # Batch restoration runner
 ├── test_restoration.py             # Tests (run with: python -m pytest)
+├── test_regression.py              # Output identical to the snapshot; determinism
+├── regression_snapshot.py          # Records / compares the exact-output snapshot
+├── regression/snapshot/            # The recorded snapshot (one JSON per benchmark image)
+└── scripts/profile_pipeline.py     # Per-stage timings vs. drawing size; cProfile
 ```
 
 ---
@@ -318,6 +322,15 @@ python check_changes.py --save-baseline   # record the current results as the ne
 It runs the unit tests, refits the scorecards without each drawing, restores every test drawing with a model that has not seen it, and compares the results with `check_baseline.json`: gaps repaired, line drawn off the drawing, wrong strokes, strokes drawn on undamaged originals, PSNR and SSIM, and which drawings changed. It ends with a verdict. Fewer wrong strokes come first: a change that draws less line off the drawing but repairs fewer gaps is kept only when the line off the drawing falls by at least 25% for at most 2 points of gap recall.
 
 Nothing is written to `restoration/outputs/` or to the shipped model; files go to a folder in the system's temp directory (`--output-dir` to choose another). If the change is kept, refit the shipped model with `python train_scoring.py` and record the new baseline.
+
+A refactor that should change nothing is checked more strictly, against an exact snapshot of the output (which stroke ends were bridged, and every final path's segments and control points, with and without Phase 6) on all 64 benchmark images:
+
+```bash
+python regression_snapshot.py             # about 30 seconds; lists any image whose output changed
+python regression_snapshot.py --rebless   # after an intended change: record the new output
+python -m pytest test_regression.py       # the same check, plus a determinism test
+python scripts/profile_pipeline.py        # per-stage time vs. number of stroke ends, and a cProfile
+```
 
 ### Fitting the Scorer
 
