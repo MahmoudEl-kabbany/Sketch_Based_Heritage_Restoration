@@ -29,7 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -87,7 +87,9 @@ def _same_model(fitted: Dict[str, Dict[str, Any]], shipped_path: str) -> bool:
     return True
 
 
-def fit_held_out_models(output_dir: str, workers: int) -> Tuple[Dict[str, str], float, bool]:
+def fit_held_out_models(
+    output_dir: str, workers: int, extra_data: Optional[str] = None, extra_difficulties: Optional[List[str]] = None,
+) -> Tuple[Dict[str, str], float, bool]:
     """Fit the scorecards once without each fold of drawings.
 
     Returns (model file for every drawing, chance that a correct candidate
@@ -95,7 +97,8 @@ def fit_held_out_models(output_dir: str, workers: int) -> Tuple[Dict[str, str], 
     what the current code would fit).
     """
     with contextlib.redirect_stdout(io.StringIO()):
-        images = train_scoring.build_dataset(os.path.join(output_dir, "synthetic"), workers)
+        images = train_scoring.build_dataset(os.path.join(output_dir, "synthetic"), workers, extra_data=extra_data,
+                                              extra_difficulties=extra_difficulties)
     folds = train_scoring.fold_of_drawings(images)
     models = {
         fold: train_scoring.fit([image for image in images if folds[image["drawing"]] != fold])
@@ -259,6 +262,10 @@ def main() -> None:
                         help=f"Where reports and intermediate files go (default: {DEFAULT_OUTPUT_DIR}).")
     parser.add_argument("--workers", type=int, default=default_workers(),
                         help="Images processed in parallel (1 = one at a time).")
+    parser.add_argument("--extra-data", default=None, metavar="DIR",
+                        help="Also train on the train split of this synthetic dataset (scripts/make_synthetic.py).")
+    parser.add_argument("--extra-difficulties", default=None,
+                        help="Comma-separated levels of --extra-data to train on (default: all).")
     parser.add_argument("--preprocess", default=None, metavar="JSON",
                         help="Preprocessing variant to test, as PreprocessConfig overrides, "
                              "e.g. '{\"threshold\": \"sauvola\"}' (see restoration/preprocess.py).")
@@ -277,7 +284,9 @@ def main() -> None:
     tests_passed = run_unit_tests()
 
     print("  Step 2 of 3: fitting the scorecards without each drawing (a minute or two)")
-    model_of, separation, shipped_model_current = fit_held_out_models(args.output_dir, args.workers)
+    model_of, separation, shipped_model_current = fit_held_out_models(
+        args.output_dir, args.workers, args.extra_data,
+        args.extra_difficulties.split(",") if args.extra_difficulties else None)
     print(f"    a correct candidate outscores a wrong one {100 * separation:.1f}% of the time")
 
     print("  Step 3 of 3: restoring every drawing with a model that has not seen it")

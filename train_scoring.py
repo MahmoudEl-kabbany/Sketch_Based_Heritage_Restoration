@@ -77,9 +77,15 @@ def make_synthetic_damage(original_path: str, out_path: str, version: int, gap_c
     cv2.imwrite(out_path, damaged)
 
 
-def labelled_candidates(drawing: str, kind: str, original_path: str, image_path: str) -> Dict[str, Any]:
-    """Candidates of one image with their measurements and what the original says about them."""
-    original, damaged, agreement = load_pair(original_path, image_path)
+def labelled_candidates(
+    drawing: str, kind: str, original_path: str, image_path: str, reference_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Candidates of one image with their measurements and what the original says about them.
+
+    *reference_path*: for degraded synthetic damage, the gapped image without
+    degradation, from which ground truth is taken (see synthetic_damage.py).
+    """
+    original, damaged, agreement = load_pair(original_path, reference_path or image_path)
     if original.shape != damaged.shape or agreement < 0.98:
         return {"drawing": drawing, "kind": kind, "skipped": True}
     gt = build_ground_truth(original, damaged)
@@ -103,10 +109,24 @@ def labelled_candidates(drawing: str, kind: str, original_path: str, image_path:
     }
 
 
-def build_dataset(work_dir: str, workers: int, name_filter: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Labelled candidates of every drawing: its provided damage, synthetic damage, and no damage."""
+def build_dataset(
+    work_dir: str,
+    workers: int,
+    name_filter: Optional[str] = None,
+    extra_data: Optional[str] = None,
+    extra_split: str = "train",
+    extra_difficulties: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Labelled candidates of every drawing: its provided damage, synthetic damage, and no damage.
+
+    *extra_data*: a dataset written by scripts/make_synthetic.py; the variants
+    of its *extra_split* ("train", "val", "test" or "all") are added, as kind
+    "extra_<difficulty>", under their source drawing's name (so a benchmark
+    drawing's synthetic variants share its cross-validation fold).
+    *extra_difficulties* limits them to these levels (default: all).
+    """
     os.makedirs(work_dir, exist_ok=True)
-    jobs: List[Tuple[str, str, str, str]] = []
+    jobs: List[Tuple[Any, ...]] = []
     for name, original_path, damaged_path in discover_pairs(name_filter=name_filter):
         original, damaged, agreement = load_pair(original_path, damaged_path)
         gap_count = 20
@@ -118,6 +138,15 @@ def build_dataset(work_dir: str, workers: int, name_filter: Optional[str] = None
             synthetic_path = os.path.join(work_dir, f"{name}_synthetic{version}.png")
             make_synthetic_damage(original_path, synthetic_path, version, gap_count)
             jobs.append((name, f"synthetic{version}", original_path, synthetic_path))
+    if extra_data:
+        from synthetic_damage import load_dataset
+        for entry in load_dataset(extra_data, None if extra_split == "all" else extra_split):
+            if name_filter and name_filter.lower() not in entry["drawing"].lower():
+                continue
+            if extra_difficulties and entry["difficulty"] not in extra_difficulties:
+                continue
+            jobs.append((entry["drawing"], f"extra_{entry['difficulty']}", entry["clean"], entry["damaged"],
+                         entry["gapped"]))
 
     images = []
     for i, image in enumerate(map_in_processes(labelled_candidates, jobs, workers), 1):
@@ -186,10 +215,17 @@ def predict(model: Dict[str, Dict[str, Any]], image: Dict[str, Any]) -> np.ndarr
 
 
 def fold_of_drawings(images: Sequence[Dict[str, Any]], folds: int = FOLDS) -> Dict[str, int]:
-    """Assign every drawing to a fold, in a fixed shuffled order."""
-    drawings = sorted({image["drawing"] for image in images})
+    """Assign every drawing to a fold, in a fixed shuffled order.
+
+    Drawings that only appear through --extra-data are assigned after the
+    others, so that adding extra data leaves the benchmark drawings' folds as they were.
+    """
+    drawings = sorted({image["drawing"] for image in images if not image["kind"].startswith("extra_")})
     order = np.random.RandomState(0).permutation(len(drawings))
-    return {drawings[index]: position % folds for position, index in enumerate(order)}
+    assignment = {drawings[index]: position % folds for position, index in enumerate(order)}
+    extra = sorted({image["drawing"] for image in images} - set(assignment))
+    assignment.update({drawing: position % folds for position, drawing in enumerate(extra)})
+    return assignment
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -321,6 +357,10 @@ def main() -> None:
     parser.add_argument("--work-dir", default=None, help="Directory for the synthetic damaged images.")
     parser.add_argument("--features", default=None, help="Comma-separated measurements to use (default: all).")
     parser.add_argument("--filter", default=None, help="Only drawings whose name contains this substring.")
+    parser.add_argument("--extra-data", default=None,
+                        help="Synthetic dataset (scripts/make_synthetic.py) whose variants are added to the training data.")
+    parser.add_argument("--extra-split", default="train", help="Which split of --extra-data to add (train/val/test/all).")
+    parser.add_argument("--extra-difficulties", default=None, help="Comma-separated levels of --extra-data to add (default: all).")
     parser.add_argument("--workers", type=int, default=default_workers())
     args = parser.parse_args()
 
@@ -331,7 +371,8 @@ def main() -> None:
     else:
         work_dir = args.work_dir or tempfile.mkdtemp(prefix="train_scoring_")
         os.makedirs(work_dir, exist_ok=True)
-        images = build_dataset(work_dir, args.workers, args.filter)
+        images = build_dataset(work_dir, args.workers, args.filter, args.extra_data, args.extra_split,
+                               args.extra_difficulties.split(",") if args.extra_difficulties else None)
         if args.dataset:
             with open(args.dataset, "wb") as f:
                 pickle.dump(images, f)

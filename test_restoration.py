@@ -256,3 +256,44 @@ def test_preprocessing_variants_are_validated_and_run(tmp_path, monkeypatch):
     for overrides in variants:
         extraction = extract_paths(image, preprocess=PreprocessConfig(**overrides))
         assert len(extraction.endpoints) == 6, overrides     # three lines, two free ends each
+
+
+def test_synthetic_damage_is_deterministic_and_matches_ground_truth(tmp_path):
+    from evaluate_gaps import build_ground_truth
+    from synthetic_damage import make_variant, split_of
+
+    strokes = [
+        [[40, 40], [460, 40]], [[40, 120], [460, 120]],                      # long straight lines
+        [[60, 200], [250, 200], [250, 420]],                                 # a corner
+        [[300, 180], [300, 460]], [[300, 320], [460, 320]],                  # a T junction
+    ]
+    clean = cv2.imread(draw(tmp_path / "clean.png", strokes, size=(500, 500)), cv2.IMREAD_GRAYSCALE)
+    first = make_variant(clean, "t", 0, "hard")
+    again = make_variant(clean, "t", 0, "hard")
+    assert np.array_equal(first["damaged"], again["damaged"]) and first["gaps"] == again["gaps"]
+    assert first["gaps"], "no gaps were placed"
+    assert {g["type"] for g in first["gaps"]} <= {"straight", "curved", "corner", "junction"}
+    # Every erased gap shows up in the ground truth built from (clean, gapped).
+    gt = build_ground_truth(clean, first["gapped"])
+    assert len(gt.gaps) >= len(first["gaps"])
+    assert split_of("t") == split_of("t") and split_of("t") in ("train", "val", "test")
+
+
+def test_committed_synthetic_samples_regenerate_exactly():
+    import json
+    import os
+
+    from synthetic_damage import load_dataset, make_variant
+
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "regression", "synthetic_samples")
+    with open(os.path.join(root, "manifest.json")) as f:
+        seed = json.load(f)["seed"]
+    entries = load_dataset(root)
+    assert len(entries) >= 20
+    for e in entries:
+        clean = cv2.imread(e["clean"], cv2.IMREAD_GRAYSCALE)
+        result = make_variant(clean, e["drawing"], e["variant"], e["difficulty"], seed)
+        assert np.array_equal(result["damaged"], cv2.imread(e["damaged"], cv2.IMREAD_GRAYSCALE)), e["damaged"]
+        assert np.array_equal(result["gapped"], cv2.imread(e["gapped"], cv2.IMREAD_GRAYSCALE)), e["gapped"]
+        with open(e["gaps"]) as f:
+            assert json.load(f)["gaps"] == json.loads(json.dumps(result["gaps"]))

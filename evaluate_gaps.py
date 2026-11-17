@@ -343,9 +343,19 @@ def evaluate_pair(
     coverage_threshold: float = COVERAGE_THRESHOLD,
     tolerance_line_widths: float = TOLERANCE_LINE_WIDTHS,
     model_path: str = MODEL_PATH,
+    reference_path: Optional[str] = None,
+    include_undamaged: bool = True,
 ) -> Dict[str, Any]:
-    """Run the pipeline on one damaged image and on its original; compare with ground truth."""
-    original, damaged, agreement = load_pair(original_path, damaged_path)
+    """Run the pipeline on one damaged image and on its original; compare with ground truth.
+
+    *reference_path*: for synthetic damage (synthetic_damage.py), the image
+    with the gaps but without the degradation. Ground truth and alignment then
+    come from (original, reference), while the pipeline runs on the damaged
+    image; stains or faded ink would otherwise count as missing strokes.
+    *include_undamaged*: also restore the original, to measure what the
+    pipeline draws where nothing is missing.
+    """
+    original, damaged, agreement = load_pair(original_path, reference_path or damaged_path)
     if original.shape != damaged.shape or agreement < 0.98:
         return {"name": name, "skipped": f"original and damaged image do not line up (agreement {agreement:.2f})"}
     gt = build_ground_truth(original, damaged, tolerance_line_widths)
@@ -391,11 +401,15 @@ def evaluate_pair(
             gap["deviation_widths"] = float(np.mean(distance) / gt.line_width)
 
     # ---- the undamaged original: everything drawn there is unnecessary
-    clean = restore(original_path, model_path=model_path,
-                    output_dir=os.path.join(output_dir, "reports_undamaged"), save_images=False)
-    clean_original = cv2.imread(original_path, cv2.IMREAD_GRAYSCALE)
-    clean_gt = build_ground_truth(clean_original, clean_original, tolerance_line_widths)
-    clean_extraction_endpoints = clean.report["analysis"]["extraction"]["endpoints"]
+    undamaged_strokes: List[Dict[str, Any]] = []
+    clean_extraction_endpoints = 0
+    if include_undamaged:
+        clean = restore(original_path, model_path=model_path,
+                        output_dir=os.path.join(output_dir, "reports_undamaged"), save_images=False)
+        clean_original = cv2.imread(original_path, cv2.IMREAD_GRAYSCALE)
+        clean_gt = build_ground_truth(clean_original, clean_original, tolerance_line_widths)
+        clean_extraction_endpoints = clean.report["analysis"]["extraction"]["endpoints"]
+        undamaged_strokes = _stroke_rows(clean_gt, clean.restored_paths, coverage_threshold)
 
     return {
         "name": name,
@@ -406,7 +420,7 @@ def evaluate_pair(
         "endpoints_at_gaps": int(at_gap.sum()),
         "candidates": len(candidates),
         "strokes_missed_by_extraction": strokes_missed,
-        "undamaged_strokes": _stroke_rows(clean_gt, clean.restored_paths, coverage_threshold),
+        "undamaged_strokes": undamaged_strokes,
         "undamaged_endpoints": int(clean_extraction_endpoints),
     }
 

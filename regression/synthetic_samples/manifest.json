@@ -1,0 +1,242 @@
+{
+ "seed": 0,
+ "variants": 1,
+ "difficulties": [
+  "easy",
+  "medium",
+  "hard"
+ ],
+ "entries": [
+  {
+   "drawing": "qd_bird_4841013539504128",
+   "split": "val",
+   "difficulty": "easy",
+   "variant": 0,
+   "clean": "val/qd_bird_4841013539504128/clean.png",
+   "gapped": "val/qd_bird_4841013539504128/easy_0/gapped.png",
+   "damaged": "val/qd_bird_4841013539504128/easy_0/damaged.png",
+   "gaps": "val/qd_bird_4841013539504128/easy_0/gaps.json",
+   "gap_count": 5
+  },
+  {
+   "drawing": "qd_bird_4841013539504128",
+   "split": "val",
+   "difficulty": "medium",
+   "variant": 0,
+   "clean": "val/qd_bird_4841013539504128/clean.png",
+   "gapped": "val/qd_bird_4841013539504128/medium_0/gapped.png",
+   "damaged": "val/qd_bird_4841013539504128/medium_0/damaged.png",
+   "gaps": "val/qd_bird_4841013539504128/medium_0/gaps.json",
+   "gap_count": 5
+  },
+  {
+   "drawing": "qd_bird_4841013539504128",
+   "split": "val",
+   "difficulty": "hard",
+   "variant": 0,
+   "clean": "val/qd_bird_4841013539504128/clean.png",
+   "gapped": "val/qd_bird_4841013539504128/hard_0/gapped.png",
+   "damaged": "val/qd_bird_4841013539504128/hard_0/damaged.png",
+   "gaps": "val/qd_bird_4841013539504128/hard_0/gaps.json",
+   "gap_count": 5
+  },
+  {
+   "drawing": "qd_butterfly_4511849510862848",
+   "split": "val",
+   "difficulty": "easy",
+   "variant": 0,
+   "clean": "val/qd_butterfly_4511849510862848/clean.png",
+   "gapped": "val/qd_butterfly_4511849510862848/easy_0/gapped.png",
+   "damaged": "val/qd_butterfly_4511849510862848/easy_0/damaged.png",
+   "gaps": "val/qd_butterfly_4511849510862848/easy_0/gaps.json",
+   "gap_count": 5
+  },
+  {
+   "drawing": "qd_butterfly_4511849510862848",
+   "split": "val",
+   "difficulty": "medium",
+   "variant": 0,
+   "clean": "val/qd_butterfly_4511849510862848/clean.png",
+   "gapped": "val/qd_butterfly_4511849510862848/medium_0/gapped.png",
+   "damaged": "val/qd_butterfly_4511849510862848/medium_0/damaged.png",
+   "gaps": "val/qd_butterfly_4511849510862848/medium_0/gaps.json",
+   "gap_count": 5
+  },
+  {
+   "drawing": "qd_butterfly_4511849510862848",
+   "split": "val",
+   "difficulty": "hard",
+   "variant": 0,
+   "clean": "val/qd_butterfly_4511849510862848/clean.png",
+   "gapped": "val/qd_butterfly_4511849510862848/hard_0/gapped.png",
+   "damaged": "val/qd_butterfly_4511849510862848/hard_0/damaged.png",
+   "gaps": "val/qd_butterfly_4511849510862848/hard_0/gaps.json",
+   "gap_count": 5
+  },
+  {
+   "drawing": "qd_castle_4617220883742720",
+   "split": "train",
+   "difficulty": "easy",
+   "variant": 0,
+   "clean": "train/qd_castle_4617220883742720/clean.png",
+   "gapped": "train/qd_castle_4617220883742720/easy_0/gapped.png",
+   "damaged": "train/qd_castle_4617220883742720/easy_0/damaged.png",
+   "gaps": "train/qd_castle_4617220883742720/easy_0/gaps.json",
+   "gap_count": 5
+  },
+  {
+   "drawing": "qd_castle_4617220883742720",
+   "split": "train",
+   "difficulty": "medium",
+   "variant": 0,
+   "clean": "train/qd_castle_4617220883742720/clean.png",
+   "gapped": "train/qd_castle_4617220883742720/medium_0/gapped.png",
+   "damaged": "train/qd_castle_4617220883742720/medium_0/damaged.png",
+   "gaps": "train/qd_castle_4617220883742720/medium_0/gaps.json",
+   "gap_count": 5
+  },
+  {
+   "drawing": "qd_castle_4617220883742720",
+   "split": "train",
+   "difficulty": "hard",
+   "variant": 0,
+   "clean": "train/qd_castle_4617220883742720/clean.png",
+   "gapped": "train/qd_castle_4617220883742720/hard_0/gapped.png",
+   "damaged": "train/qd_castle_4617220883742720/hard_0/damaged.png",
+   "gaps": "train/qd_castle_4617220883742720/hard_0/gaps.json",
+   "gap_count": 5
+  },
+  {
+   "drawing": "qd_crown_4610349368082432",
+   "split": "val",
+   "difficulty": "easy",
+   "variant": 0,
+   "clean": "val/qd_crown_4610349368082432/clean.png",
+   "gapped": "val/qd_crown_4610349368082432/easy_0/gapped.png",
+   "damaged": "val/qd_crown_4610349368082432/easy_0/damaged.png",
+   "gaps": "val/qd_crown_4610349368082432/easy_0/gaps.json",
+   "gap_count": 6
+  },
+  {
+   "drawing": "qd_crown_4610349368082432",
+   "split": "val",
+   "difficulty": "medium",
+   "variant": 0,
+   "clean": "val/qd_crown_4610349368082432/clean.png",
+   "gapped": "val/qd_crown_4610349368082432/medium_0/gapped.png",
+   "damaged": "val/qd_crown_4610349368082432/medium_0/damaged.png",
+   "gaps": "val/qd_crown_4610349368082432/medium_0/gaps.json",
+   "gap_count": 6
+  },
+  {
+   "drawing": "qd_crown_4610349368082432",
+   "split": "val",
+   "difficulty": "hard",
+   "variant": 0,
+   "clean": "val/qd_crown_4610349368082432/clean.png",
+   "gapped": "val/qd_crown_4610349368082432/hard_0/gapped.png",
+   "damaged": "val/qd_crown_4610349368082432/hard_0/damaged.png",
+   "gaps": "val/qd_crown_4610349368082432/hard_0/gaps.json",
+   "gap_count": 6
+  },
+  {
+   "drawing": "qd_fish_4547641239142400",
+   "split": "train",
+   "difficulty": "easy",
+   "variant": 0,
+   "clean": "train/qd_fish_4547641239142400/clean.png",
+   "gapped": "train/qd_fish_4547641239142400/easy_0/gapped.png",
+   "damaged": "train/qd_fish_4547641239142400/easy_0/damaged.png",
+   "gaps": "train/qd_fish_4547641239142400/easy_0/gaps.json",
+   "gap_count": 3
+  },
+  {
+   "drawing": "qd_fish_4547641239142400",
+   "split": "train",
+   "difficulty": "medium",
+   "variant": 0,
+   "clean": "train/qd_fish_4547641239142400/clean.png",
+   "gapped": "train/qd_fish_4547641239142400/medium_0/gapped.png",
+   "damaged": "train/qd_fish_4547641239142400/medium_0/damaged.png",
+   "gaps": "train/qd_fish_4547641239142400/medium_0/gaps.json",
+   "gap_count": 3
+  },
+  {
+   "drawing": "qd_fish_4547641239142400",
+   "split": "train",
+   "difficulty": "hard",
+   "variant": 0,
+   "clean": "train/qd_fish_4547641239142400/clean.png",
+   "gapped": "train/qd_fish_4547641239142400/hard_0/gapped.png",
+   "damaged": "train/qd_fish_4547641239142400/hard_0/damaged.png",
+   "gaps": "train/qd_fish_4547641239142400/hard_0/gaps.json",
+   "gap_count": 3
+  },
+  {
+   "drawing": "qd_house_4660500463878144",
+   "split": "train",
+   "difficulty": "easy",
+   "variant": 0,
+   "clean": "train/qd_house_4660500463878144/clean.png",
+   "gapped": "train/qd_house_4660500463878144/easy_0/gapped.png",
+   "damaged": "train/qd_house_4660500463878144/easy_0/damaged.png",
+   "gaps": "train/qd_house_4660500463878144/easy_0/gaps.json",
+   "gap_count": 3
+  },
+  {
+   "drawing": "qd_house_4660500463878144",
+   "split": "train",
+   "difficulty": "medium",
+   "variant": 0,
+   "clean": "train/qd_house_4660500463878144/clean.png",
+   "gapped": "train/qd_house_4660500463878144/medium_0/gapped.png",
+   "damaged": "train/qd_house_4660500463878144/medium_0/damaged.png",
+   "gaps": "train/qd_house_4660500463878144/medium_0/gaps.json",
+   "gap_count": 3
+  },
+  {
+   "drawing": "qd_house_4660500463878144",
+   "split": "train",
+   "difficulty": "hard",
+   "variant": 0,
+   "clean": "train/qd_house_4660500463878144/clean.png",
+   "gapped": "train/qd_house_4660500463878144/hard_0/gapped.png",
+   "damaged": "train/qd_house_4660500463878144/hard_0/damaged.png",
+   "gaps": "train/qd_house_4660500463878144/hard_0/gaps.json",
+   "gap_count": 3
+  },
+  {
+   "drawing": "qd_vase_4561298257870848",
+   "split": "train",
+   "difficulty": "easy",
+   "variant": 0,
+   "clean": "train/qd_vase_4561298257870848/clean.png",
+   "gapped": "train/qd_vase_4561298257870848/easy_0/gapped.png",
+   "damaged": "train/qd_vase_4561298257870848/easy_0/damaged.png",
+   "gaps": "train/qd_vase_4561298257870848/easy_0/gaps.json",
+   "gap_count": 4
+  },
+  {
+   "drawing": "qd_vase_4561298257870848",
+   "split": "train",
+   "difficulty": "medium",
+   "variant": 0,
+   "clean": "train/qd_vase_4561298257870848/clean.png",
+   "gapped": "train/qd_vase_4561298257870848/medium_0/gapped.png",
+   "damaged": "train/qd_vase_4561298257870848/medium_0/damaged.png",
+   "gaps": "train/qd_vase_4561298257870848/medium_0/gaps.json",
+   "gap_count": 4
+  },
+  {
+   "drawing": "qd_vase_4561298257870848",
+   "split": "train",
+   "difficulty": "hard",
+   "variant": 0,
+   "clean": "train/qd_vase_4561298257870848/clean.png",
+   "gapped": "train/qd_vase_4561298257870848/hard_0/gapped.png",
+   "damaged": "train/qd_vase_4561298257870848/hard_0/damaged.png",
+   "gaps": "train/qd_vase_4561298257870848/hard_0/gaps.json",
+   "gap_count": 4
+  }
+ ]
+}

@@ -160,6 +160,7 @@ Sketch_Based_Heritage_Restoration/
 │   └── efd.py                      # Standalone EFD demo (not used by the pipeline)
 │
 ├── add_gaps.py                     # Damage simulation tool (gaps, cracks, scrubs)
+├── synthetic_damage.py             # Typed gaps + degradation with ground truth (synthetic dataset)
 ├── check_changes.py                # Tests a code change against the recorded baseline
 ├── train_scoring.py                # Fits the scorecards; cross-validated report
 ├── evaluate_gaps.py                # Gap-level benchmark against ground truth
@@ -171,7 +172,11 @@ Sketch_Based_Heritage_Restoration/
 ├── regression_snapshot.py          # Records / compares the exact-output snapshot
 ├── regression/snapshot/            # The recorded snapshot (one JSON per benchmark image)
 ├── scripts/profile_pipeline.py     # Per-stage timings vs. drawing size; cProfile
-└── scripts/compare_preprocessing.py # Benchmarks preprocessing variants, each with a refitted scorer
+├── scripts/compare_preprocessing.py # Benchmarks preprocessing variants, each with a refitted scorer
+├── scripts/fetch_quickdraw.py      # Seeded Quick, Draw! subset, rasterized (data/quickdraw/)
+├── scripts/make_synthetic.py       # Builds the synthetic damage dataset (data/synthetic/)
+├── scripts/evaluate_synthetic.py   # Gap benchmark on it, by difficulty, gap type and source
+└── regression/synthetic_samples/   # 21 small committed samples (Quick, Draw!, CC BY 4.0)
 ```
 
 ---
@@ -334,6 +339,20 @@ python regression_snapshot.py --rebless   # after an intended change: record the
 python -m pytest test_regression.py       # the same check, plus a determinism test
 python scripts/profile_pipeline.py        # per-stage time vs. number of stroke ends, and a cProfile
 ```
+
+### Synthetic Damage Dataset
+
+Unlimited labelled data with known gaps: each clean drawing gets typed gaps (straight, curved, corner, junction) erased along its strokes, then degradation at three levels (easy, medium, hard: fading, paper texture, stains, uneven light, blur, noise, JPEG). Ground truth comes from the gapped image before degradation.
+
+```bash
+python scripts/fetch_quickdraw.py        # 500 Quick, Draw! drawings (CC BY 4.0) -> data/quickdraw/
+python scripts/make_synthetic.py         # benchmark originals + Quick, Draw! -> data/synthetic/ (train/val/test by drawing)
+python scripts/evaluate_synthetic.py --split test --models cv_models/   # recall by difficulty, gap type and source
+python train_scoring.py --extra-data data/synthetic                    # also train on its train split
+python check_changes.py --extra-data data/synthetic                    # does that help on the real benchmark?
+```
+
+`data/` is git-ignored; everything is deterministic for a seed.
 
 ### Fitting the Scorer
 
