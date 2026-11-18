@@ -49,7 +49,6 @@ FEATURES: Dict[str, str] = {
     "nearest_ratio": "gap length relative to the distance from each end to its nearest free end",
     "same_stroke": "the two ends belong to one stroke (1 = yes: the bridge closes it)",
     "crossed_ink": "existing stroke the bridge runs over between its ends, in stroke widths",
-    "ends_nearby": "other free stroke ends within half the gap plus two stroke widths of the bridge's middle (several: a junction)",
     # ---- smooth bridges
     "aim_worst": "degrees by which the worse-aimed end points away from the other end",
     "aim_best": "degrees by which the better-aimed end points away from the other end",
@@ -77,7 +76,7 @@ SHAPE_FEATURES: Dict[str, Tuple[str, ...]] = {
 # of magnitude and enter by their logarithm; the others enter as they are.
 FEATURE_SCALES: Dict[str, str] = {
     "gap_length": "log2(x)", "width_mismatch": "log2(x)", "stub_shortness": "log2(x)", "nearest_ratio": "log2(x)",
-    "crossed_ink": "log2(1 + x)", "sideways_offset": "log2(1 + x)", "ends_nearby": "log2(1 + x)",
+    "crossed_ink": "log2(1 + x)", "sideways_offset": "log2(1 + x)",
     "mdtw": "ln(1 + x)", "mjerk": "log10(1 + 1e10 x)",
 }
 _SCALE_FUNCTIONS = {
@@ -306,17 +305,7 @@ def _crossed_ink(bridge_points: np.ndarray, dist_map: Optional[np.ndarray]) -> f
     return float(ink[first_clear:last_clear + 1].sum())
 
 
-def _ends_nearby(candidate: ConnectionCandidate, tree: Optional[cKDTree], gap: float, width: float) -> float:
-    """Free stroke ends other than the bridge's own two near the bridge's middle: more than none at a junction."""
-    if tree is None:
-        return 0.0
-    middle = (candidate.ep_a.position + candidate.ep_b.position) / 2.0
-    return float(max(len(tree.query_ball_point(middle, gap / 2.0 + 2.0 * width)) - 2, 0))
-
-
-def _measure(
-    candidate: ConnectionCandidate, ends: Dict[int, _End], result: ExtractionResult, tree: Optional[cKDTree] = None,
-) -> List[float]:
+def _measure(candidate: ConnectionCandidate, ends: Dict[int, _End], result: ExtractionResult) -> List[float]:
     """The FEATURES of one candidate, in order; NaN for those not on the scorecard of its shape."""
     ep_a, ep_b = candidate.ep_a, candidate.ep_b
     end_a, end_b = ends[ep_a.endpoint_id], ends[ep_b.endpoint_id]
@@ -339,7 +328,6 @@ def _measure(
         nearest_ratio=gap / max(np.sqrt(end_a.nearest * end_b.nearest), 1e-6),   # geometric mean of the two ratios
         same_stroke=float(candidate.same_path_closure),
         crossed_ink=_crossed_ink(candidate.bridge_points, result.dist_map) / width,
-        ends_nearby=_ends_nearby(candidate, tree, gap, width),
     )
 
     if candidate.shape == "corner":
@@ -386,9 +374,7 @@ def measure_candidates(candidates: List[ConnectionCandidate], result: Extraction
     if not candidates:
         return np.zeros((0, len(FEATURE_NAMES)))
     ends = _end_contexts(result)
-    positions = np.array([ep.position for ep in result.endpoints]).reshape(-1, 2)
-    tree = cKDTree(positions) if len(positions) else None
-    return np.array([_measure(c, ends, result, tree) for c in candidates], dtype=np.float64)
+    return np.array([_measure(c, ends, result) for c in candidates], dtype=np.float64)
 
 
 def on_scorecard_scale(measurements: np.ndarray) -> np.ndarray:
