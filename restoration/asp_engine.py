@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from restoration.candidates import ConnectionCandidate
+from restoration.constraints import HINT_BONUS, ConstraintError, ResolvedConstraints
 
 RULES_PATH = os.path.join(os.path.dirname(__file__), "asp_rules", "restoration.lp")
 
@@ -38,12 +39,22 @@ def utility(score: float) -> int:
     return int(round(score * UTILITY_SCALE))
 
 
-def encode_facts(candidates: Sequence[ConnectionCandidate]) -> str:
-    """Convert scored candidates into ASP fact strings."""
-    return "\n".join(
-        f"candidate({c.id},{c.ep_a.endpoint_id},{c.ep_b.endpoint_id},{utility(c.score)})."
-        for c in candidates
-    )
+def encode_facts(
+    candidates: Sequence[ConnectionCandidate], constraints: Optional[ResolvedConstraints] = None,
+) -> str:
+    """Convert scored candidates (and the user's constraints, if any) into ASP fact strings."""
+    hinted = constraints.pairs("hint") if constraints else set()
+
+    def value(c: ConnectionCandidate) -> int:
+        if frozenset((c.ep_a.endpoint_id, c.ep_b.endpoint_id)) in hinted:
+            return max(utility(c.score), 0) + HINT_BONUS
+        return utility(c.score)
+
+    lines = [f"candidate({c.id},{c.ep_a.endpoint_id},{c.ep_b.endpoint_id},{value(c)})." for c in candidates]
+    if constraints:
+        lines += [f"forbid_pair({a},{b})." for a, b in constraints.forbid]
+        lines += [f"force_pair({a},{b})." for a, b in constraints.force]
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -55,8 +66,13 @@ def _solve_facts(
     rules_path: str,
     max_solutions: int,
     timeout_s: float = 30.0,
+    found: Optional[List[bool]] = None,
 ) -> List[int]:
-    """Run clingo on one fact bundle and return accepted candidate IDs."""
+    """Run clingo on one fact bundle and return accepted candidate IDs.
+
+    *found*, if given, gets True appended when the solver found any answer
+    (an empty answer and no answer both return []).
+    """
     import clingo
 
     ctl = clingo.Control(_control_args(max_solutions))
@@ -69,6 +85,8 @@ def _solve_facts(
 
     def on_model(model):
         nonlocal accepted_ids
+        if found is not None and not found:
+            found.append(True)
         accepted_ids = []
         for atom in model.symbols(shown=True):
             if atom.name == "accept" and len(atom.arguments) == 1:
@@ -90,23 +108,30 @@ def solve_candidates(
     rules_path: str = RULES_PATH,
     max_solutions: int = 1,
     timeout_s: float = 30.0,
+    constraints: Optional[ResolvedConstraints] = None,
 ) -> Tuple[List[int], Dict[str, Any]]:
     """Solve for the optimal set of connections; return accepted IDs + stats.
 
     A candidate at or below the acceptance threshold has no positive utility
-    and cannot be part of an optimal answer, so only the others are encoded.
+    and cannot be part of an optimal answer, so only the others are encoded,
+    plus the candidates of pairs the user forced or hinted (*constraints*).
     """
     start_total = time.perf_counter()
 
-    working = [c for c in candidates if utility(c.score) > 0]
+    wanted = (constraints.pairs("force") | constraints.pairs("hint")) if constraints else set()
+    working = [c for c in candidates
+               if utility(c.score) > 0 or frozenset((c.ep_a.endpoint_id, c.ep_b.endpoint_id)) in wanted]
 
     t_encode = time.perf_counter()
-    facts = encode_facts(working)
+    facts = encode_facts(working, constraints)
     encoding_time_s = time.perf_counter() - t_encode
 
     t_solve = time.perf_counter()
-    accepted_ids = _solve_facts(facts, rules_path, max_solutions, timeout_s) if working else []
+    found: List[bool] = []
+    accepted_ids = _solve_facts(facts, rules_path, max_solutions, timeout_s, found) if working else []
     solving_time_s = time.perf_counter() - t_solve
+    if constraints and constraints.force and not found:
+        raise ConstraintError("the forced bridges cannot all be drawn together (no answer satisfies them)")
 
     summary: Dict[str, Any] = {
         "candidate_count_input": len(candidates),

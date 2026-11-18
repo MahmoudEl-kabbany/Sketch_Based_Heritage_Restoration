@@ -67,6 +67,34 @@ uses_endpoint(Id, E) :- candidate(Id, _, E, _).
 
 The two shapes of bridge between the same pair of ends share both ends, so at most one of them is accepted: the more probable one.
 
+### 4.1 User constraints (interactive refinement)
+
+A user can forbid, force or hint bridges (`restore(..., user_constraints=...)`, `scripts/refine.py`; see `restoration/constraints.py`). The constraints name stroke ends by position; each position is resolved to the nearest free end, and it is an error if none is within `tolerance_px`. They reach the solver as facts:
+
+```prolog
+forbid_pair(EndpointA, EndpointB).
+force_pair(EndpointA, EndpointB).
+```
+
+and these rules, which do nothing without such facts (the `-1` dummies keep the predicates defined):
+
+```prolog
+forbid_pair(-1, -1).
+force_pair(-1, -1).
+:- accept(Id), candidate(Id, A, B, _), forbid_pair(A, B).
+:- accept(Id), candidate(Id, B, A, _), forbid_pair(A, B).
+forced_satisfied(A, B) :- accept(Id), candidate(Id, A, B, _), force_pair(A, B).
+forced_satisfied(A, B) :- accept(Id), candidate(Id, B, A, _), force_pair(A, B).
+:- force_pair(A, B), A >= 0, not forced_satisfied(A, B).
+```
+
+- **Forced and hinted pairs are always encoded**, whatever their utility. If the pipeline proposed no candidate for such a pair, a smooth one is synthesized before scoring.
+- **A hinted candidate is worth at least `HINT_BONUS` = 100 units** (10 log-odds): its own utility if positive, plus the bonus. It is drawn unless a force needs one of its ends, or the bridges it displaces are together worth more.
+- **The whole drawing is re-optimized.** Forbidding a bridge frees its ends for other partners. Forcing one takes its ends away from their former partners.
+- **Inconsistent constraints are rejected before solving:** two forced bridges sharing an end, or a pair both forced and forbidden.
+
+Without constraints the facts are exactly those of before, and the answers are identical (exact snapshot).
+
 ---
 
 ## 5. Deterministic Solving
@@ -101,6 +129,7 @@ def solve_candidates(
     rules_path: str = RULES_PATH,
     max_solutions: int = 1,
     timeout_s: float = 30.0,
+    constraints: Optional[ResolvedConstraints] = None,   # forbid / force / hint, see 4.1
 ) -> Tuple[List[int], Dict[str, Any]]:      # accepted ids, solver statistics
 
 def decode_solution(accepted_ids, candidates) -> List[ConnectionCandidate]

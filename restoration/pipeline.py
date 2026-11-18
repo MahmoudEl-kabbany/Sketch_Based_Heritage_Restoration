@@ -19,13 +19,14 @@ from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass
 from itertools import groupby
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
 
 from bezier_curves.bezier import BezierPath, BezierSegment
 from restoration.extraction import EndpointInfo, ExtractionResult, extract_paths
+from restoration.constraints import ResolvedConstraints, add_missing_candidates, load_constraints, resolve, user_role
 from restoration.preprocess import PreprocessConfig
 from restoration.candidates import ConnectionCandidate, generate_candidates
 from restoration.scoring import FEATURE_SCALES, FEATURES, MODEL_PATH, ScoringModel, load_model, score_candidates
@@ -56,6 +57,10 @@ class RestorationResult:
     restored_paths: List[BezierPath]
     bridges: List[BezierSegment]
     report: Dict[str, Any]
+    # For interactive refinement (scripts/refine.py) and feedback logging:
+    extraction: Optional[ExtractionResult] = None
+    candidates: Optional[List[ConnectionCandidate]] = None
+    accepted: Optional[List[ConnectionCandidate]] = None
 
 
 @contextmanager
@@ -218,6 +223,7 @@ def _change_events(
     accepted: List[ConnectionCandidate],
     threshold: float,
     gap_closure_diagnostics: List[Dict[str, Any]],
+    constraints: Optional[ResolvedConstraints] = None,
 ) -> List[Dict[str, Any]]:
     """Describe every restoration change for the report's ``detailed_events``."""
     bridge_owner = {_segment_key(seg): c for c in accepted for seg in c.bridge_bezier}
@@ -257,6 +263,9 @@ def _change_events(
                 }
                 ranked = sorted(rivals.values(), key=lambda c: (-c.probability, c.id))
                 event["candidate"] = _candidate_event_details(candidate, threshold, ranked)
+                role = user_role(candidate, constraints)
+                if role:
+                    event["user"] = role
                 event["explanation"] = _build_bridge_event_explanation(
                     label_id, candidate, threshold, approx_length, ranked,
                 )
@@ -525,6 +534,16 @@ def _build_gap_closure_phase_summary(
     }
 
 
+def _constraints_report(constraints: ResolvedConstraints, accepted: List[ConnectionCandidate]) -> Dict[str, Any]:
+    drawn = {frozenset((c.ep_a.endpoint_id, c.ep_b.endpoint_id)) for c in accepted}
+    rows = []
+    for record in constraints.records:
+        bridged = frozenset((record["endpoint_a"], record["endpoint_b"])) in drawn
+        rows.append({**record, "bridged": bridged,
+                     "held": bridged if record["kind"] != "forbid" else not bridged})
+    return {"constraints": rows, "candidates_added": list(constraints.synthesized)}
+
+
 def _model_summary(model: ScoringModel) -> Dict[str, Any]:
     """The scoring model as the report states it: the scorecards' weights, or for boosted trees their measurements."""
     if model.kind == "gbt":
@@ -564,6 +583,7 @@ def _build_report(
     model: ScoringModel,
     stage_timings: Dict[str, float],
     asp_solver_summary: Dict[str, Any],
+    constraints: Optional[ResolvedConstraints] = None,
 ) -> Dict[str, Any]:
     """Build a detailed structured restoration report."""
     extraction_open = sum(1 for p in result.paths if not p.is_closed)
@@ -572,7 +592,7 @@ def _build_report(
     final_closed = len(final_paths) - final_open
 
     return {
-        "schema_version": "4.0",
+        "schema_version": "4.1",
         "image": {
             "name": os.path.basename(image_path),
             "shape": list(result.image_shape),
@@ -623,6 +643,8 @@ def _build_report(
             },
             "gap_closure_phase": gap_closure_summary,
         },
+        # The user's constraints (schema 4.1): what each resolved to and whether it held.
+        "user_constraints": _constraints_report(constraints, accepted) if constraints else None,
         "detailed_events": events,
         "open_ends": open_ends,
     }
@@ -669,6 +691,7 @@ def restore(
     asp_timeout_s: float = 30.0,
     save_images: bool = True,
     preprocess: Optional[PreprocessConfig] = None,
+    user_constraints: Union[None, str, Dict[str, Any]] = None,
 ) -> RestorationResult:
     """Restore a single damaged sketch image.
 
@@ -689,6 +712,9 @@ def restore(
             JSON report is written either way
         preprocess: preprocessing variant (restoration.preprocess); default
             the original behaviour, or the one named by SKETCH_PREPROCESS
+        user_constraints: bridges to forbid, force or hint, as a dict or a
+            JSON file path (see restoration/constraints.py); the solver
+            re-optimizes the whole drawing under them
 
     Returns:
         RestorationResult with original paths, restored paths, bridges, and report
@@ -720,7 +746,13 @@ def restore(
     print("  Phase 2: Generating connection candidates...")
     with _timed(stage_timings, "phase2_candidate_generation_s"):
         candidates = generate_candidates(extraction)
+        constraints = resolve(load_constraints(user_constraints), extraction.endpoints)
+        if constraints:
+            add_missing_candidates(candidates, constraints, extraction.endpoints)
     print(f"    {len(candidates)} candidates")
+    if constraints:
+        print(f"    user constraints: {len(constraints.forbid)} forbid, {len(constraints.force)} force, "
+              f"{len(constraints.hint)} hint ({len(constraints.synthesized)} candidate(s) added)")
 
     # Phase 3: Scoring
     print("  Phase 3: Scoring candidates...")
@@ -743,6 +775,7 @@ def restore(
             scored,
             RULES_PATH,
             timeout_s=asp_timeout_s,
+            constraints=constraints,
         )
         stage_timings["phase4_asp_fact_encoding_s"] = solver_summary["encoding_time_s"]
         stage_timings["phase4_asp_solving_s"] = solver_summary["solving_time_s"]
@@ -786,7 +819,7 @@ def restore(
         # Ensure visual order for labeling (top-down, left-right)
         final_paths.sort(key=visual_order_key)
 
-        events = _change_events(final_paths, scored, accepted, model.threshold, gap_closure_diagnostics)
+        events = _change_events(final_paths, scored, accepted, model.threshold, gap_closure_diagnostics, constraints)
         open_ends = _open_ends(extraction, scored, accepted, model.threshold)
         if save_images:
             _save_overlay(image_path, final_paths, output_dir, labeled=True)
@@ -810,6 +843,7 @@ def restore(
         model,
         stage_timings,
         asp_solver_summary,
+        constraints,
     )
 
     # Save report JSON
@@ -832,6 +866,9 @@ def restore(
         restored_paths=final_paths,
         bridges=bridges,
         report=report,
+        extraction=extraction,
+        candidates=scored,
+        accepted=accepted,
     )
 
 

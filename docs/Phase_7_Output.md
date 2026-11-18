@@ -73,7 +73,7 @@ The report is the dictionary returned by `_build_report()`. It is saved as `name
 
 ```json
 {
-  "schema_version": "4.0",
+  "schema_version": "4.1",
   "image": { "name": "da9_gt_damaged.png", "shape": [224, 310], "diagonal_px": 382.5, "line_width_px": 4.0 },
   "summary": {
     "processing_time_s": 1.741,
@@ -195,6 +195,10 @@ Each entry of `detailed_events` explains one change and carries the same `id` as
 - `alternatives` are the three most probable other candidates for the same two stroke ends: what the bridge was preferred to.
 - A `gap_closure` event has `gap_closure_validity` (closure method, reason, gap size and plausibility metrics) instead of `candidate`.
 
+### Schema 4.1: user constraints
+
+`user_constraints` is `null` unless constraints were given to `restore()`. Then it holds one row per constraint: its `kind` (`forbid` / `force` / `hint`), the positions given (`a`, `b`), the stroke ends they resolved to (`endpoint_a`, `endpoint_b`), the candidates of that pair (`candidates`), whether one was `synthesized`, whether a bridge now joins the pair (`bridged`), and whether the constraint `held`. `candidates_added` lists the synthesized candidate ids. A bridge event whose pair was forced or hinted has `"user": "forced"` or `"user": "hinted"`.
+
 ### Schema 4.0: renamed keys
 
 Phase 6 was renamed from "EFD closure" to symmetry-guided single-gap closure. Schema 4.0 renames everything that carried the old name; nothing else changed from 3.0.
@@ -248,6 +252,9 @@ class RestorationResult:
     restored_paths: List[BezierPath]
     bridges: List[BezierSegment]
     report: dict
+    extraction: ExtractionResult              # Phase 1 result (for refinement and feedback)
+    candidates: List[ConnectionCandidate]     # all scored candidates
+    accepted: List[ConnectionCandidate]       # those the solver chose
 ```
 
 `restore_batch()` processes a list of images, in parallel if `workers` is given, and returns a `List[RestorationResult]`.

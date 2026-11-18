@@ -145,6 +145,8 @@ Sketch_Based_Heritage_Restoration/
 │   ├── scoring.py                  # Phase 3 — Measurements and fitted scorecards
 │   ├── scoring_model.json          # The fitted scorecards (written by train_scoring.py)
 │   ├── asp_engine.py               # Phase 4 — ASP fact encoding, Clingo solver
+│   ├── constraints.py              # User constraints (forbid / force / hint) for the solver
+│   ├── feedback.py                 # User corrections logged as training data
 │   ├── synthesis.py                # Phase 5 — Merging bridges into paths
 │   ├── single_gap_closure.py       # Phase 6 — Symmetry-guided single-gap closure (optional)
 │   ├── efd_closure.py              # Deprecated alias of single_gap_closure.py
@@ -173,6 +175,7 @@ Sketch_Based_Heritage_Restoration/
 ├── regression/snapshot/            # The recorded snapshot (one JSON per benchmark image)
 ├── scripts/profile_pipeline.py     # Per-stage timings vs. drawing size; cProfile
 ├── scripts/compare_preprocessing.py # Benchmarks preprocessing variants, each with a refitted scorer
+├── scripts/refine.py               # Interactive correction: forbid / force / hint bridges, re-solve
 ├── scripts/fetch_quickdraw.py      # Seeded Quick, Draw! subset, rasterized (data/quickdraw/)
 ├── scripts/make_synthetic.py       # Builds the synthetic damage dataset (data/synthetic/)
 ├── scripts/evaluate_synthetic.py   # Gap benchmark on it, by difficulty, gap type and source
@@ -339,6 +342,19 @@ python regression_snapshot.py --rebless   # after an intended change: record the
 python -m pytest test_regression.py       # the same check, plus a determinism test
 python scripts/profile_pipeline.py        # per-stage time vs. number of stroke ends, and a cProfile
 ```
+
+### Correcting a Restoration by Hand
+
+```bash
+python scripts/refine.py test_images/difficult_test_cases/ankh_damaged.png
+```
+
+An OpenCV window shows the drawn bridges and every free stroke end:
+- Click two ends, then press `f` to force, `h` to hint or `x` to forbid a bridge between them.
+- Right-click a drawn bridge to forbid it.
+- `u` undoes the last constraint, `s` saves, `q` saves and quits.
+
+The whole drawing is re-solved after each change: a forbidden bridge frees its ends for other partners. The constraints are saved as JSON (default `feedback/<image>_constraints.json`) and can be reused with `restore(path, user_constraints="....json")`. Every action is also logged with the affected candidates' measurements to `feedback/feedback.jsonl` (git-ignored). `python train_scoring.py --include-feedback feedback/feedback.jsonl` learns from them. See [docs/Phase_4_ASP_Decision_Engine.md](docs/Phase_4_ASP_Decision_Engine.md#41-user-constraints-interactive-refinement).
 
 ### Synthetic Damage Dataset
 

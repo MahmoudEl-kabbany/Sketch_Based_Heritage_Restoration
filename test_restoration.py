@@ -332,3 +332,77 @@ def test_boosted_model_round_trips_and_respects_directions(tmp_path):
     strokes = [[[30, 120], [130, 120]], [[160, 120], [290, 120]], [[30, 60], [290, 60]]]
     result = restore(draw(tmp_path / "gap.png", strokes), model_path=path, output_dir=str(tmp_path), save_images=True)
     assert result.report["analysis"]["scoring_model"]["kind"] == "gbt"
+
+
+def test_user_constraints_forbid_force_and_hint(tmp_path):
+    import pytest
+
+    from restoration.constraints import ConstraintError
+
+    # Two pieces of one line with a gap between x=130 and x=160, and a line above.
+    image = draw(tmp_path / "gap.png", [[[30, 120], [130, 120]], [[160, 120], [290, 120]], [[30, 60], [290, 60]]])
+
+    def run(constraints):
+        result = restore(image, output_dir=str(tmp_path), save_images=False, user_constraints=constraints)
+        pairs = {frozenset(tuple(np.round(ep.position).astype(int)) for ep in (c.ep_a, c.ep_b)) for c in result.accepted}
+        return result, pairs
+
+    def near(pairs, a, b):
+        return any(all(min(np.hypot(p[0] - q[0], p[1] - q[1]) for p in pair) < 8 for q in (a, b)) for pair in pairs)
+
+    plain, pairs = run(None)
+    assert plain.report["user_constraints"] is None and plain.report["schema_version"] == "4.1"
+    assert near(pairs, (130, 120), (160, 120))                       # the gap is bridged by default
+
+    forbidden, pairs = run({"forbid": [{"a": [130, 120], "b": [160, 120]}]})
+    assert not near(pairs, (130, 120), (160, 120))
+    assert forbidden.report["user_constraints"]["constraints"][0]["held"]
+
+    # Forcing (130,120) onto the upper line's end takes that end away from the gap: global re-optimization.
+    forced, pairs = run({"force": [{"a": [130, 120], "b": [30, 60]}]})
+    assert near(pairs, (130, 120), (30, 60)) and not near(pairs, (130, 120), (160, 120))
+    row = forced.report["user_constraints"]["constraints"][0]
+    assert row["held"] and row["bridged"]
+    assert any(e.get("user") == "forced" for e in forced.report["detailed_events"])
+
+    hinted, pairs = run({"hint": [{"a": [130, 120], "b": [30, 60]}]})
+    assert near(pairs, (130, 120), (30, 60))
+
+    with pytest.raises(ConstraintError):
+        run({"forbid": [{"a": [200, 200], "b": [160, 120]}]})            # no stroke end near (200, 200)
+    with pytest.raises(ConstraintError):
+        run({"force": [{"a": [130, 120], "b": [160, 120]}], "forbid": [{"a": [160, 120], "b": [130, 120]}]})
+
+
+def test_refine_session_logs_feedback_that_trains(tmp_path):
+    import importlib.util
+    import json
+    import os
+
+    import train_scoring
+    from restoration.feedback import feedback_images, read_feedback
+
+    spec = importlib.util.spec_from_file_location(
+        "refine", os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "refine.py"))
+    refine = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(refine)
+
+    image = draw(tmp_path / "gap.png", [[[30, 120], [130, 120]], [[160, 120], [290, 120]], [[30, 60], [290, 60]]])
+    log = str(tmp_path / "feedback.jsonl")
+    session = refine.RefineSession(image, feedback_path=log)
+    drawn = session.bridge_at((145, 120))
+    assert drawn is not None                                          # the default bridge across the gap
+    assert session.add("forbid", drawn.ep_a.position, drawn.ep_b.position)
+    assert session.bridge_at((145, 120)) is None                      # re-solved without it
+    a, b = session.endpoint_at((130, 120)), session.endpoint_at((30, 60))
+    assert session.add("force", a.position, b.position)
+    assert not session.add("force", session.endpoint_at((160, 120)).position, a.position)   # end already forced
+    assert session.undo() and session.constraints["force"] == []
+
+    rows = read_feedback(log)
+    assert {r["action"] for r in rows} == {"forbid", "force"} and {r["label"] for r in rows} == {0, 1}
+    images = feedback_images(log)
+    assert images[0]["kind"] == "extra_feedback" and images[0]["features"].shape[1] == len(train_scoring.FEATURE_NAMES)
+    session.save(str(tmp_path / "c.json"))
+    assert json.load(open(tmp_path / "c.json"))["forbid"]
+    assert session.render().shape[2] == 3

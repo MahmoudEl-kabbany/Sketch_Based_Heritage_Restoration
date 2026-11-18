@@ -511,6 +511,8 @@ def main() -> None:
     parser.add_argument("--features", default=None, help="Comma-separated measurements to use (default: all).")
     parser.add_argument("--filter", default=None, help="Only drawings whose name contains this substring.")
     add_training_options(parser)
+    parser.add_argument("--include-feedback", default=None, metavar="FILE",
+                        help="Also train on user corrections logged by scripts/refine.py (feedback/feedback.jsonl).")
     parser.add_argument("--workers", type=int, default=default_workers())
     args = parser.parse_args()
     extra_data, difficulties, tune = training_options(args, parser)
@@ -526,6 +528,13 @@ def main() -> None:
         if args.dataset:
             with open(args.dataset, "wb") as f:
                 pickle.dump(images, f)
+
+    if args.include_feedback:
+        from restoration.feedback import feedback_images
+        corrections = feedback_images(args.include_feedback)
+        print(f"  Added {sum(len(i['correct']) for i in corrections)} user corrections "
+              f"from {len(corrections)} drawings ({args.include_feedback})")
+        images = list(images) + corrections
 
     names = args.features.split(",") if args.features else None
     folds = fold_of_drawings(images)
