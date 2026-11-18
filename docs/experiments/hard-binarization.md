@@ -1,6 +1,15 @@
 # Binarization on stained, unevenly lit pages (the synthetic "hard" level)
 
-Branch `wp-hard-binarization` (from `wp-junction-measurement`). **Default unchanged** (exact snapshot identical).
+Branch `wp-hard-binarization` (from `wp-junction-measurement`). **Adopted, inference only** (Mahmoud, 2026-11-18): `PreprocessConfig().background` is now `"auto"`. The scorer is still trained on images binarized without flattening (`train_scoring.training_preprocess`).
+
+| after adoption | before | now |
+|---|---|---|
+| real pairs (`check_changes.py`) | 86.3% / 39.3 lw off | **UNCHANGED**; shipped model current |
+| exact snapshot (64 images) | — | identical |
+| synthetic test, overall recall | 83.3% | **86.8%** |
+| synthetic test, easy | 91.9% / 6 wrong | 91.9% / 6 wrong |
+| synthetic test, medium | 87.4% / 7 wrong / 139 off | 87.5% / 6 wrong / 138 off |
+| synthetic test, hard | 70.6% / 30,531 wrong | **81.2% / 11 wrong** |
 
 ## Problem
 

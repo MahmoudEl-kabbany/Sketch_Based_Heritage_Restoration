@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import dataclasses
 import os
 import pickle
 import random
@@ -41,6 +42,7 @@ from restoration.extraction import extract_paths
 from restoration.pipeline import default_workers, map_in_processes
 from restoration.render_restored_sketch import estimate_line_width
 from restoration.graph_features import build_graph
+from restoration.preprocess import ENV_VAR as PREPROCESS_ENV_VAR, PreprocessConfig
 from restoration.scoring import (
     FEATURE_DIRECTIONS, FEATURE_NAMES, FEATURE_SCALES, FEATURES, MODEL_PATH, SHAPE_FEATURES, candidate_features,
 )
@@ -78,6 +80,20 @@ def make_synthetic_damage(original_path: str, out_path: str, version: int, gap_c
     cv2.imwrite(out_path, damaged)
 
 
+def training_preprocess() -> PreprocessConfig:
+    """How training images are binarized: as at restoration time, but without background flattening.
+
+    The shipped model was fitted on plain-Otsu images; flattening the synthetic
+    "medium" pages in training shifted its weights and cost 13 line widths off
+    the drawing on the real pairs (docs/experiments/hard-binarization.md), while
+    at restoration time flattening only touches unevenly lit pages. An explicit
+    SKETCH_PREPROCESS experiment applies to training and restoration alike.
+    """
+    if os.environ.get(PREPROCESS_ENV_VAR, "").strip():
+        return PreprocessConfig.from_env()
+    return dataclasses.replace(PreprocessConfig(), background="none")
+
+
 def labelled_candidates(
     drawing: str, kind: str, original_path: str, image_path: str, reference_path: Optional[str] = None,
     with_graph: bool = False,
@@ -92,7 +108,7 @@ def labelled_candidates(
         return {"drawing": drawing, "kind": kind, "skipped": True}
     gt = build_ground_truth(original, damaged)
 
-    extraction = extract_paths(image_path)
+    extraction = extract_paths(image_path, preprocess=training_preprocess())
     candidates = generate_candidates(extraction)
     labels = label_candidates(gt, candidates)
     return {

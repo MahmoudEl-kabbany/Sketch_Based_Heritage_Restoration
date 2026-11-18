@@ -3,11 +3,14 @@
 Everything later in the pipeline (the skeleton graph, the stroke radii, the
 line width and the distance map) is derived from the one mask produced here.
 
-PreprocessConfig() reproduces the pipeline's original behaviour exactly:
-Otsu threshold, speck removal, scikit-image's default skeleton, and the
-radius-based spur pruning of bezier._prune_skeleton_spurs. The other options
-are experimental variants, measured in docs/experiments/WP-3.md; none of
-them is on by default.
+PreprocessConfig() is Otsu threshold, speck removal, scikit-image's default
+skeleton and the radius-based spur pruning of bezier._prune_skeleton_spurs,
+plus background flattening on unevenly lit pages (background="auto": only
+when the paper's brightness varies by more than UNEVEN_PAPER; on even paper
+the result is exactly that of plain Otsu). The scorer is trained on images
+binarized without the flattening (train_scoring.training_preprocess). The
+other options are experimental variants, measured in docs/experiments/WP-3.md
+and docs/experiments/hard-binarization.md.
 
 A variant can be chosen per call (extract_paths(..., preprocess=cfg),
 restore(..., preprocess=cfg)) or, for whole benchmark runs whose worker
@@ -57,7 +60,7 @@ class PreprocessConfig:
     skeleton: str = "zhang"            # one of SKELETONS ("zhang" is scikit-image's default)
     junction_aware_pruning: bool = False   # prune a spur only where its junction keeps two long branches
     # Uneven paper (stains, light gradient): divide by an estimate of the paper's brightness first.
-    background: str = "none"           # one of BACKGROUNDS
+    background: str = "auto"           # one of BACKGROUNDS (training images use "none", see train_scoring.py)
     background_size: float = 0.06      # closing kernel for the paper estimate, as a share of the image diagonal
     window_relative: float = 0.0       # if > 0: local-threshold window as a share of the diagonal (overrides window)
 

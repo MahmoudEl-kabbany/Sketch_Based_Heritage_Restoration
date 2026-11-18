@@ -50,13 +50,14 @@ Raster Image (grayscale)
 binary, radius_map, line_width = stroke_geometry(image_path)
 ```
 
+- **Background flattening on uneven paper** (`background="auto"`): the paper's brightness is estimated by a grey-level closing with a disk of 6% of the image diagonal (it erases strokes and filled details), and if it varies by more than 5% (stains, light gradient), the image is divided by it. On evenly lit paper nothing is changed. All 64 benchmark images are even (at most 2.8%). The scorer is trained on images binarized without this step (see [experiments/hard-binarization.md](experiments/hard-binarization.md)).
 - **Otsu thresholding** with `BINARY_INV`: strokes (dark pixels) become foreground.
 - **Radius map:** the distance of every stroke pixel to the background. Along the skeleton this is the local stroke radius.
 - **Line width:** twice the median radius along the skeleton.
 - **Speck removal:** blobs smaller than half a squared line width are deleted. There is no blur: blurring closes small gaps and moves stroke ends.
 - The skeleton used for the line width is the same one the graph is built from (§3.2): the mask, the radius map, the skeleton and the distance map all come from one binarization.
 
-#### Preprocessing variants (experimental, off by default)
+#### Preprocessing variants
 
 `restoration/preprocess.py` holds this step. `PreprocessConfig()` is exactly the behaviour above; its fields select variants for experiments, passed as `extract_paths(..., preprocess=cfg)` / `restore(..., preprocess=cfg)`, or for whole benchmark runs as JSON in the environment variable `SKETCH_PREPROCESS` (`check_changes.py --preprocess '{...}'` sets it):
 
@@ -67,6 +68,9 @@ binary, radius_map, line_width = stroke_geometry(image_path)
 | `close_px` | `0` | morphological closing of the mask with an elliptical kernel of this size |
 | `skeleton` | `"zhang"` | `"lee"` |
 | `junction_aware_pruning` | `False` | prune a spur (§3.4) only where its junction keeps two other branches longer than 3 junction radii |
+| `background` | `"auto"` | `"none"` (plain Otsu, as in training), `"divide"` (always flatten the paper) |
+| `background_size` | `0.06` | closing disk for the paper estimate, as a share of the image diagonal |
+| `window_relative` | `0` | local-threshold window as a share of the diagonal (overrides `window`) |
 
 The measured effect of each is in [experiments/WP-3.md](experiments/WP-3.md).
 
