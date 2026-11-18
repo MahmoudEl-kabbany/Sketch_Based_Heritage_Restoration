@@ -37,6 +37,12 @@ SPECK_AREA_WIDTHS2 = 0.5
 THRESHOLDS = ("otsu", "sauvola", "niblack", "adaptive_gaussian")
 DENOISERS = ("none", "median", "nlmeans")
 SKELETONS = ("zhang", "lee")
+BACKGROUNDS = ("none", "divide", "auto")
+# "auto" flattens the paper only when its estimated brightness varies by more than
+# this share (1st to 99th percentile). The 64 benchmark images and the synthetic
+# "easy" pages measure at most 0.028, stained or unevenly lit pages ("medium",
+# "hard") at least 0.080.
+UNEVEN_PAPER = 0.05
 
 
 @dataclass(frozen=True)
@@ -50,9 +56,14 @@ class PreprocessConfig:
     close_px: int = 0                  # morphological closing of the mask (elliptical kernel, px); 0 = off
     skeleton: str = "zhang"            # one of SKELETONS ("zhang" is scikit-image's default)
     junction_aware_pruning: bool = False   # prune a spur only where its junction keeps two long branches
+    # Uneven paper (stains, light gradient): divide by an estimate of the paper's brightness first.
+    background: str = "none"           # one of BACKGROUNDS
+    background_size: float = 0.06      # closing kernel for the paper estimate, as a share of the image diagonal
+    window_relative: float = 0.0       # if > 0: local-threshold window as a share of the diagonal (overrides window)
 
     def __post_init__(self) -> None:
-        for name, allowed in (("threshold", THRESHOLDS), ("denoise", DENOISERS), ("skeleton", SKELETONS)):
+        for name, allowed in (("threshold", THRESHOLDS), ("denoise", DENOISERS), ("skeleton", SKELETONS),
+                              ("background", BACKGROUNDS)):
             if getattr(self, name) not in allowed:
                 raise ValueError(f"PreprocessConfig.{name} must be one of {allowed}, not {getattr(self, name)!r}")
 
@@ -90,8 +101,48 @@ def _odd(n: int) -> int:
     return n if n % 2 else n + 1
 
 
+def paper_estimate(img: np.ndarray, size_fraction: float) -> np.ndarray:
+    """The paper's brightness without the strokes (float32, same size as *img*).
+
+    A grey-level closing with a disk wider than any stroke (and than filled
+    details such as a drawn pupil) removes the dark strokes and leaves the
+    paper, which is then smoothed.
+    """
+    h, w = img.shape
+    size = _odd(int(round(size_fraction * float(np.hypot(h, w)))))
+    # Close on a reduced image (the paper varies slowly), then bring it back to full size.
+    factor = max(1, size // 15)
+    small = cv2.resize(img, (max(1, w // factor), max(1, h // factor)), interpolation=cv2.INTER_AREA)
+    k = _odd(size // factor)
+    paper = cv2.morphologyEx(small, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    paper = cv2.GaussianBlur(paper, (0, 0), k / 2.0)
+    return cv2.resize(paper, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+
+
+def paper_unevenness(paper: np.ndarray) -> float:
+    """How much the paper's brightness varies: (99th - 1st percentile) / 99th percentile."""
+    lo, hi = np.percentile(paper, [1, 99])
+    return float((hi - lo) / max(hi, 1.0))
+
+
+def flatten_background(img: np.ndarray, size_fraction: float, paper: Optional[np.ndarray] = None) -> np.ndarray:
+    """Divide out the paper's brightness: stains and light gradients become flat white."""
+    paper = paper_estimate(img, size_fraction) if paper is None else paper
+    flat = img.astype(np.float32) / np.maximum(paper, 1.0) * 255.0
+    return np.clip(flat, 0, 255).astype(np.uint8)
+
+
 def binarize(img: np.ndarray, cfg: PreprocessConfig) -> np.ndarray:
     """Stroke mask (uint8, 255 on dark strokes) of a grayscale image."""
+    if cfg.background == "divide":
+        img = flatten_background(img, cfg.background_size)
+    elif cfg.background == "auto":
+        paper = paper_estimate(img, cfg.background_size)
+        if paper_unevenness(paper) > UNEVEN_PAPER:
+            img = flatten_background(img, cfg.background_size, paper)
+    window = cfg.window
+    if cfg.window_relative > 0:
+        window = int(round(cfg.window_relative * float(np.hypot(*img.shape))))
     if cfg.denoise == "median":
         img = cv2.medianBlur(img, _odd(cfg.denoise_size))
     elif cfg.denoise == "nlmeans":
@@ -101,11 +152,11 @@ def binarize(img: np.ndarray, cfg: PreprocessConfig) -> np.ndarray:
         _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     elif cfg.threshold == "adaptive_gaussian":
         binary = cv2.adaptiveThreshold(
-            img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, _odd(cfg.window), cfg.adaptive_c,
+            img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, _odd(window), cfg.adaptive_c,
         )
     else:
         local = threshold_sauvola if cfg.threshold == "sauvola" else threshold_niblack
-        binary = np.where(img < local(img, window_size=_odd(cfg.window), k=cfg.k), 255, 0).astype(np.uint8)
+        binary = np.where(img < local(img, window_size=_odd(window), k=cfg.k), 255, 0).astype(np.uint8)
 
     if cfg.close_px > 0:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(cfg.close_px), int(cfg.close_px)))
