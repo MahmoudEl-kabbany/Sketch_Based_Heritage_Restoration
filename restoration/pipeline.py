@@ -525,6 +525,33 @@ def _build_gap_closure_phase_summary(
     }
 
 
+def _model_summary(model: ScoringModel) -> Dict[str, Any]:
+    """The scoring model as the report states it: the scorecards' weights, or for boosted trees their measurements."""
+    if model.kind == "gbt":
+        return {
+            "threshold": round(float(model.threshold), 4),
+            "kind": "gbt",
+            # Gradient-boosted trees: no weights to list; these are the measurements they use.
+            "boosted_trees": {shape: {"features": list(card.names)} for shape, card in model.scorecards.items()},
+        }
+    return {
+        "threshold": round(float(model.threshold), 4),
+        # log-odds = intercept + sum of weight * (transform(value) - mean) / scale, on the scorecard of the bridge's shape
+        "scorecards": {
+            shape: {
+                "intercept": round(float(card.intercept), 4),
+                "features": {
+                    name: {"meaning": FEATURES[name], "transform": FEATURE_SCALES.get(name, "x"),
+                           "weight": round(float(weight), 4),
+                           "mean": round(float(mean), 4), "scale": round(float(scale), 4)}
+                    for name, weight, mean, scale in zip(card.names, card.weights, card.mean, card.scale)
+                },
+            }
+            for shape, card in model.scorecards.items()
+        },
+    }
+
+
 def _build_report(
     image_path: str,
     result: ExtractionResult,
@@ -576,22 +603,7 @@ def _build_report(
                 "probability_summary": _numeric_summary([c.probability for c in candidates], digits=4),
                 "above_threshold": sum(1 for c in candidates if utility(c.score) > 0),
             },
-            "scoring_model": {
-                "threshold": round(float(model.threshold), 4),
-                # log-odds = intercept + sum of weight * (transform(value) - mean) / scale, on the scorecard of the bridge's shape
-                "scorecards": {
-                    shape: {
-                        "intercept": round(float(card.intercept), 4),
-                        "features": {
-                            name: {"meaning": FEATURES[name], "transform": FEATURE_SCALES.get(name, "x"),
-                                   "weight": round(float(weight), 4),
-                                   "mean": round(float(mean), 4), "scale": round(float(scale), 4)}
-                            for name, weight, mean, scale in zip(card.names, card.weights, card.mean, card.scale)
-                        },
-                    }
-                    for shape, card in model.scorecards.items()
-                },
-            },
+            "scoring_model": _model_summary(model),
             "selection": {
                 "accepted_total": len(accepted),
                 "acceptance_rate_percent": round(len(accepted) / max(len(candidates), 1) * 100, 1),

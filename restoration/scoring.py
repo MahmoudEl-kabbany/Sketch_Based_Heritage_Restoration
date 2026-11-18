@@ -411,11 +411,28 @@ class Scorecard:
 
 
 @dataclass
-class ScoringModel:
-    """A scorecard per bridge shape, and the probability above which a bridge is drawn."""
+class BoostedModel:
+    """A gradient-boosted classifier (scikit-learn) for bridges of one shape, on scorecard-scale measurements."""
 
-    scorecards: Dict[str, Scorecard]
+    names: List[str]
+    estimator: object
+
+    def probability(self, features: np.ndarray) -> np.ndarray:
+        return self.estimator.predict_proba(features)[:, 1]
+
+
+@dataclass
+class ScoringModel:
+    """A model per bridge shape, and the probability above which a bridge is drawn.
+
+    The models are scorecards (logistic regressions, the default) or, for a
+    model file of kind "gbt", gradient-boosted trees; the rest of the pipeline
+    sees only the probability.
+    """
+
+    scorecards: Dict[str, Union[Scorecard, BoostedModel]]
     threshold: float
+    kind: str = "scorecard"
 
     @property
     def threshold_log_odds(self) -> float:
@@ -428,6 +445,17 @@ def load_model(path: str = MODEL_PATH) -> ScoringModel:
         raise FileNotFoundError(f"No scoring model at {path}; run train_scoring.py to fit one.")
     with open(path) as f:
         data = json.load(f)
+
+    if data.get("kind") == "gbt":
+        import joblib   # scikit-learn's dependency; only needed for boosted models
+
+        estimators = joblib.load(os.path.join(os.path.dirname(path), data["estimators"]))
+        return ScoringModel(
+            scorecards={shape: BoostedModel(names=list(names), estimator=estimators[shape])
+                        for shape, names in data["features"].items()},
+            threshold=float(data["threshold"]),
+            kind="gbt",
+        )
 
     scorecards: Dict[str, Scorecard] = {}
     for shape, card in data["scorecards"].items():
@@ -475,6 +503,10 @@ def score_candidates(
         model = load_model(model or MODEL_PATH)
 
     measurements = measure_candidates(candidates, result)
+    if model.kind == "gbt":
+        _score_boosted(candidates, measurements, model)
+        candidates.sort(key=lambda c: (-c.score, c.distance, c.id))
+        return candidates
     for c, measured, scaled in zip(candidates, measurements, on_scorecard_scale(measurements)):
         card = model.scorecards[c.shape]
         columns = [FEATURE_NAMES.index(name) for name in card.names]
@@ -487,3 +519,25 @@ def score_candidates(
 
     candidates.sort(key=lambda c: (-c.score, c.distance, c.id))
     return candidates
+
+
+def _score_boosted(candidates: List[ConnectionCandidate], measurements: np.ndarray, model: ScoringModel) -> None:
+    """score_candidates for a model of boosted trees: one batch per bridge shape.
+
+    Trees give no additive per-measurement log-odds, so `contributions` stays
+    empty and the report names no measurement for or against a bridge.
+    """
+    scaled = on_scorecard_scale(measurements)
+    shapes = np.array([c.shape for c in candidates], dtype=object)
+    for shape, booster in model.scorecards.items():
+        rows = np.flatnonzero(shapes == shape)
+        if not len(rows):
+            continue
+        columns = [FEATURE_NAMES.index(name) for name in booster.names]
+        probability = np.clip(booster.probability(scaled[np.ix_(rows, columns)]), 1e-9, 1.0 - 1e-9)
+        for i, p in zip(rows, probability):
+            c = candidates[i]
+            c.features = dict(zip(booster.names, map(float, measurements[i, columns])))
+            c.contributions = {}
+            c.probability = float(p)
+            c.score = float(np.log(p / (1.0 - p))) - model.threshold_log_odds

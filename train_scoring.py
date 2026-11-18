@@ -196,10 +196,42 @@ def fit_scorecard(images: Sequence[Dict[str, Any]], shape: str, names: Sequence[
             "unused": [name for i, name in enumerate(names) if i not in used]}
 
 
-def fit(images: Sequence[Dict[str, Any]], names: Optional[Sequence[str]] = None) -> Dict[str, Dict[str, Any]]:
-    """A scorecard for each bridge shape, on the measurements of that shape (only those in *names*, if given)."""
+MODEL_KINDS = ("scorecard", "gbt")
+# Gradient-boosted trees: small and regularized, a fixed seed and no early stopping
+# (which would hold out a random share), so the fit is repeatable.
+GBT_PARAMS = dict(max_iter=200, learning_rate=0.1, max_leaf_nodes=15, min_samples_leaf=40,
+                  l2_regularization=1.0, early_stopping=False, random_state=0)
+
+
+def fit_boosted(images: Sequence[Dict[str, Any]], shape: str, names: Sequence[str]) -> Dict[str, Any]:
+    """Gradient-boosted trees on the measurements of one bridge shape.
+
+    Each measurement may only move the probability in the direction
+    FEATURE_DIRECTIONS allows (monotonic constraints), as for the scorecards.
+    No class weights: the probabilities are compared with a threshold, so they
+    must stay calibrated.
+    """
+    from sklearn.ensemble import HistGradientBoostingClassifier
+
+    columns = [FEATURE_NAMES.index(name) for name in names]
+    x = np.vstack([image["features"][image["shape"] == shape][:, columns] for image in images])
+    y = np.concatenate([image["correct"][image["shape"] == shape] for image in images]).astype(int)
+    estimator = HistGradientBoostingClassifier(
+        monotonic_cst=[FEATURE_DIRECTIONS.get(name, 0) for name in names], **GBT_PARAMS,
+    ).fit(x, y)
+    return {"kind": "gbt", "names": list(names), "columns": columns, "estimator": estimator, "unused": []}
+
+
+def fit(
+    images: Sequence[Dict[str, Any]], names: Optional[Sequence[str]] = None, kind: str = "scorecard",
+) -> Dict[str, Dict[str, Any]]:
+    """A model for each bridge shape, on the measurements of that shape (only those in *names*, if given).
+
+    *kind*: "scorecard" (logistic regression, the shipped model) or "gbt" (gradient-boosted trees).
+    """
+    fitter = fit_boosted if kind == "gbt" else fit_scorecard
     return {
-        shape: fit_scorecard(images, shape, [n for n in shape_names if names is None or n in names])
+        shape: fitter(images, shape, [n for n in shape_names if names is None or n in names])
         for shape, shape_names in SHAPE_FEATURES.items()
     }
 
@@ -209,6 +241,10 @@ def predict(model: Dict[str, Dict[str, Any]], image: Dict[str, Any]) -> np.ndarr
     probability = np.zeros(len(image["shape"]))
     for shape, card in model.items():
         rows = image["shape"] == shape
+        if card.get("kind") == "gbt":
+            if rows.any():
+                probability[rows] = card["estimator"].predict_proba(image["features"][rows][:, card["columns"]])[:, 1]
+            continue
         standardized = (image["features"][rows][:, card["columns"]] - card["mean"]) / card["scale"]
         probability[rows] = expit(card["intercept"] + standardized @ card["weights"])
     return probability
@@ -338,6 +374,55 @@ def model_document(model: Dict[str, Dict[str, Any]], threshold: float, training:
     }
 
 
+def write_model(path: str, model: Dict[str, Dict[str, Any]], threshold: float, training: Dict[str, Any]) -> None:
+    """Write a fitted model where load_model() reads it: a scorecard JSON, or for
+    boosted trees a JSON pointing to a joblib file next to it."""
+    if not any(card.get("kind") == "gbt" for card in model.values()):
+        write_json(path, model_document(model, threshold, training))
+        return
+    import joblib
+    import sklearn
+
+    estimators_file = os.path.splitext(os.path.basename(path))[0] + ".joblib"
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    joblib.dump({shape: card["estimator"] for shape, card in model.items()},
+                os.path.join(os.path.dirname(os.path.abspath(path)), estimators_file))
+    write_json(path, {
+        "description": "Gradient-boosted trees (scikit-learn HistGradientBoostingClassifier) giving the probability "
+                       "that a candidate bridge redraws a missing stroke, one per bridge shape, on the "
+                       "scorecard-scale measurements. Fitted by train_scoring.py --model gbt.",
+        "kind": "gbt",
+        "threshold": threshold,
+        "estimators": estimators_file,
+        "features": {shape: card["names"] for shape, card in model.items()},
+        "sklearn_version": sklearn.__version__,
+        "parameters": GBT_PARAMS,
+        "training": training,
+    })
+
+
+THRESHOLD_GRID = tuple(np.round(np.arange(0.30, 0.901, 0.025), 3))
+
+
+def choose_threshold(
+    images: Sequence[Dict[str, Any]], probabilities: Sequence[np.ndarray],
+    reference: Sequence[np.ndarray], workers: int,
+) -> Tuple[float, Dict[str, float], Dict[str, float]]:
+    """The threshold that repairs most gaps of *images* while drawing no more line off the drawing
+    than the *reference* probabilities do at THRESHOLD (ties: the higher threshold).
+
+    Returns (threshold, its totals, the reference totals). Meant for a validation set the
+    models were not fitted on.
+    """
+    ref = sweep(images, reference, (THRESHOLD,), workers)[0]
+    totals = sweep(images, probabilities, THRESHOLD_GRID, workers)
+    allowed = [(t, row) for t, row in zip(THRESHOLD_GRID, totals) if row["off_drawing_widths"] <= ref["off_drawing_widths"]]
+    if not allowed:
+        return THRESHOLD, sweep(images, probabilities, (THRESHOLD,), workers)[0], ref
+    threshold, row = max(allowed, key=lambda item: (item[1]["repaired"], item[0]))
+    return float(threshold), row, ref
+
+
 def write_json(path: str, document: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as f:
@@ -348,6 +433,37 @@ def write_json(path: str, document: Dict[str, Any]) -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
+
+def validation_images(
+    extra_data: str, difficulties: Optional[Sequence[str]], workers: int, exclude: Sequence[str] = (),
+) -> List[Dict[str, Any]]:
+    """Labelled candidates of the val split of a synthetic dataset, without the drawings in *exclude*
+    (the benchmark's, so that no threshold is tuned on a drawing it is later tested on)."""
+    from synthetic_damage import load_dataset
+
+    jobs = [(e["drawing"], f"val_{e['difficulty']}", e["clean"], e["damaged"], e["gapped"])
+            for e in load_dataset(extra_data, "val")
+            if e["drawing"] not in set(exclude) and (not difficulties or e["difficulty"] in difficulties)]
+    return [image for image in map_in_processes(labelled_candidates, jobs, workers) if not image.get("skipped")]
+
+
+def fit_with_threshold(
+    train: Sequence[Dict[str, Any]], kind: str, names: Optional[Sequence[str]],
+    val: Optional[Sequence[Dict[str, Any]]], workers: int,
+) -> Tuple[Dict[str, Dict[str, Any]], float, Dict[str, Any]]:
+    """Fit a model; with *val*, choose its threshold there (choose_threshold), against a scorecard
+    fitted on the same images minus the synthetic extra data, at the usual threshold."""
+    model = fit(train, names, kind)
+    if not val:
+        return model, THRESHOLD, {}
+    reference = fit([image for image in train if not image["kind"].startswith("extra_")], names, "scorecard")
+    threshold, row, ref = choose_threshold(val, [predict(model, i) for i in val], [predict(reference, i) for i in val], workers)
+    return model, threshold, {
+        "threshold_chosen_on": f"{len(val)} validation images",
+        "validation": {"repaired": row["repaired"], "gaps": row["gaps"], "off_drawing_widths": round(row["off_drawing_widths"], 1)},
+        "validation_reference": {"repaired": ref["repaired"], "off_drawing_widths": round(ref["off_drawing_widths"], 1)},
+    }
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fit the candidate scorer; report cross-validated results.")
@@ -361,8 +477,16 @@ def main() -> None:
                         help="Synthetic dataset (scripts/make_synthetic.py) whose variants are added to the training data.")
     parser.add_argument("--extra-split", default="train", help="Which split of --extra-data to add (train/val/test/all).")
     parser.add_argument("--extra-difficulties", default=None, help="Comma-separated levels of --extra-data to add (default: all).")
+    parser.add_argument("--model", default="scorecard", choices=MODEL_KINDS,
+                        help="scorecard (logistic regression, the shipped kind) or gbt (gradient-boosted trees).")
+    parser.add_argument("--tune-threshold", action="store_true",
+                        help="Choose the acceptance threshold on the val split of --extra-data (its non-benchmark "
+                             "drawings): most gaps repaired without more line off the drawing than the plain "
+                             "scorecard at the usual threshold.")
     parser.add_argument("--workers", type=int, default=default_workers())
     args = parser.parse_args()
+    if args.tune_threshold and not args.extra_data:
+        parser.error("--tune-threshold needs --extra-data")
 
     if args.dataset and os.path.exists(args.dataset):
         with open(args.dataset, "rb") as f:
@@ -379,14 +503,22 @@ def main() -> None:
 
     names = args.features.split(",") if args.features else None
     folds = fold_of_drawings(images)
+    difficulties = args.extra_difficulties.split(",") if args.extra_difficulties else None
+    val = None
+    if args.tune_threshold:
+        benchmark = {image["drawing"] for image in images if not image["kind"].startswith("extra_")}
+        val = validation_images(args.extra_data, difficulties, args.workers, sorted(benchmark))
+        print(f"  {len(val)} validation images for the threshold")
 
     # ---- every candidate's probability from a model fitted without its drawing
-    fold_models = {
-        fold: fit([image for image in images if folds[image["drawing"]] != fold], names)
+    fitted = {
+        fold: fit_with_threshold([image for image in images if folds[image["drawing"]] != fold],
+                                 args.model, names, val, args.workers)
         for fold in sorted(set(folds.values()))
     }
+    fold_models = {fold: model for fold, (model, _, _) in fitted.items()}
     held_out = [predict(fold_models[folds[image["drawing"]]], image) for image in images]
-    final_model = fit(images, names)
+    final_model, final_threshold, threshold_info = fit_with_threshold(images, args.model, names, val, args.workers)
 
     # ---- report
     sep = "=" * 78
@@ -425,7 +557,12 @@ def main() -> None:
 
     print(f"\n  Model fitted on all drawings; a bridge is drawn above probability {THRESHOLD:.2f} "
           f"({ACCEPTANCE_ODDS:g} to 1 that it is right).")
+    if args.tune_threshold:
+        print(f"  Threshold chosen on the validation split: {final_threshold:.3f}  {threshold_info}")
     for shape, card in final_model.items():
+        if card.get("kind") == "gbt":
+            print(f"  Boosted trees for {shape} bridges on: {', '.join(card['names'])}")
+            continue
         print(f"  Scorecard for {shape} bridges, weights on standardized measurements:")
         for name, weight in sorted(zip(card["names"], card["weights"]), key=lambda item: -abs(item[1])):
             scale = f"  [{FEATURE_SCALES[name]}]" if name in FEATURE_SCALES else ""
@@ -442,14 +579,15 @@ def main() -> None:
         "correct_candidates": stats["correct"],
         "cross_validated_auc": round(stats["auc"], 4),
         "cross_validated_calibration": calibration,
-        "threshold_rule": f"a bridge is drawn when it is at least {ACCEPTANCE_ODDS:g} times as likely to be right as wrong",
+        "threshold_rule": (f"chosen on the synthetic validation split: {threshold_info}" if args.tune_threshold else
+                           f"a bridge is drawn when it is at least {ACCEPTANCE_ODDS:g} times as likely to be right as wrong"),
     }
-    write_json(args.output, model_document(final_model, THRESHOLD, training_summary))
+    write_model(args.output, final_model, final_threshold, training_summary)
     print(f"  Model saved -> {args.output}")
     if args.cv_dir:
-        for fold, model in fold_models.items():
-            write_json(os.path.join(args.cv_dir, f"fold_{fold}.json"),
-                       model_document(model, THRESHOLD, {"held_out_fold": fold}))
+        for fold, (model, threshold, info) in fitted.items():
+            write_model(os.path.join(args.cv_dir, f"fold_{fold}.json"), model, threshold,
+                        {"held_out_fold": fold, **info})
         write_json(os.path.join(args.cv_dir, "folds.json"),
                    {drawing: f"fold_{fold}.json" for drawing, fold in sorted(folds.items())})
         print(f"  Held-out models saved -> {args.cv_dir}")

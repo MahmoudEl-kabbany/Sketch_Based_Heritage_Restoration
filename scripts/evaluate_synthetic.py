@@ -142,6 +142,8 @@ def main() -> int:
     parser.add_argument("--source", default=None, choices=("own", "quickdraw"))
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--models", default=None, help="train_scoring.py --cv-dir folder: held-out model per drawing")
+    parser.add_argument("--fallback-model", default=MODEL_PATH,
+                        help="Model for drawings --models has no held-out model for (default: the shipped one).")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--workers", type=int, default=default_workers())
     args = parser.parse_args()
@@ -164,12 +166,12 @@ def main() -> int:
             known = set(json.load(f))
         model_of = held_out_models(args.models, [d for d in drawings if d in known])
         print(f"  held-out models for {sum(d in known for d in drawings)} of {len(drawings)} drawings; "
-              f"the shipped model for the rest")
+              f"{args.fallback_model} for the rest")
 
     first_variant = {}
     for e in entries:
         first_variant.setdefault(e["drawing"], (e["difficulty"], e["variant"]))
-    jobs = [(e, args.output_dir, model_of.get(e["drawing"], MODEL_PATH),
+    jobs = [(e, args.output_dir, model_of.get(e["drawing"], args.fallback_model),
              first_variant[e["drawing"]] == (e["difficulty"], e["variant"])) for e in entries]
     rows = []
     for i, row in enumerate(map_in_processes(evaluate_entry, jobs, args.workers), 1):

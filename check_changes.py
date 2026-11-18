@@ -24,6 +24,7 @@ import argparse
 import contextlib
 import io
 import json
+import pickle
 import os
 import subprocess
 import sys
@@ -87,34 +88,65 @@ def _same_model(fitted: Dict[str, Dict[str, Any]], shipped_path: str) -> bool:
     return True
 
 
+def _cached(path: Optional[str], build):
+    """build(), or its result pickled at *path* by an earlier run (labels do not depend on the model)."""
+    if path and os.path.exists(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    value = build()
+    if path:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(value, f)
+    return value
+
+
 def fit_held_out_models(
-    output_dir: str, workers: int, extra_data: Optional[str] = None, extra_difficulties: Optional[List[str]] = None,
+    output_dir: str,
+    workers: int,
+    extra_data: Optional[str] = None,
+    extra_difficulties: Optional[List[str]] = None,
+    kind: str = "scorecard",
+    tune_threshold: bool = False,
+    cache_dir: Optional[str] = None,
 ) -> Tuple[Dict[str, str], float, bool]:
-    """Fit the scorecards once without each fold of drawings.
+    """Fit the model once without each fold of drawings.
 
     Returns (model file for every drawing, chance that a correct candidate
     outscores a wrong one on held-out drawings, whether the shipped model is
     what the current code would fit).
     """
+    tag = "extra-" + "-".join(extra_difficulties or ["all"]) if extra_data else "base"
     with contextlib.redirect_stdout(io.StringIO()):
-        images = train_scoring.build_dataset(os.path.join(output_dir, "synthetic"), workers, extra_data=extra_data,
-                                              extra_difficulties=extra_difficulties)
+        images = _cached(cache_dir and os.path.join(cache_dir, f"train_{tag}.pkl"),
+                         lambda: train_scoring.build_dataset(os.path.join(output_dir, "synthetic"), workers,
+                                                             extra_data=extra_data, extra_difficulties=extra_difficulties))
     folds = train_scoring.fold_of_drawings(images)
-    models = {
-        fold: train_scoring.fit([image for image in images if folds[image["drawing"]] != fold])
+    val = None
+    if tune_threshold:
+        benchmark = sorted({image["drawing"] for image in images if not image["kind"].startswith("extra_")})
+        val = _cached(cache_dir and os.path.join(cache_dir, f"val_{tag}.pkl"),
+                      lambda: train_scoring.validation_images(extra_data, extra_difficulties, workers, benchmark))
+    fitted = {
+        fold: train_scoring.fit_with_threshold(
+            [image for image in images if folds[image["drawing"]] != fold], kind, None, val, workers)
         for fold in sorted(set(folds.values()))
     }
-    held_out = [train_scoring.predict(models[folds[image["drawing"]]], image) for image in images]
+    held_out = [train_scoring.predict(fitted[folds[image["drawing"]]][0], image) for image in images]
     separation = train_scoring.separation(images, held_out)["auc"]
 
     model_dir = os.path.join(output_dir, "cv")
-    for fold, model in models.items():
-        train_scoring.write_json(
-            os.path.join(model_dir, f"fold_{fold}.json"),
-            train_scoring.model_document(model, train_scoring.THRESHOLD, {"held_out_fold": fold}),
-        )
+    for fold, (model, threshold, info) in fitted.items():
+        if tune_threshold:
+            print(f"    fold {fold}: threshold {threshold:.3f} {info.get('validation')} vs {info.get('validation_reference')}")
+        train_scoring.write_model(os.path.join(model_dir, f"fold_{fold}.json"), model, threshold,
+                                  {"held_out_fold": fold, **info})
     model_of = {drawing: os.path.join(model_dir, f"fold_{fold}.json") for drawing, fold in folds.items()}
-    return model_of, separation, _same_model(train_scoring.fit(images), MODEL_PATH)
+    # The same layout train_scoring.py --cv-dir writes, so evaluate_*.py --models can use this folder.
+    train_scoring.write_json(os.path.join(model_dir, "folds.json"),
+                             {drawing: f"fold_{fold}.json" for drawing, fold in sorted(folds.items())})
+    shipped_current = kind == "scorecard" and not tune_threshold and _same_model(train_scoring.fit(images), MODEL_PATH)
+    return model_of, separation, shipped_current
 
 
 def _gaps_quietly(*job) -> Dict[str, Any]:
@@ -266,6 +298,13 @@ def main() -> None:
                         help="Also train on the train split of this synthetic dataset (scripts/make_synthetic.py).")
     parser.add_argument("--extra-difficulties", default=None,
                         help="Comma-separated levels of --extra-data to train on (default: all).")
+    parser.add_argument("--model", default="scorecard", choices=train_scoring.MODEL_KINDS,
+                        help="Kind of scorer to fit and test (default: scorecard, the shipped kind).")
+    parser.add_argument("--tune-threshold", action="store_true",
+                        help="Choose each fold's threshold on the val split of --extra-data (see train_scoring.py).")
+    parser.add_argument("--dataset-cache", default=None, metavar="DIR",
+                        help="Keep the labelled candidates here and reuse them in later runs. Delete it after any "
+                             "change to extraction, candidates or measurements.")
     parser.add_argument("--preprocess", default=None, metavar="JSON",
                         help="Preprocessing variant to test, as PreprocessConfig overrides, "
                              "e.g. '{\"threshold\": \"sauvola\"}' (see restoration/preprocess.py).")
@@ -284,9 +323,12 @@ def main() -> None:
     tests_passed = run_unit_tests()
 
     print("  Step 2 of 3: fitting the scorecards without each drawing (a minute or two)")
+    if args.tune_threshold and not args.extra_data:
+        parser.error("--tune-threshold needs --extra-data")
     model_of, separation, shipped_model_current = fit_held_out_models(
         args.output_dir, args.workers, args.extra_data,
-        args.extra_difficulties.split(",") if args.extra_difficulties else None)
+        args.extra_difficulties.split(",") if args.extra_difficulties else None,
+        args.model, args.tune_threshold, args.dataset_cache)
     print(f"    a correct candidate outscores a wrong one {100 * separation:.1f}% of the time")
 
     print("  Step 3 of 3: restoring every drawing with a model that has not seen it")

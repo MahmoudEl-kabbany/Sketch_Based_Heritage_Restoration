@@ -370,6 +370,15 @@ python evaluate_gaps.py --models models/
 python evaluate_restoration.py --models models/
 ```
 
+Alternatives to the shipped scorecard, each judged on held-out drawings by `check_changes.py` (see [docs/experiments/WP-5.md](docs/experiments/WP-5.md)):
+
+```bash
+python check_changes.py --model gbt                                        # gradient-boosted trees
+python check_changes.py --extra-data data/synthetic --extra-difficulties easy,medium --tune-threshold                         --dataset-cache cache/                             # + synthetic data, threshold tuned on its val split
+```
+
+A model file of kind `gbt` is used like any other: `restore(path, model_path="models/gbt.json")`.
+
 ---
 
 ## Pipeline Phases in Detail

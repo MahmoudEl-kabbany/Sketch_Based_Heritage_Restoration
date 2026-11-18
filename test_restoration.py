@@ -297,3 +297,38 @@ def test_committed_synthetic_samples_regenerate_exactly():
         assert np.array_equal(result["gapped"], cv2.imread(e["gapped"], cv2.IMREAD_GRAYSCALE)), e["gapped"]
         with open(e["gaps"]) as f:
             assert json.load(f)["gaps"] == json.loads(json.dumps(result["gaps"]))
+
+
+def test_boosted_model_round_trips_and_respects_directions(tmp_path):
+    import train_scoring
+    from restoration.scoring import FEATURE_DIRECTIONS, FEATURE_NAMES, SHAPE_FEATURES, load_model
+
+    rng = np.random.default_rng(0)
+    gap = FEATURE_NAMES.index("gap_length")
+    images = []
+    for _ in range(4):
+        n = 400
+        features = rng.normal(size=(n, len(FEATURE_NAMES)))
+        shape = np.where(rng.random(n) < 0.7, "smooth", "corner").astype(object)
+        correct = features[:, gap] + 0.3 * rng.normal(size=n) < -0.5          # short gaps are right
+        images.append({"features": features, "shape": shape, "correct": correct})
+    model = train_scoring.fit(images, kind="gbt")
+    path = str(tmp_path / "gbt.json")
+    train_scoring.write_model(path, model, 0.6, {})
+    loaded = load_model(path)
+    assert loaded.kind == "gbt" and loaded.threshold == 0.6
+    for shape in SHAPE_FEATURES:
+        rows = images[0]["shape"] == shape
+        columns = [FEATURE_NAMES.index(n) for n in loaded.scorecards[shape].names]
+        direct = train_scoring.predict(model, images[0])[rows]
+        assert np.allclose(loaded.scorecards[shape].probability(images[0]["features"][rows][:, columns]), direct)
+    # gap_length may only lower the probability (FEATURE_DIRECTIONS = -1).
+    assert FEATURE_DIRECTIONS["gap_length"] == -1
+    probe = np.zeros((50, len(FEATURE_NAMES)))
+    probe[:, gap] = np.linspace(-3, 3, 50)
+    image = {"features": probe, "shape": np.array(["smooth"] * 50, dtype=object)}
+    assert np.all(np.diff(train_scoring.predict(model, image)) <= 1e-12)
+    # The whole pipeline, report and figures included, runs with a boosted model.
+    strokes = [[[30, 120], [130, 120]], [[160, 120], [290, 120]], [[30, 60], [290, 60]]]
+    result = restore(draw(tmp_path / "gap.png", strokes), model_path=path, output_dir=str(tmp_path), save_images=True)
+    assert result.report["analysis"]["scoring_model"]["kind"] == "gbt"

@@ -184,6 +184,16 @@ Do the probabilities mean what they say?
 
 ---
 
+### 5.5 Alternatives: boosted trees, synthetic data, a tuned threshold
+
+`train_scoring.py` (and `check_changes.py`, which judges them on held-out drawings) can also fit:
+
+- `--model gbt`: gradient-boosted trees (scikit-learn `HistGradientBoostingClassifier`, one per bridge shape) on the same scorecard-scale measurements. The monotonic constraints follow `FEATURE_DIRECTIONS`, as the scorecard weights do. The parameters are fixed in `train_scoring.GBT_PARAMS` (seeded, no early stopping). There are no class weights, so the probabilities stay comparable with the threshold. The model file is a JSON with `"kind": "gbt"` that points to a `.joblib` file next to it. `score_candidates` then computes `probability` and `score` as before, but leaves `contributions` empty: trees give no per-measurement log-odds, so the report names no measurement for or against a bridge.
+- `--extra-data DIR --extra-difficulties easy,medium`: also trains on the train split of the synthetic dataset (`scripts/make_synthetic.py`).
+- `--tune-threshold`: chooses the acceptance threshold on the synthetic val split, leaving out its benchmark drawings. The threshold is the one that repairs the most gaps there while drawing no more line off the drawing than the plain scorecard at 2/3 (`train_scoring.choose_threshold`).
+
+The shipped model is still the scorecard at 2/3. The comparison is in [experiments/WP-5.md](experiments/WP-5.md).
+
 ## 6. Entry Points
 
 ```python
@@ -204,5 +214,6 @@ def load_model(path=MODEL_PATH) -> ScoringModel
 | Library | Usage |
 |---|---|
 | `dtaidistance` | DTW distance (compiled version when available) |
+| `scikit-learn` | only for `--model gbt` (boosted trees) |
 | `scipy` | LAPACK tridiagonal solver (`gtsv`) for the MJerk spline, KD-tree for nearest free ends; the fit in `train_scoring.py` |
 | `numpy` | everything else |

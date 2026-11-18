@@ -7,3 +7,4 @@ pyefd
 clingo
 dtaidistance
 sknw
+scikit-learn
