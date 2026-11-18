@@ -370,11 +370,13 @@ python evaluate_gaps.py --models models/
 python evaluate_restoration.py --models models/
 ```
 
-Alternatives to the shipped scorecard, each judged on held-out drawings by `check_changes.py` (see [docs/experiments/WP-5.md](docs/experiments/WP-5.md)):
+By default both scripts train as the shipped model was trained: benchmark + synthetic easy/medium, threshold tuned on the synthetic val split. Alternatives, each judged on held-out drawings by `check_changes.py` (see [docs/experiments/WP-5.md](docs/experiments/WP-5.md)):
 
 ```bash
-python check_changes.py --model gbt                                        # gradient-boosted trees
-python check_changes.py --extra-data data/synthetic --extra-difficulties easy,medium --tune-threshold                         --dataset-cache cache/                             # + synthetic data, threshold tuned on its val split
+python check_changes.py --model gbt                        # gradient-boosted trees instead of the scorecard
+python check_changes.py --no-extra-data                    # benchmark drawings only, threshold 2/3 (before WP-5)
+python check_changes.py --fixed-threshold                  # synthetic training, but threshold 2/3
+python check_changes.py --dataset-cache cache/             # reuse labelled candidates between runs
 ```
 
 A model file of kind `gbt` is used like any other: `restore(path, model_path="models/gbt.json")`.
@@ -409,7 +411,8 @@ Estimates for each candidate the probability that it redraws a missing stroke:
 - **Measurements** free of scale: gap length in stroke widths, aim of both ends, sideways offset, existing stroke crossed, nearest-partner relations, **MDTW** and **MJerk** of the bridge with its context; for corners the turn, detour, balance and straightness of the strokes
 - **Scorecards** — one logistic regression per bridge shape, one weight per measurement, each weight held to the direction its meaning allows
 - **Fitted, not tuned** — weights come from `train_scoring.py`, cross-validated by drawing
-- **Threshold** — a bridge is drawn when it is at least twice as likely right as wrong
+- **Trained on real and synthetic damage** — the benchmark drawings plus the easy and medium levels of the synthetic dataset
+- **Threshold** — chosen on the synthetic validation split (0.55): as many repairs as possible without more line drawn off the drawing
 
 ### Phase 4 — ASP Decision
 
@@ -463,14 +466,16 @@ Generates comprehensive outputs:
 
 32 drawings, 784 true gaps. Each drawing is restored with scorecards fitted **without it** (5-fold cross-validation by drawing), so these are results on unseen drawings.
 
-| | Hand-tuned pipeline | This pipeline |
-|---|---|---|
-| Gap recall | 77.7% | **87.2%** |
-| Line drawn off the drawing (damaged + undamaged images) | 1,010 line widths | **89 line widths** |
-| Wrong strokes (damaged + undamaged images) | 44 | **5** |
-| Strokes drawn on the 32 undamaged originals | 307 | **23** |
-| Repaired gaps: distance from the true centre line (median) | 0.12 line widths | 0.11 line widths |
-| Mean PSNR (damaged images: 22.26 dB) | 24.53 dB | **26.06 dB** |
+| | Hand-tuned pipeline | Fitted scorecards | + synthetic training, tuned threshold (current) |
+|---|---|---|---|
+| Gap recall | 77.7% | **87.2%** | 86.3% |
+| Line drawn off the drawing (damaged + undamaged images) | 1,010 line widths | 89 line widths | **39 line widths** |
+| Wrong strokes (damaged + undamaged images) | 44 | 5 | **3** |
+| Strokes drawn on the 32 undamaged originals | 307 | **23** | 26 |
+| Repaired gaps: distance from the true centre line (median) | 0.12 line widths | 0.12 line widths | 0.11 line widths |
+| Mean PSNR (damaged images: 22.26 dB) | 24.53 dB | 26.06 dB | **26.10 dB** |
+
+The current model (adopted in WP-5, see [docs/experiments/WP-5.md](docs/experiments/WP-5.md)) is also trained on the easy and medium levels of the synthetic dataset, and its threshold (0.55) is chosen on that dataset's validation split. It more than halves the line drawn off the drawing for 0.9 points of recall. The middle column, and the sensitivity table below, are for the fitted scorecards before that change.
 
 Recall by kind of gap: 89.8% for a gap in one stroke (625 gaps), 83.1% for a gap over a junction (118), 61.0% where a stroke end was erased (41).
 
@@ -516,7 +521,9 @@ Key parameters of the `restore()` function:
 
 The Phase 6 arguments were called `efd_*` before report schema 4.0; the old names still work, with a `DeprecationWarning`.
 
-The acceptance threshold lives in the model file (`"threshold"`, 2/3 by default: a bridge is drawn when it is at least twice as likely right as wrong). Lowering it repairs more gaps and draws more wrong strokes; `train_scoring.py` prints the trade-off.
+The acceptance threshold lives in the model file (`"threshold"`, 0.55 in the shipped model, chosen on the synthetic validation split; `train_scoring.py --fixed-threshold` uses 2/3 instead). Lowering it repairs more gaps and draws more wrong strokes; `train_scoring.py` prints the trade-off.
+
+`train_scoring.py` and `check_changes.py` train as the shipped model was trained, which needs the synthetic dataset in `data/synthetic/` (`python scripts/fetch_quickdraw.py`, then `python scripts/make_synthetic.py`). `--no-extra-data` trains on the benchmark drawings only, as before WP-5.
 
 ---
 

@@ -132,7 +132,9 @@ A measurement that would have counted the wrong way gets no weight and is left o
 
 ### 4.2 The acceptance threshold
 
-A bridge is drawn when it is at least **twice as likely to be right as wrong**: probability above 2/3 (`ACCEPTANCE_ODDS = 2` in `train_scoring.py`). Drawing a wrong stroke into a heritage drawing is worse than leaving a gap open, hence more than even odds. The threshold is stored in the model file; it is a stated preference, not a fitted number, and it can be relied on because the probabilities are calibrated (section 5.3).
+The threshold is stored in the model file. The shipped model uses **0.55**, chosen on the validation split of the synthetic dataset (section 5.5): the threshold that repairs the most gaps there without drawing more line off the drawing than the scorecard trained on the benchmark alone does at 2/3. Training on synthetic data makes the probabilities a little more cautious, which is why the threshold is lower than before.
+
+The earlier rule, still available with `train_scoring.py --fixed-threshold`, was a stated preference: a bridge is drawn when it is at least **twice as likely to be right as wrong**, probability above 2/3 (`ACCEPTANCE_ODDS = 2`). Drawing a wrong stroke into a heritage drawing is worse than leaving a gap open, hence more than even odds. Either way the threshold can be relied on because the probabilities are calibrated (section 5.3).
 
 ---
 
@@ -189,10 +191,10 @@ Do the probabilities mean what they say?
 `train_scoring.py` (and `check_changes.py`, which judges them on held-out drawings) can also fit:
 
 - `--model gbt`: gradient-boosted trees (scikit-learn `HistGradientBoostingClassifier`, one per bridge shape) on the same scorecard-scale measurements. The monotonic constraints follow `FEATURE_DIRECTIONS`, as the scorecard weights do. The parameters are fixed in `train_scoring.GBT_PARAMS` (seeded, no early stopping). There are no class weights, so the probabilities stay comparable with the threshold. The model file is a JSON with `"kind": "gbt"` that points to a `.joblib` file next to it. `score_candidates` then computes `probability` and `score` as before, but leaves `contributions` empty: trees give no per-measurement log-odds, so the report names no measurement for or against a bridge.
-- `--extra-data DIR --extra-difficulties easy,medium`: also trains on the train split of the synthetic dataset (`scripts/make_synthetic.py`).
-- `--tune-threshold`: chooses the acceptance threshold on the synthetic val split, leaving out its benchmark drawings. The threshold is the one that repairs the most gaps there while drawing no more line off the drawing than the plain scorecard at 2/3 (`train_scoring.choose_threshold`).
+- `--extra-data DIR --extra-difficulties LEVELS` (default `data/synthetic`, `easy,medium`): also trains on the train split of the synthetic dataset (`scripts/make_synthetic.py`). `--no-extra-data` trains on the benchmark drawings only.
+- The acceptance threshold is chosen on the synthetic val split, leaving out its benchmark drawings, unless `--fixed-threshold` is given. The threshold is the one that repairs the most gaps there while drawing no more line off the drawing than the plain scorecard at 2/3 (`train_scoring.choose_threshold`).
 
-The shipped model is still the scorecard at 2/3. The comparison is in [experiments/WP-5.md](experiments/WP-5.md).
+Since WP-5 the shipped model is the scorecard trained with the synthetic easy and medium levels, with the threshold tuned on the val split. These are the defaults of `train_scoring.py` and `check_changes.py`; `--no-extra-data` and `--fixed-threshold` restore the earlier training. The comparison is in [experiments/WP-5.md](experiments/WP-5.md).
 
 ## 6. Entry Points
 

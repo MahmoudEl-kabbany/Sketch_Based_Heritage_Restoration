@@ -70,13 +70,13 @@ def run_unit_tests() -> bool:
     return result.returncode == 0
 
 
-def _same_model(fitted: Dict[str, Dict[str, Any]], shipped_path: str) -> bool:
-    """True if the shipped model file holds the scorecards the current code would fit."""
+def _same_model(fitted: Dict[str, Dict[str, Any]], shipped_path: str, threshold: float = train_scoring.THRESHOLD) -> bool:
+    """True if the shipped model file holds the scorecards (and threshold) the current code would fit."""
     if not os.path.exists(shipped_path):
         return False
     with open(shipped_path) as f:
         document = json.load(f)
-    if abs(document["threshold"] - train_scoring.THRESHOLD) > 1e-9:
+    if "scorecards" not in document or abs(document["threshold"] - threshold) > 1e-9:
         return False
     shipped = document["scorecards"]
     for shape, card in fitted.items():
@@ -145,7 +145,10 @@ def fit_held_out_models(
     # The same layout train_scoring.py --cv-dir writes, so evaluate_*.py --models can use this folder.
     train_scoring.write_json(os.path.join(model_dir, "folds.json"),
                              {drawing: f"fold_{fold}.json" for drawing, fold in sorted(folds.items())})
-    shipped_current = kind == "scorecard" and not tune_threshold and _same_model(train_scoring.fit(images), MODEL_PATH)
+    shipped_current = False
+    if kind == "scorecard":
+        full_model, full_threshold, _ = train_scoring.fit_with_threshold(images, kind, None, val, workers)
+        shipped_current = _same_model(full_model, MODEL_PATH, full_threshold)
     return model_of, separation, shipped_current
 
 
@@ -294,14 +297,8 @@ def main() -> None:
                         help=f"Where reports and intermediate files go (default: {DEFAULT_OUTPUT_DIR}).")
     parser.add_argument("--workers", type=int, default=default_workers(),
                         help="Images processed in parallel (1 = one at a time).")
-    parser.add_argument("--extra-data", default=None, metavar="DIR",
-                        help="Also train on the train split of this synthetic dataset (scripts/make_synthetic.py).")
-    parser.add_argument("--extra-difficulties", default=None,
-                        help="Comma-separated levels of --extra-data to train on (default: all).")
-    parser.add_argument("--model", default="scorecard", choices=train_scoring.MODEL_KINDS,
-                        help="Kind of scorer to fit and test (default: scorecard, the shipped kind).")
-    parser.add_argument("--tune-threshold", action="store_true",
-                        help="Choose each fold's threshold on the val split of --extra-data (see train_scoring.py).")
+    # What the models are trained on: by default as the shipped model is (see train_scoring.py).
+    train_scoring.add_training_options(parser)
     parser.add_argument("--dataset-cache", default=None, metavar="DIR",
                         help="Keep the labelled candidates here and reuse them in later runs. Delete it after any "
                              "change to extraction, candidates or measurements.")
@@ -323,12 +320,9 @@ def main() -> None:
     tests_passed = run_unit_tests()
 
     print("  Step 2 of 3: fitting the scorecards without each drawing (a minute or two)")
-    if args.tune_threshold and not args.extra_data:
-        parser.error("--tune-threshold needs --extra-data")
+    extra_data, difficulties, tune = train_scoring.training_options(args, parser)
     model_of, separation, shipped_model_current = fit_held_out_models(
-        args.output_dir, args.workers, args.extra_data,
-        args.extra_difficulties.split(",") if args.extra_difficulties else None,
-        args.model, args.tune_threshold, args.dataset_cache)
+        args.output_dir, args.workers, extra_data, difficulties, args.model, tune, args.dataset_cache)
     print(f"    a correct candidate outscores a wrong one {100 * separation:.1f}% of the time")
 
     print("  Step 3 of 3: restoring every drawing with a model that has not seen it")

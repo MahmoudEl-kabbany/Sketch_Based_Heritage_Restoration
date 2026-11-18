@@ -68,10 +68,19 @@ found in WP-4 (tens of thousands of noise strokes for every scorer).
 - One cost of the recommended model: strokes drawn on undamaged originals go 23 → 26, while their off-drawing length
   falls.
 
-## To adopt the recommendation (needs Mahmoud's approval)
+## Adopted (2026-11-18, approved by Mahmoud)
+
+The recommended configuration is now the default of `train_scoring.py` and `check_changes.py`. The options are
+`--extra-data` (default `data/synthetic`) and `--extra-difficulties easy,medium`, and the threshold is tuned unless
+`--fixed-threshold` is given; `--no-extra-data` gives the old training. The shipped `restoration/scoring_model.json`
+was refitted (threshold 0.55, separation 98.4%). `check_baseline.json` was re-recorded: 86.3% recall, 39.3 line widths
+off the drawing, 3 wrong strokes, 26 strokes on undamaged originals, PSNR 26.10 dB. The exact snapshot was re-recorded
+too (35 of 64 images changed, as expected with a new model).
+
+The commands that were used:
 
 ```bash
-python train_scoring.py --extra-data data/synthetic --extra-difficulties easy,medium --tune-threshold   # writes restoration/scoring_model.json
+python train_scoring.py                  # now the default training; writes restoration/scoring_model.json
 python check_changes.py --save-baseline   # new baseline
 python regression_snapshot.py --rebless   # new exact snapshot
 ```

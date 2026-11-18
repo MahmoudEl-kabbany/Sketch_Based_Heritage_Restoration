@@ -401,6 +401,43 @@ def write_model(path: str, model: Dict[str, Dict[str, Any]], threshold: float, t
     })
 
 
+# The shipped model's training (adopted after WP-5): the benchmark plus the easy and
+# medium variants of the synthetic dataset, with the threshold chosen on its val split.
+DEFAULT_EXTRA_DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "synthetic")
+DEFAULT_EXTRA_DIFFICULTIES = "easy,medium"
+
+
+def add_training_options(parser: argparse.ArgumentParser) -> None:
+    """The options that say what a model is trained on; shared with check_changes.py."""
+    parser.add_argument("--extra-data", default=DEFAULT_EXTRA_DATA, metavar="DIR",
+                        help="Synthetic dataset (scripts/make_synthetic.py) whose train split is added to the "
+                             "training data (default: data/synthetic).")
+    parser.add_argument("--extra-split", default="train", help="Which split of --extra-data to add (train/val/test/all).")
+    parser.add_argument("--extra-difficulties", default=DEFAULT_EXTRA_DIFFICULTIES,
+                        help=f"Comma-separated levels of --extra-data to add (default: {DEFAULT_EXTRA_DIFFICULTIES}; "
+                             "all for every level).")
+    parser.add_argument("--no-extra-data", action="store_true",
+                        help="Train on the benchmark drawings only, at the fixed threshold (the model before WP-5).")
+    parser.add_argument("--fixed-threshold", action="store_true",
+                        help=f"Use the fixed threshold {THRESHOLD:.3f} instead of choosing it on the val split of --extra-data.")
+    parser.add_argument("--model", default="scorecard", choices=MODEL_KINDS,
+                        help="scorecard (logistic regression, the shipped kind) or gbt (gradient-boosted trees).")
+
+
+def training_options(
+    args: argparse.Namespace, parser: argparse.ArgumentParser,
+) -> Tuple[Optional[str], Optional[List[str]], bool]:
+    """(extra data folder or None, its difficulty levels or None for all, whether to tune the threshold)."""
+    if args.no_extra_data:
+        return None, None, False
+    if not os.path.exists(os.path.join(args.extra_data, "manifest.json")):
+        parser.error(f"no synthetic dataset at {args.extra_data}. Build it with "
+                     "python scripts/fetch_quickdraw.py and python scripts/make_synthetic.py, "
+                     "or pass --no-extra-data.")
+    levels = None if args.extra_difficulties in (None, "", "all") else args.extra_difficulties.split(",")
+    return args.extra_data, levels, not args.fixed_threshold
+
+
 THRESHOLD_GRID = tuple(np.round(np.arange(0.30, 0.901, 0.025), 3))
 
 
@@ -473,20 +510,10 @@ def main() -> None:
     parser.add_argument("--work-dir", default=None, help="Directory for the synthetic damaged images.")
     parser.add_argument("--features", default=None, help="Comma-separated measurements to use (default: all).")
     parser.add_argument("--filter", default=None, help="Only drawings whose name contains this substring.")
-    parser.add_argument("--extra-data", default=None,
-                        help="Synthetic dataset (scripts/make_synthetic.py) whose variants are added to the training data.")
-    parser.add_argument("--extra-split", default="train", help="Which split of --extra-data to add (train/val/test/all).")
-    parser.add_argument("--extra-difficulties", default=None, help="Comma-separated levels of --extra-data to add (default: all).")
-    parser.add_argument("--model", default="scorecard", choices=MODEL_KINDS,
-                        help="scorecard (logistic regression, the shipped kind) or gbt (gradient-boosted trees).")
-    parser.add_argument("--tune-threshold", action="store_true",
-                        help="Choose the acceptance threshold on the val split of --extra-data (its non-benchmark "
-                             "drawings): most gaps repaired without more line off the drawing than the plain "
-                             "scorecard at the usual threshold.")
+    add_training_options(parser)
     parser.add_argument("--workers", type=int, default=default_workers())
     args = parser.parse_args()
-    if args.tune_threshold and not args.extra_data:
-        parser.error("--tune-threshold needs --extra-data")
+    extra_data, difficulties, tune = training_options(args, parser)
 
     if args.dataset and os.path.exists(args.dataset):
         with open(args.dataset, "rb") as f:
@@ -495,19 +522,17 @@ def main() -> None:
     else:
         work_dir = args.work_dir or tempfile.mkdtemp(prefix="train_scoring_")
         os.makedirs(work_dir, exist_ok=True)
-        images = build_dataset(work_dir, args.workers, args.filter, args.extra_data, args.extra_split,
-                               args.extra_difficulties.split(",") if args.extra_difficulties else None)
+        images = build_dataset(work_dir, args.workers, args.filter, extra_data, args.extra_split, difficulties)
         if args.dataset:
             with open(args.dataset, "wb") as f:
                 pickle.dump(images, f)
 
     names = args.features.split(",") if args.features else None
     folds = fold_of_drawings(images)
-    difficulties = args.extra_difficulties.split(",") if args.extra_difficulties else None
     val = None
-    if args.tune_threshold:
+    if tune:
         benchmark = {image["drawing"] for image in images if not image["kind"].startswith("extra_")}
-        val = validation_images(args.extra_data, difficulties, args.workers, sorted(benchmark))
+        val = validation_images(extra_data, difficulties, args.workers, sorted(benchmark))
         print(f"  {len(val)} validation images for the threshold")
 
     # ---- every candidate's probability from a model fitted without its drawing
@@ -557,7 +582,7 @@ def main() -> None:
 
     print(f"\n  Model fitted on all drawings; a bridge is drawn above probability {THRESHOLD:.2f} "
           f"({ACCEPTANCE_ODDS:g} to 1 that it is right).")
-    if args.tune_threshold:
+    if tune:
         print(f"  Threshold chosen on the validation split: {final_threshold:.3f}  {threshold_info}")
     for shape, card in final_model.items():
         if card.get("kind") == "gbt":
@@ -579,7 +604,8 @@ def main() -> None:
         "correct_candidates": stats["correct"],
         "cross_validated_auc": round(stats["auc"], 4),
         "cross_validated_calibration": calibration,
-        "threshold_rule": (f"chosen on the synthetic validation split: {threshold_info}" if args.tune_threshold else
+        "extra_data": {"difficulties": difficulties or "all", "split": args.extra_split} if extra_data else None,
+        "threshold_rule": (f"chosen on the synthetic validation split: {threshold_info}" if tune else
                            f"a bridge is drawn when it is at least {ACCEPTANCE_ODDS:g} times as likely to be right as wrong"),
     }
     write_model(args.output, final_model, final_threshold, training_summary)
