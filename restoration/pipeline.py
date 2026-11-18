@@ -28,6 +28,7 @@ from bezier_curves.bezier import BezierPath, BezierSegment
 from restoration.extraction import EndpointInfo, ExtractionResult, extract_paths
 from restoration.constraints import ResolvedConstraints, add_missing_candidates, load_constraints, resolve, user_role
 from restoration.preprocess import PreprocessConfig
+from restoration import tjoins as tjoin_phase
 from restoration.candidates import ConnectionCandidate, generate_candidates
 from restoration.scoring import FEATURE_SCALES, FEATURES, MODEL_PATH, ScoringModel, load_model, score_candidates
 from restoration.asp_engine import decode_solution, solve_candidates, utility, RULES_PATH
@@ -38,7 +39,7 @@ from restoration.geometry import polyline_length, safe_normalize, visual_order_k
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
 
 # Segment source types that mark a restoration change (anything not original).
-CHANGE_SOURCES = ("bridge", "gap_closure")
+CHANGE_SOURCES = ("bridge", "tjoin", "gap_closure")
 
 # A measurement is named among a bridge's reasons when it moves the log-odds by at least this much.
 MIN_REPORTED_LOG_ODDS = 0.25
@@ -224,8 +225,11 @@ def _change_events(
     threshold: float,
     gap_closure_diagnostics: List[Dict[str, Any]],
     constraints: Optional[ResolvedConstraints] = None,
+    tjoins_drawn: Sequence[Any] = (),
+    tjoin_threshold: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Describe every restoration change for the report's ``detailed_events``."""
+    tjoin_of = {_segment_key(t.segment): t for t in tjoins_drawn}
     bridge_owner = {_segment_key(seg): c for c in accepted for seg in c.bridge_bezier}
     by_endpoint = _candidates_by_endpoint(candidates)
     closures_accepted = iter([e for e in gap_closure_diagnostics if e["accepted"]])
@@ -234,6 +238,10 @@ def _change_events(
     for number, (source, segments, pts) in enumerate(_iter_changes(final_paths), 1):
         label_id = f"R{number}"
         is_bridge = source == "bridge"
+        if source == "tjoin":
+            events.append(_tjoin_event(f"R{number}", segments, pts, tjoin_of,
+                                       tjoin_threshold if tjoin_threshold is not None else threshold))
+            continue
         pos = pts[len(pts) // 2]
         approx_length = polyline_length(pts)
 
@@ -292,14 +300,16 @@ def _open_ends(
     candidates: List[ConnectionCandidate],
     accepted: List[ConnectionCandidate],
     threshold: float,
+    tjoins_drawn: Sequence[Any] = (),
 ) -> List[Dict[str, Any]]:
     """Every free stroke end that was left open, with its best candidate and why it was not drawn."""
     by_endpoint = _candidates_by_endpoint(candidates)
     used_by = {ep.endpoint_id: c for c in accepted for ep in (c.ep_a, c.ep_b)}
+    extended = {t.endpoint.endpoint_id for t in tjoins_drawn}
 
     open_ends: List[Dict[str, Any]] = []
     for ep in extraction.endpoints:
-        if ep.endpoint_id in used_by:
+        if ep.endpoint_id in used_by or ep.endpoint_id in extended:
             continue
         entry: Dict[str, Any] = {
             "endpoint": _endpoint_ref(ep),
@@ -534,6 +544,35 @@ def _build_gap_closure_phase_summary(
     }
 
 
+def _tjoin_event(label_id: str, segments, pts, tjoin_of, threshold: float) -> Dict[str, Any]:
+    """Report entry for a T-join (Phase 5b)."""
+    pos = pts[len(pts) // 2]
+    t = next((tjoin_of[k] for k in map(_segment_key, segments) if k in tjoin_of), None)
+    event: Dict[str, Any] = {
+        "id": label_id, "source": "tjoin", "type": "T-Join",
+        "coordinates": [round(float(pos[0]), 1), round(float(pos[1]), 1)],
+        "segment_count": len(segments),
+        "geometry": {"approx_length_px": round(polyline_length(pts), 2), "sample_points": int(len(pts))},
+    }
+    if t is not None:
+        ranked = sorted(t.contributions.items(), key=lambda kv: -kv[1])
+        favour = "; ".join(f"{tjoin_phase.TJOIN_FEATURES[n]} = {t.measurements[n]:.3g} ({v:+.1f})"
+                           for n, v in ranked[:3] if v >= MIN_REPORTED_LOG_ODDS) or "no single measurement stands out"
+        event["tjoin"] = {
+            "endpoint": _endpoint_ref(t.endpoint),
+            "target": [round(float(t.target[0]), 1), round(float(t.target[1]), 1)],
+            "probability": round(float(t.probability), 4),
+            "measurements": {n: round(float(v), 4) for n, v in t.measurements.items()},
+        }
+        event["explanation"] = (
+            f"{label_id} extends {_endpoint_name(t.endpoint)} by {polyline_length(pts):.1f}px until it meets the "
+            f"stroke ahead of it at ({t.target[0]:.0f}, {t.target[1]:.0f}). The estimated probability that this "
+            f"redraws a missing stroke is {t.probability:.2f}; T-joins are drawn above {threshold:.2f}. "
+            f"In its favour: {favour}."
+        )
+    return event
+
+
 def _constraints_report(constraints: ResolvedConstraints, accepted: List[ConnectionCandidate]) -> Dict[str, Any]:
     drawn = {frozenset((c.ep_a.endpoint_id, c.ep_b.endpoint_id)) for c in accepted}
     rows = []
@@ -593,6 +632,7 @@ def _build_report(
     stage_timings: Dict[str, float],
     asp_solver_summary: Dict[str, Any],
     constraints: Optional[ResolvedConstraints] = None,
+    tjoin_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build a detailed structured restoration report."""
     extraction_open = sum(1 for p in result.paths if not p.is_closed)
@@ -601,7 +641,7 @@ def _build_report(
     final_closed = len(final_paths) - final_open
 
     return {
-        "schema_version": "4.1",
+        "schema_version": "4.2",
         "image": {
             "name": os.path.basename(image_path),
             "shape": list(result.image_shape),
@@ -651,6 +691,8 @@ def _build_report(
                 "gap_closure_events_logged": sum(1 for e in events if e["source"] == "gap_closure"),
             },
             "gap_closure_phase": gap_closure_summary,
+            # Phase 5b (schema 4.2): null when the model has no T-join scorecard.
+            "tjoins": tjoin_summary,
         },
         # The user's constraints (schema 4.1): what each resolved to and whether it held.
         "user_constraints": _constraints_report(constraints, accepted) if constraints else None,
@@ -805,6 +847,21 @@ def restore(
         restored_paths = merge_restored_paths(extraction.paths, accepted)
     print(f"    {len(bridges)} bridge segment(s) created")
 
+    # Phase 5b: T-joins (only with a model that has a T-join scorecard)
+    tjoin_candidates: List[tjoin_phase.TJoinCandidate] = []
+    tjoins_drawn: List[tjoin_phase.TJoinCandidate] = []
+    with _timed(stage_timings, "phase5b_tjoins_s"):
+        if model.tjoin is not None:
+            print("  Phase 5b: T-joins...")
+            constrained = {e for r in (constraints.records if constraints else []) for e in (r["endpoint_a"], r["endpoint_b"])}
+            tjoin_candidates = [c for c in tjoin_phase.find_candidates(extraction, restored_paths)
+                                if c.endpoint.endpoint_id not in constrained]
+            tjoin_phase.score(tjoin_candidates, model.tjoin)
+            tjoin_threshold = model.tjoin_threshold if model.tjoin_threshold is not None else model.threshold
+            tjoins_drawn = [c for c in tjoin_candidates if c.probability > tjoin_threshold]
+            tjoin_phase.apply(restored_paths, tjoins_drawn)
+            print(f"    {len(tjoins_drawn)} of {len(tjoin_candidates)} T-join(s) drawn")
+
     # Phase 6: single-gap closure (only if asked for)
     final_paths: List[BezierPath] = list(restored_paths)
     gap_closure_diagnostics: List[Dict[str, Any]] = []
@@ -828,8 +885,10 @@ def restore(
         # Ensure visual order for labeling (top-down, left-right)
         final_paths.sort(key=visual_order_key)
 
-        events = _change_events(final_paths, scored, accepted, model.threshold, gap_closure_diagnostics, constraints)
-        open_ends = _open_ends(extraction, scored, accepted, model.threshold)
+        events = _change_events(final_paths, scored, accepted, model.threshold, gap_closure_diagnostics, constraints,
+                                tjoins_drawn,
+                                model.tjoin_threshold if model.tjoin_threshold is not None else model.threshold)
+        open_ends = _open_ends(extraction, scored, accepted, model.threshold, tjoins_drawn)
         if save_images:
             _save_overlay(image_path, final_paths, output_dir, labeled=True)
             _save_overlay(image_path, final_paths, output_dir, labeled=False)
@@ -853,6 +912,7 @@ def restore(
         stage_timings,
         asp_solver_summary,
         constraints,
+        {"candidates": len(tjoin_candidates), "drawn": len(tjoins_drawn)} if model.tjoin is not None else None,
     )
 
     # Save report JSON

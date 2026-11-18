@@ -351,7 +351,7 @@ def test_user_constraints_forbid_force_and_hint(tmp_path):
         return any(all(min(np.hypot(p[0] - q[0], p[1] - q[1]) for p in pair) < 8 for q in (a, b)) for pair in pairs)
 
     plain, pairs = run(None)
-    assert plain.report["user_constraints"] is None and plain.report["schema_version"] == "4.1"
+    assert plain.report["user_constraints"] is None and plain.report["schema_version"] == "4.2"
     assert near(pairs, (130, 120), (160, 120))                       # the gap is bridged by default
 
     forbidden, pairs = run({"forbid": [{"a": [130, 120], "b": [160, 120]}]})
@@ -437,3 +437,27 @@ def test_graph_model_trains_repeatably_and_restores(tmp_path):
                                                             list(images[0]["shape"])), p1)
     result = restore(damaged, model_path=path, output_dir=str(tmp_path), save_images=True)
     assert result.report["analysis"]["scoring_model"]["kind"] == "gnn"
+
+
+def test_tjoin_extends_a_stroke_end_to_the_stroke_ahead(tmp_path):
+    import json
+
+    from restoration.scoring import MODEL_PATH
+
+    # A bar, and a stem below it whose top was erased: the stem's end points at the bar 30 px away.
+    image = draw(tmp_path / "t.png", [[[30, 60], [290, 60]], [[160, 90], [160, 200]]])
+
+    plain = restore(image, output_dir=str(tmp_path), save_images=False)
+    assert plain.report["analysis"]["tjoins"] is None                       # the shipped model has no T-join card
+
+    model = json.load(open(MODEL_PATH))
+    model["tjoin"] = {"intercept": 5.0, "features": [                       # draws any T-join aimed at its target
+        {"name": "tjoin_aim", "meaning": "", "transform": "x", "weight": -0.1, "mean": 0.0, "scale": 10.0}]}
+    path = str(tmp_path / "with_tjoin.json")
+    json.dump(model, open(path, "w"))
+    result = restore(image, model_path=path, output_dir=str(tmp_path), save_images=True)
+
+    assert result.report["analysis"]["tjoins"]["drawn"] == 1
+    event = next(e for e in result.report["detailed_events"] if e["source"] == "tjoin")
+    assert abs(event["tjoin"]["target"][1] - 60) < 6 and abs(event["tjoin"]["target"][0] - 160) < 6
+    assert all(abs(o["coordinates"][1] - 90) > 10 for o in result.report["open_ends"])   # the stem's end is no longer open

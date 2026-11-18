@@ -145,6 +145,29 @@ def build_dataset(
     drawing's synthetic variants share its cross-validation fold).
     *extra_difficulties* limits them to these levels (default: all).
     """
+    jobs = dataset_jobs(work_dir, name_filter, extra_data, extra_split, extra_difficulties)
+    if with_graph:   # graphs for the context-aware scorer (--model gnn)
+        jobs = [tuple(job) + (None,) * (5 - len(job)) + (True,) for job in jobs]
+    images = []
+    for i, image in enumerate(map_in_processes(labelled_candidates, jobs, workers), 1):
+        if image.get("skipped"):
+            print(f"  [{i}/{len(jobs)}] {image['drawing']} ({image['kind']}): skipped, does not line up with its original")
+            continue
+        print(f"  [{i}/{len(jobs)}] {image['drawing']} ({image['kind']}): "
+              f"{len(image['correct'])} candidates, {int(image['correct'].sum())} correct, "
+              f"{image['gap_count']} gaps")
+        images.append(image)
+    return images
+
+
+def dataset_jobs(
+    work_dir: str,
+    name_filter: Optional[str] = None,
+    extra_data: Optional[str] = None,
+    extra_split: str = "train",
+    extra_difficulties: Optional[Sequence[str]] = None,
+) -> List[Tuple[Any, ...]]:
+    """The training images as (drawing, kind, original, image[, reference]) jobs; writes the synthetic damage."""
     os.makedirs(work_dir, exist_ok=True)
     jobs: List[Tuple[Any, ...]] = []
     for name, original_path, damaged_path in discover_pairs(name_filter=name_filter):
@@ -167,19 +190,69 @@ def build_dataset(
                 continue
             jobs.append((entry["drawing"], f"extra_{entry['difficulty']}", entry["clean"], entry["damaged"],
                          entry["gapped"]))
+    return jobs
 
-    if with_graph:   # graphs for the context-aware scorer (--model gnn)
-        jobs = [tuple(job) + (None,) * (5 - len(job)) + (True,) for job in jobs]
-    images = []
-    for i, image in enumerate(map_in_processes(labelled_candidates, jobs, workers), 1):
-        if image.get("skipped"):
-            print(f"  [{i}/{len(jobs)}] {image['drawing']} ({image['kind']}): skipped, does not line up with its original")
-            continue
-        print(f"  [{i}/{len(jobs)}] {image['drawing']} ({image['kind']}): "
-              f"{len(image['correct'])} candidates, {int(image['correct'].sum())} correct, "
-              f"{image['gap_count']} gaps")
-        images.append(image)
-    return images
+
+# ═══════════════════════════════════════════════════════════════════════════
+# T-joins (restoration/tjoins.py)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def labelled_tjoins(
+    drawing: str, kind: str, original_path: str, image_path: str, reference_path: Optional[str] = None,
+    model_path: str = MODEL_PATH,
+) -> Dict[str, Any]:
+    """T-join candidates of one image, after its bridges, with measurements and labels from the original.
+
+    The bridges come from a restoration with *model_path* (without T-joins);
+    a T-join is correct when it redraws erased stroke next to a true gap, as
+    for bridges (evaluate_gaps.label_candidates).
+    """
+    import contextlib
+    import io
+
+    from restoration import tjoins
+    from restoration.pipeline import restore
+
+    original, damaged, agreement = load_pair(original_path, reference_path or image_path)
+    if original.shape != damaged.shape or agreement < 0.98:
+        return {"drawing": drawing, "kind": kind, "skipped": True}
+    gt = build_ground_truth(original, damaged)
+    with tempfile.TemporaryDirectory() as out, contextlib.redirect_stdout(io.StringIO()):
+        result = restore(image_path, model_path=model_path, output_dir=out, save_images=False,
+                         preprocess=training_preprocess())
+    candidates = tjoins.find_candidates(result.extraction, result.restored_paths)
+    proxies = [SimpleNamespace(ep_a=SimpleNamespace(position=c.endpoint.position),
+                               ep_b=SimpleNamespace(position=c.target), bridge_points=c.points) for c in candidates]
+    labels = label_candidates(gt, proxies) if proxies else []
+    return {
+        "drawing": drawing, "kind": kind,
+        "features": tjoins.feature_matrix(candidates),
+        "correct": np.array([row["correct"] for row in labels], dtype=bool),
+        "unfounded": np.array([row["unfounded"] for row in labels], dtype=bool),
+        "gap_count": len(gt.gaps),
+    }
+
+
+def build_tjoin_dataset(
+    work_dir: str, workers: int, extra_data: Optional[str] = None,
+    extra_difficulties: Optional[Sequence[str]] = None, model_path: str = MODEL_PATH,
+) -> List[Dict[str, Any]]:
+    """labelled_tjoins of every training image (the same images as build_dataset)."""
+    jobs = dataset_jobs(work_dir, None, extra_data, "train", extra_difficulties)
+    jobs = [tuple(job) + (None,) * (5 - len(job)) + (model_path,) for job in jobs]
+    return [image for image in map_in_processes(labelled_tjoins, jobs, workers) if not image.get("skipped")]
+
+
+def fit_tjoin(images: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """The T-join scorecard: a sign-constrained logistic regression like the bridge scorecards."""
+    from restoration.tjoins import TJOIN_DIRECTIONS, TJOIN_FEATURE_NAMES
+
+    rows = [i for i in images if len(i["correct"])]
+    x = np.vstack([i["features"] for i in rows]) if rows else np.zeros((0, len(TJOIN_FEATURE_NAMES)))
+    y = np.concatenate([i["correct"] for i in rows]).astype(float) if rows else np.zeros(0)
+    card = _fit_logistic(x, y, list(TJOIN_FEATURE_NAMES), TJOIN_DIRECTIONS)
+    card["kind"] = "tjoin"
+    return card
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -195,6 +268,13 @@ def fit_scorecard(images: Sequence[Dict[str, Any]], shape: str, names: Sequence[
     columns = [FEATURE_NAMES.index(name) for name in names]
     x = np.vstack([image["features"][image["shape"] == shape][:, columns] for image in images])
     y = np.concatenate([image["correct"][image["shape"] == shape] for image in images]).astype(float)
+    card = _fit_logistic(x, y, list(names), FEATURE_DIRECTIONS)
+    card["columns"] = [columns[names.index(n)] for n in card["names"]]
+    return card
+
+
+def _fit_logistic(x: np.ndarray, y: np.ndarray, names: List[str], directions: Dict[str, int]) -> Dict[str, Any]:
+    """Logistic regression on standardized columns, each weight within the direction *directions* allows."""
     mean, scale = x.mean(axis=0), x.std(axis=0)
     scale[scale < 1e-9] = 1.0
     z = (x - mean) / scale
@@ -207,12 +287,12 @@ def fit_scorecard(images: Sequence[Dict[str, Any]], shape: str, names: Sequence[
         return float(value), np.append(z.T @ error + weights, error.sum())
 
     allowed = {-1: (None, 0.0), 1: (0.0, None), 0: (None, None)}
-    bounds = [allowed[FEATURE_DIRECTIONS.get(name, 0)] for name in names] + [(None, None)]
+    bounds = [allowed[directions.get(name, 0)] for name in names] + [(None, None)]
     result = minimize(loss, np.zeros(len(names) + 1), jac=True, method="L-BFGS-B", bounds=bounds,
                       options={"maxiter": 5000})
     # A measurement the fit gives no weight (it would have counted the wrong way) is left off the scorecard.
     used = np.flatnonzero(result.x[:-1] != 0.0)
-    return {"names": [names[i] for i in used], "columns": [columns[i] for i in used],
+    return {"names": [names[i] for i in used],
             "mean": mean[used], "scale": scale[used],
             "weights": result.x[:-1][used], "intercept": float(result.x[-1]),
             "unused": [name for i, name in enumerate(names) if i not in used]}
@@ -271,6 +351,8 @@ def predict(model: Dict[str, Dict[str, Any]], image: Dict[str, Any]) -> np.ndarr
     if "all" in model and model["all"].get("kind") == "gnn":
         return model["all"]["scorer"].probability(image["graph"], image["features"], list(image["shape"]))
     for shape, card in model.items():
+        if card.get("kind") == "tjoin":
+            continue
         rows = image["shape"] == shape
         if card.get("kind") == "gbt":
             if rows.any():
@@ -399,9 +481,31 @@ def model_document(model: Dict[str, Dict[str, Any]], threshold: float, training:
                     for name, weight, mean, scale in zip(card["names"], card["weights"], card["mean"], card["scale"])
                 ],
             }
-            for shape, card in model.items()
+            for shape, card in model.items() if card.get("kind") != "tjoin"
         },
         "training": training,
+        **({"tjoin": _card_document(model["tjoin"], _tjoin_meaning, _tjoin_scale)} if "tjoin" in model else {}),
+    }
+
+
+def _tjoin_meaning(name: str) -> str:
+    from restoration.tjoins import TJOIN_FEATURES
+    return TJOIN_FEATURES[name]
+
+
+def _tjoin_scale(name: str) -> str:
+    from restoration.tjoins import TJOIN_SCALES
+    return TJOIN_SCALES.get(name, "x")
+
+
+def _card_document(card: Dict[str, Any], meaning, transform) -> Dict[str, Any]:
+    return {
+        "intercept": card["intercept"],
+        "features": [
+            {"name": name, "meaning": meaning(name), "transform": transform(name),
+             "weight": float(weight), "mean": float(mean), "scale": float(scale)}
+            for name, weight, mean, scale in zip(card["names"], card["weights"], card["mean"], card["scale"])
+        ],
     }
 
 
@@ -582,6 +686,11 @@ def main() -> None:
     parser.add_argument("--features", default=None, help="Comma-separated measurements to use (default: all).")
     parser.add_argument("--filter", default=None, help="Only drawings whose name contains this substring.")
     add_training_options(parser)
+    parser.add_argument("--tjoins", action="store_true",
+                        help="Also fit a T-join scorecard (restoration/tjoins.py): restorations with the model then "
+                             "extend free stroke ends to the stroke ahead of them. Not in the shipped model.")
+    parser.add_argument("--tjoin-threshold", type=float, default=None,
+                        help="Probability a T-join needs (default: the bridges' threshold).")
     parser.add_argument("--include-feedback", default=None, metavar="FILE",
                         help="Also train on user corrections logged by scripts/refine.py (feedback/feedback.jsonl).")
     parser.add_argument("--workers", type=int, default=default_workers())
@@ -693,7 +802,19 @@ def main() -> None:
         "threshold_rule": (f"chosen on the synthetic validation split: {threshold_info}" if tune else
                            f"a bridge is drawn when it is at least {ACCEPTANCE_ODDS:g} times as likely to be right as wrong"),
     }
+    if args.tjoins:
+        tjoin_images = build_tjoin_dataset(work_dir if not args.dataset else tempfile.mkdtemp(prefix="train_tjoins_"),
+                                           args.workers, extra_data, difficulties)
+        final_model["tjoin"] = fit_tjoin(tjoin_images)
+        card = final_model["tjoin"]
+        print(f"  T-join scorecard on {sum(len(i['correct']) for i in tjoin_images)} candidates: "
+              + ", ".join(f"{n} {w:+.2f}" for n, w in zip(card["names"], card["weights"])))
     write_model(args.output, final_model, final_threshold, training_summary)
+    if args.tjoins and args.tjoin_threshold is not None:
+        with open(args.output) as f:
+            document = json.load(f)
+        document["tjoin"]["threshold"] = float(args.tjoin_threshold)
+        write_json(args.output, document)
     print(f"  Model saved -> {args.output}")
     if args.cv_dir:
         for fold, (model, threshold, info) in fitted.items():

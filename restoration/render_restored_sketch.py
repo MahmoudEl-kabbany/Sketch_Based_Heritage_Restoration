@@ -146,7 +146,7 @@ def render_bridges_on_damaged(
             continue
 
         for seg in path.segments:
-            if seg.source_type not in ("bridge", "gap_closure"):
+            if seg.source_type not in ("bridge", "tjoin", "gap_closure"):
                 continue
 
             pts = seg.sample(n=pts_per_segment)

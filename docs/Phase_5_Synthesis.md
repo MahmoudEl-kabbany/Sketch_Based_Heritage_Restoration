@@ -58,6 +58,18 @@ After the bridge segments are created, the discrete paths must be chained togeth
 
 ---
 
+## 4b. T-joins (Phase 5b, optional)
+
+A bridge joins two free stroke ends. Some damage needs a stroke end extended until it meets *another stroke* instead: a stroke tip erased next to the stroke it touched, or the stem of an erased T-junction, whose bar is redrawn by a bridge. `restoration/tjoins.py` handles these after the bridges are merged:
+
+1. **Sources:** every free end still free after merging.
+2. **Target:** the nearest point of any final path (bridges included, not the end's own stroke) within 12 line widths and within 25° of the end's direction.
+3. **Measurements** (`TJOIN_FEATURES`): length, aim, incidence on the target stroke, crossed ink, stub length, a free end nearer than the target, and whether the target lies on a bridge.
+4. **Scoring:** a sign-constrained scorecard (`"tjoin"` section of the model file), fitted by `train_scoring.py --tjoins` on candidates labelled from the original drawing. An end takes its T-join if the probability exceeds `tjoin.threshold` (default: the bridges' threshold).
+5. **Drawing:** the source path is extended by a cubic that leaves the end along its tangent and arrives straight at the target. Its segments have `source_type = "tjoin"`.
+
+**T-joins run only when the model file has a `"tjoin"` section.** The shipped model has none: on held-out real pairs they added 1.5 points of recall but 10.6 line widths off the drawing (see [experiments/tjoins.md](experiments/tjoins.md)).
+
 ## 5. Entry Points
 
 ```python

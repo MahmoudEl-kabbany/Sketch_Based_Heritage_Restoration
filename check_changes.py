@@ -80,6 +80,8 @@ def _same_model(fitted: Dict[str, Dict[str, Any]], shipped_path: str, threshold:
         return False
     shipped = document["scorecards"]
     for shape, card in fitted.items():
+        if card.get("kind") == "tjoin":
+            continue
         features = shipped.get(shape, {}).get("features", [])
         if [feature["name"] for feature in features] != card["names"]:
             return False
@@ -109,6 +111,7 @@ def fit_held_out_models(
     kind: str = "scorecard",
     tune_threshold: bool = False,
     cache_dir: Optional[str] = None,
+    with_tjoins: bool = False,
 ) -> Tuple[Dict[str, str], float, bool]:
     """Fit the model once without each fold of drawings.
 
@@ -135,6 +138,16 @@ def fit_held_out_models(
             [image for image in images if folds[image["drawing"]] != fold], kind, None, val, workers)
         for fold in sorted(set(folds.values()))
     }
+    if with_tjoins:
+        with contextlib.redirect_stdout(io.StringIO()):
+            tjoin_images = _cached(cache_dir and os.path.join(cache_dir, f"tjoin_{tag}.pkl"),
+                                   lambda: train_scoring.build_tjoin_dataset(
+                                       os.path.join(output_dir, "synthetic"), workers, extra_data, extra_difficulties))
+        for fold, (model, threshold, info) in fitted.items():
+            model["tjoin"] = train_scoring.fit_tjoin([i for i in tjoin_images if folds.get(i["drawing"]) != fold])
+            card = model["tjoin"]
+            print(f"    fold {fold}: T-join scorecard on {sum(len(i['correct']) for i in tjoin_images if folds.get(i['drawing']) != fold)} "
+                  f"candidates: " + ", ".join(f"{n} {w:+.2f}" for n, w in zip(card["names"], card["weights"])))
     held_out = [train_scoring.predict(fitted[folds[image["drawing"]]][0], image) for image in images]
     separation = train_scoring.separation(images, held_out)["auc"]
 
@@ -302,6 +315,8 @@ def main() -> None:
                         help="Images processed in parallel (1 = one at a time).")
     # What the models are trained on: by default as the shipped model is (see train_scoring.py).
     train_scoring.add_training_options(parser)
+    parser.add_argument("--tjoins", action="store_true",
+                        help="Also fit T-join scorecards (restoration/tjoins.py), so the restorations draw T-joins.")
     parser.add_argument("--dataset-cache", default=None, metavar="DIR",
                         help="Keep the labelled candidates here and reuse them in later runs. Delete it after any "
                              "change to extraction, candidates or measurements.")
@@ -326,7 +341,7 @@ def main() -> None:
     extra_data, difficulties, tune = train_scoring.training_options(args, parser)
     train_scoring.configure_gnn(args)
     model_of, separation, shipped_model_current = fit_held_out_models(
-        args.output_dir, args.workers, extra_data, difficulties, args.model, tune, args.dataset_cache)
+        args.output_dir, args.workers, extra_data, difficulties, args.model, tune, args.dataset_cache, args.tjoins)
     print(f"    a correct candidate outscores a wrong one {100 * separation:.1f}% of the time")
 
     print("  Step 3 of 3: restoring every drawing with a model that has not seen it")

@@ -195,6 +195,10 @@ Each entry of `detailed_events` explains one change and carries the same `id` as
 - `alternatives` are the three most probable other candidates for the same two stroke ends: what the bridge was preferred to.
 - A `gap_closure` event has `gap_closure_validity` (closure method, reason, gap size and plausibility metrics) instead of `candidate`.
 
+### Schema 4.2: T-joins
+
+`analysis.tjoins` is `null` when the model has no T-join scorecard; otherwise `{"candidates": n, "drawn": m}`. A T-join appears in `detailed_events` with `"source": "tjoin"`, `"type": "T-Join"`, and a `tjoin` entry: the extended stroke end, the target point, its probability and its measurements. `summary.stage_timings_s` gains `phase5b_tjoins_s`.
+
 ### Schema 4.1: user constraints
 
 `user_constraints` is `null` unless constraints were given to `restore()`. Then it holds one row per constraint: its `kind` (`forbid` / `force` / `hint`), the positions given (`a`, `b`), the stroke ends they resolved to (`endpoint_a`, `endpoint_b`), the candidates of that pair (`candidates`), whether one was `synthesized`, whether a bridge now joins the pair (`bridged`), and whether the constraint `held`. `candidates_added` lists the synthesized candidate ids. A bridge event whose pair was forced or hinted has `"user": "forced"` or `"user": "hinted"`.

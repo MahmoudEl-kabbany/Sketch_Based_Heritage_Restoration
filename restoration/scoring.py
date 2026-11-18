@@ -433,6 +433,9 @@ class ScoringModel:
     scorecards: Dict[str, Union[Scorecard, BoostedModel]]
     threshold: float
     kind: str = "scorecard"
+    # Scorecard for T-joins (restoration/tjoins.py); without it, no T-joins are drawn.
+    tjoin: Optional[Scorecard] = None
+    tjoin_threshold: Optional[float] = None   # probability a T-join needs; default: the bridges' threshold
 
     @property
     def threshold_log_odds(self) -> float:
@@ -478,7 +481,24 @@ def load_model(path: str = MODEL_PATH) -> ScoringModel:
             weights=np.array([feature["weight"] for feature in card["features"]], dtype=np.float64),
             intercept=float(card["intercept"]),
         )
-    return ScoringModel(scorecards=scorecards, threshold=float(data["threshold"]))
+    tjoin = None
+    if data.get("tjoin"):
+        from restoration.tjoins import TJOIN_FEATURE_NAMES
+
+        card = data["tjoin"]
+        unknown = [f["name"] for f in card["features"] if f["name"] not in TJOIN_FEATURE_NAMES]
+        if unknown:
+            raise ValueError(f"Scoring model {path}: unknown T-join measurements {unknown}")
+        tjoin = Scorecard(
+            names=[f["name"] for f in card["features"]],
+            mean=np.array([f["mean"] for f in card["features"]], dtype=np.float64),
+            scale=np.array([f["scale"] for f in card["features"]], dtype=np.float64),
+            weights=np.array([f["weight"] for f in card["features"]], dtype=np.float64),
+            intercept=float(card["intercept"]),
+        )
+    tjoin_threshold = float(data["tjoin"]["threshold"]) if data.get("tjoin") and "threshold" in data["tjoin"] else None
+    return ScoringModel(scorecards=scorecards, threshold=float(data["threshold"]), tjoin=tjoin,
+                        tjoin_threshold=tjoin_threshold)
 
 
 def held_out_models(directory: str, drawings: List[str]) -> Dict[str, str]:

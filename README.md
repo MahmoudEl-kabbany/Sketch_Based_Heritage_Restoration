@@ -516,7 +516,7 @@ Across all of these, gap recall stays between 84.8% and 88.6% and the off-drawin
 
 The acceptance threshold is the one deliberate choice. At 0.5 (even odds) gap recall is 88.8% with 173 line widths off the drawing; at 0.8 it is 82.8% with 24.
 
-**What limits it.** The provided damage is cut out with straight edges, and 32 drawings are few; cross-validation guards against memorising drawings, not against a different kind of damage. A stroke end that should be extended to meet another stroke, and a stroke end that was erased, cannot be repaired by joining two ends. Some of the bridges drawn on undamaged originals are across gaps the artist left, which look like damage.
+**What limits it.** The provided damage is cut out with straight edges, and 32 drawings are few; cross-validation guards against memorising drawings, not against a different kind of damage. A stroke end that should be extended to meet another stroke, and a stroke end that was erased, cannot be repaired by joining two ends. T-joins (`train_scoring.py --tjoins`, Phase 5b) extend a free end to the stroke ahead of it; they are not in the shipped model, because they cost more line off the drawing than the recall they add (see [docs/experiments/tjoins.md](docs/experiments/tjoins.md)). Some of the bridges drawn on undamaged originals are across gaps the artist left, which look like damage.
 
 ---
 
