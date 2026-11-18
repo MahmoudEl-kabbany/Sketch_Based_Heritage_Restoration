@@ -65,3 +65,34 @@ Against the drawn bridges that repair a gap, their median measurements are:
    length"), refitted. It would let the scorer learn that long, sharply turning bridges are plausible *when several
    ends meet at one place*. It could recover some of the under-scored 67%, but risks more wrong strokes. Judge it with
    `check_changes.py`.
+
+## Follow-up: a junction-aware measurement (tried, not kept)
+
+Branch `wp-junction-measurement`. Mahmoud chose option 2 above. A measurement was added to every scorecard:
+`ends_nearby`, the number of other free stroke ends within half the gap plus two stroke widths of the bridge's
+middle (0 at an ordinary gap, 1–2 at an erased junction). It entered as `log2(1 + x)`, sign unconstrained, and was
+refitted with the shipped training (synthetic easy/medium, tuned threshold).
+
+| | shipped | + `ends_nearby` |
+|---|---|---|
+| real pairs: recall % | 86.3 | 86.7 |
+| real pairs: off-drawing (lw) | **39.3** | 53.5 |
+| real pairs: wrong strokes | **3** | 5 |
+| real pairs: strokes on undamaged | **26** | 29 |
+| synthetic test, easy+medium: recall % | 89.6 | 90.2 |
+| synthetic test, easy+medium: junction recall % | 69.8 | 70.4 |
+| synthetic test, easy+medium: corner recall % | 84.3 | 86.3 |
+| synthetic test, easy+medium: wrong strokes / off-drawing | **13 / 261** | 16 / 292 |
+
+`check_changes.py` verdict: trade-off, **not kept** (+0.4 points of recall for 14 more line widths off the drawing).
+
+The fit gave `ends_nearby` a **negative** weight (−0.19). Over all candidates, more ends nearby means a bridge is
+*less* likely to be right: at a crowded spot the wrong candidates outnumber the right one. An additive measurement
+cannot say "long, sharply turning bridges are plausible at junctions". That needs an interaction (e.g. aim or gap
+length *given* a junction), on a lever worth about 0.5 points of overall recall.
+
+The measurement was reverted (it would otherwise change cached labels and the GBT/GNN inputs for no gain). The
+commit history keeps it.
+
+**Conclusion on junctions:** on per-bridge scoring, junctions are close to what end-to-end bridges can do. The
+remaining structural part needs T-join candidates (a free end joined to the middle of another stroke).
