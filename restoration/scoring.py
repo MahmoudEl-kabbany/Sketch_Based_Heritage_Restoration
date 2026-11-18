@@ -49,8 +49,6 @@ FEATURES: Dict[str, str] = {
     "nearest_ratio": "gap length relative to the distance from each end to its nearest free end",
     "same_stroke": "the two ends belong to one stroke (1 = yes: the bridge closes it)",
     "crossed_ink": "existing stroke the bridge runs over between its ends, in stroke widths",
-    "faint_ink": "darkness of the darkest point inside the bridge, relative to the paper around it (1 = black ink)",
-    "gap_texture": "grey-level variation along the inside of the bridge, relative to that of the paper around it",
     # ---- smooth bridges
     "aim_worst": "degrees by which the worse-aimed end points away from the other end",
     "aim_best": "degrees by which the better-aimed end points away from the other end",
@@ -78,7 +76,7 @@ SHAPE_FEATURES: Dict[str, Tuple[str, ...]] = {
 # of magnitude and enter by their logarithm; the others enter as they are.
 FEATURE_SCALES: Dict[str, str] = {
     "gap_length": "log2(x)", "width_mismatch": "log2(x)", "stub_shortness": "log2(x)", "nearest_ratio": "log2(x)",
-    "crossed_ink": "log2(1 + x)", "sideways_offset": "log2(1 + x)", "gap_texture": "log2(1 + x)",
+    "crossed_ink": "log2(1 + x)", "sideways_offset": "log2(1 + x)",
     "mdtw": "ln(1 + x)", "mjerk": "log10(1 + 1e10 x)",
 }
 _SCALE_FUNCTIONS = {
@@ -94,7 +92,6 @@ _SCALE_FUNCTIONS = {
 # Measurements not listed may count either way.
 FEATURE_DIRECTIONS: Dict[str, int] = {
     "gap_length": -1, "width_mismatch": -1, "stub_shortness": -1, "nearest_ratio": -1, "crossed_ink": -1,
-    "faint_ink": -1, "gap_texture": -1,
     "aim_worst": -1, "aim_best": -1, "turn": -1, "sideways_offset": -1, "arc_miss": -1, "mdtw": -1, "mjerk": -1,
     "corner_detour": -1, "corner_balance": -1, "corner_bend": -1,
     "mutual_nearest": 1,
@@ -308,33 +305,6 @@ def _crossed_ink(bridge_points: np.ndarray, dist_map: Optional[np.ndarray]) -> f
     return float(ink[first_clear:last_clear + 1].sum())
 
 
-def _grey_evidence(bridge_points: np.ndarray, gray: Optional[np.ndarray], line_width: float) -> Tuple[float, float]:
-    """(faint_ink, gap_texture) of a bridge from the grey image: what lies inside the gap, below the threshold too.
-
-    Measured on the bridge without 1.5 line widths at either end (those are the
-    strokes it joins), against the paper of a window 4 line widths around it:
-    the 90th percentile of the window is the paper's brightness, the spread of
-    its lighter half the paper's own texture.
-    """
-    if gray is None:
-        return 0.0, 0.0
-    h, w = gray.shape
-    along = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(bridge_points, axis=0), axis=1))))
-    inner = bridge_points[(along > 1.5 * line_width) & (along < along[-1] - 1.5 * line_width)]
-    if len(inner) < 2:
-        return 0.0, 0.0
-    xy = np.clip(np.round(inner).astype(int), [0, 0], [w - 1, h - 1])
-    values = gray[xy[:, 1], xy[:, 0]].astype(np.float64)
-    x0, y0 = np.maximum(inner.min(axis=0) - 4 * line_width, 0).astype(int)
-    x1, y1 = np.minimum(inner.max(axis=0) + 4 * line_width, [w - 1, h - 1]).astype(int)
-    window = gray[y0:y1 + 1, x0:x1 + 1].astype(np.float64)
-    paper = float(np.percentile(window, 90))
-    light = window[window >= np.percentile(window, 50)]
-    paper_spread = max(float(light.std()) if light.size else 0.0, 1.0)
-    return (float(np.clip((paper - values.min()) / max(paper, 1.0), 0.0, 1.0)),
-            float(values.std() / paper_spread))
-
-
 def _measure(candidate: ConnectionCandidate, ends: Dict[int, _End], result: ExtractionResult) -> List[float]:
     """The FEATURES of one candidate, in order; NaN for those not on the scorecard of its shape."""
     ep_a, ep_b = candidate.ep_a, candidate.ep_b
@@ -359,7 +329,6 @@ def _measure(candidate: ConnectionCandidate, ends: Dict[int, _End], result: Extr
         same_stroke=float(candidate.same_path_closure),
         crossed_ink=_crossed_ink(candidate.bridge_points, result.dist_map) / width,
     )
-    values["faint_ink"], values["gap_texture"] = _grey_evidence(candidate.bridge_points, result.gray, result.line_width)
 
     if candidate.shape == "corner":
         corner = np.asarray(candidate.corner_point, dtype=np.float64)

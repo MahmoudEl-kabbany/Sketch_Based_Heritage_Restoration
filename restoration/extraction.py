@@ -51,7 +51,6 @@ class ExtractionResult:
     image_shape: Tuple[int, int]   # (h, w)
     diagonal: float                # sqrt(h² + w²)
     dist_map: Optional[np.ndarray] = None  # distance of every pixel to the nearest stroke
-    gray: Optional[np.ndarray] = None      # the grayscale image itself (for the grey-level measurements of Phase 3)
     line_width: float = 2.0        # typical stroke width of the drawing, in pixels
 
 
@@ -195,5 +194,4 @@ def extract_paths(
         # Distance of every pixel to the nearest stroke (0 on strokes)
         dist_map=cv2.distanceTransform((255 - binary).astype(np.uint8), cv2.DIST_L2, 5),
         line_width=line_width,
-        gray=cv2.imread(image_path, cv2.IMREAD_GRAYSCALE),
     )
