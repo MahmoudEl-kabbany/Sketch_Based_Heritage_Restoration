@@ -4,6 +4,7 @@ preprocessed/
 outputs/
 restoration_output/
 tests/
+results/
 
 # Test input images
 test_images/
