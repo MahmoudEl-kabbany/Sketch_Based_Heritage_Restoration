@@ -116,17 +116,20 @@ def fit_held_out_models(
     outscores a wrong one on held-out drawings, whether the shipped model is
     what the current code would fit).
     """
-    tag = "extra-" + "-".join(extra_difficulties or ["all"]) if extra_data else "base"
+    with_graph = kind == "gnn"
+    tag = ("extra-" + "-".join(extra_difficulties or ["all"]) if extra_data else "base") + ("-graph" if with_graph else "")
     with contextlib.redirect_stdout(io.StringIO()):
         images = _cached(cache_dir and os.path.join(cache_dir, f"train_{tag}.pkl"),
                          lambda: train_scoring.build_dataset(os.path.join(output_dir, "synthetic"), workers,
-                                                             extra_data=extra_data, extra_difficulties=extra_difficulties))
+                                                             extra_data=extra_data, extra_difficulties=extra_difficulties,
+                                                             with_graph=with_graph))
     folds = train_scoring.fold_of_drawings(images)
     val = None
     if tune_threshold:
         benchmark = sorted({image["drawing"] for image in images if not image["kind"].startswith("extra_")})
         val = _cached(cache_dir and os.path.join(cache_dir, f"val_{tag}.pkl"),
-                      lambda: train_scoring.validation_images(extra_data, extra_difficulties, workers, benchmark))
+                      lambda: train_scoring.validation_images(extra_data, extra_difficulties, workers, benchmark,
+                                                              with_graph=with_graph))
     fitted = {
         fold: train_scoring.fit_with_threshold(
             [image for image in images if folds[image["drawing"]] != fold], kind, None, val, workers)
@@ -321,6 +324,7 @@ def main() -> None:
 
     print("  Step 2 of 3: fitting the scorecards without each drawing (a minute or two)")
     extra_data, difficulties, tune = train_scoring.training_options(args, parser)
+    train_scoring.configure_gnn(args)
     model_of, separation, shipped_model_current = fit_held_out_models(
         args.output_dir, args.workers, extra_data, difficulties, args.model, tune, args.dataset_cache)
     print(f"    a correct candidate outscores a wrong one {100 * separation:.1f}% of the time")

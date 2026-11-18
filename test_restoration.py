@@ -406,3 +406,34 @@ def test_refine_session_logs_feedback_that_trains(tmp_path):
     session.save(str(tmp_path / "c.json"))
     assert json.load(open(tmp_path / "c.json"))["forbid"]
     assert session.render().shape[2] == 3
+
+
+def test_graph_model_trains_repeatably_and_restores(tmp_path):
+    import train_scoring
+    from restoration.gnn import GnnConfig, train as train_gnn
+    from restoration.scoring import load_model
+
+    images = []
+    for k, y in enumerate((60, 100, 140)):
+        whole = [[[30, y], [290, y]], [[30, y + 60], [290, y + 60]]]
+        broken = [[[30, y], [140, y]], [[160, y], [290, y]], [[30, y + 60], [290, y + 60]]]
+        original = draw(tmp_path / f"o{k}.png", whole)
+        damaged = draw(tmp_path / f"d{k}.png", broken)
+        images.append(train_scoring.labelled_candidates(f"t{k}", "provided", original, damaged, with_graph=True))
+    assert all("graph" in i and i["correct"].any() for i in images)
+
+    config = dict(epochs=3, hidden=8, layers=2)
+    first = train_gnn(images, GnnConfig(**config))
+    second = train_gnn(images, GnnConfig(**config))
+    p1 = first.probability(images[0]["graph"], images[0]["features"], list(images[0]["shape"]))
+    p2 = second.probability(images[0]["graph"], images[0]["features"], list(images[0]["shape"]))
+    assert np.array_equal(p1, p2)                                    # seeded, deterministic
+
+    path = str(tmp_path / "gnn.json")
+    train_scoring.write_model(path, {"all": {"kind": "gnn", "scorer": first, "names": [], "unused": []}}, 0.5, {})
+    loaded = load_model(path)
+    assert loaded.kind == "gnn"
+    assert np.allclose(loaded.scorecards["all"].probability(images[0]["graph"], images[0]["features"],
+                                                            list(images[0]["shape"])), p1)
+    result = restore(damaged, model_path=path, output_dir=str(tmp_path), save_images=True)
+    assert result.report["analysis"]["scoring_model"]["kind"] == "gnn"

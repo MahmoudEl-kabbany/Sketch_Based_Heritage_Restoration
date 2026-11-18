@@ -546,6 +546,15 @@ def _constraints_report(constraints: ResolvedConstraints, accepted: List[Connect
 
 def _model_summary(model: ScoringModel) -> Dict[str, Any]:
     """The scoring model as the report states it: the scorecards' weights, or for boosted trees their measurements."""
+    if model.kind == "gnn":
+        scorer = model.scorecards["all"]
+        return {
+            "threshold": round(float(model.threshold), 4),
+            "kind": "gnn",
+            # A graph network over the drawing: no weights to list; its relations and size.
+            "graph_network": {"relations": list(scorer.config.relations), "hidden": scorer.config.hidden,
+                              "layers": scorer.config.layers},
+        }
     if model.kind == "gbt":
         return {
             "threshold": round(float(model.threshold), 4),

@@ -40,6 +40,7 @@ from restoration.candidates import generate_candidates
 from restoration.extraction import extract_paths
 from restoration.pipeline import default_workers, map_in_processes
 from restoration.render_restored_sketch import estimate_line_width
+from restoration.graph_features import build_graph
 from restoration.scoring import (
     FEATURE_DIRECTIONS, FEATURE_NAMES, FEATURE_SCALES, FEATURES, MODEL_PATH, SHAPE_FEATURES, candidate_features,
 )
@@ -79,6 +80,7 @@ def make_synthetic_damage(original_path: str, out_path: str, version: int, gap_c
 
 def labelled_candidates(
     drawing: str, kind: str, original_path: str, image_path: str, reference_path: Optional[str] = None,
+    with_graph: bool = False,
 ) -> Dict[str, Any]:
     """Candidates of one image with their measurements and what the original says about them.
 
@@ -106,6 +108,7 @@ def labelled_candidates(
         "endpoints": np.array([[c.ep_a.endpoint_id, c.ep_b.endpoint_id] for c in candidates], dtype=int).reshape(-1, 2),
         "bridges": [c.bridge_points.astype(np.float32) for c in candidates],
         "gap_count": len(gt.gaps),
+        **({"graph": build_graph(extraction, candidates)} if with_graph else {}),
     }
 
 
@@ -116,6 +119,7 @@ def build_dataset(
     extra_data: Optional[str] = None,
     extra_split: str = "train",
     extra_difficulties: Optional[Sequence[str]] = None,
+    with_graph: bool = False,
 ) -> List[Dict[str, Any]]:
     """Labelled candidates of every drawing: its provided damage, synthetic damage, and no damage.
 
@@ -148,6 +152,8 @@ def build_dataset(
             jobs.append((entry["drawing"], f"extra_{entry['difficulty']}", entry["clean"], entry["damaged"],
                          entry["gapped"]))
 
+    if with_graph:   # graphs for the context-aware scorer (--model gnn)
+        jobs = [tuple(job) + (None,) * (5 - len(job)) + (True,) for job in jobs]
     images = []
     for i, image in enumerate(map_in_processes(labelled_candidates, jobs, workers), 1):
         if image.get("skipped"):
@@ -196,7 +202,9 @@ def fit_scorecard(images: Sequence[Dict[str, Any]], shape: str, names: Sequence[
             "unused": [name for i, name in enumerate(names) if i not in used]}
 
 
-MODEL_KINDS = ("scorecard", "gbt")
+MODEL_KINDS = ("scorecard", "gbt", "gnn")
+# Options of the graph model (--gnn-relations, --gnn-epochs); see restoration/gnn.py.
+GNN_OPTIONS: Dict[str, Any] = {}
 # Gradient-boosted trees: small and regularized, a fixed seed and no early stopping
 # (which would hold out a random share), so the fit is repeatable.
 GBT_PARAMS = dict(max_iter=200, learning_rate=0.1, max_leaf_nodes=15, min_samples_leaf=40,
@@ -229,6 +237,11 @@ def fit(
 
     *kind*: "scorecard" (logistic regression, the shipped model) or "gbt" (gradient-boosted trees).
     """
+    if kind == "gnn":
+        from restoration.gnn import GnnConfig, train as train_gnn
+
+        scorer = train_gnn(images, GnnConfig(**GNN_OPTIONS))
+        return {"all": {"kind": "gnn", "scorer": scorer, "names": list(FEATURE_NAMES), "unused": []}}
     fitter = fit_boosted if kind == "gbt" else fit_scorecard
     return {
         shape: fitter(images, shape, [n for n in shape_names if names is None or n in names])
@@ -239,6 +252,8 @@ def fit(
 def predict(model: Dict[str, Dict[str, Any]], image: Dict[str, Any]) -> np.ndarray:
     """Probability of every candidate of an image, each from the scorecard of its shape."""
     probability = np.zeros(len(image["shape"]))
+    if "all" in model and model["all"].get("kind") == "gnn":
+        return model["all"]["scorer"].probability(image["graph"], image["features"], list(image["shape"]))
     for shape, card in model.items():
         rows = image["shape"] == shape
         if card.get("kind") == "gbt":
@@ -377,6 +392,25 @@ def model_document(model: Dict[str, Dict[str, Any]], threshold: float, training:
 def write_model(path: str, model: Dict[str, Dict[str, Any]], threshold: float, training: Dict[str, Any]) -> None:
     """Write a fitted model where load_model() reads it: a scorecard JSON, or for
     boosted trees a JSON pointing to a joblib file next to it."""
+    if "all" in model and model["all"].get("kind") == "gnn":
+        import torch
+
+        weights_file = os.path.splitext(os.path.basename(path))[0] + ".pt"
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        scorer = model["all"]["scorer"]
+        torch.save(scorer.state(), os.path.join(os.path.dirname(os.path.abspath(path)), weights_file))
+        write_json(path, {
+            "description": "A graph network over the drawing (restoration/gnn.py) giving the probability that a "
+                           "candidate bridge redraws a missing stroke, from its two stroke ends in context and its "
+                           "measurements. Fitted by train_scoring.py --model gnn.",
+            "kind": "gnn",
+            "threshold": threshold,
+            "weights": weights_file,
+            "config": scorer.config.to_dict(),
+            "torch_version": torch.__version__,
+            "training": training,
+        })
+        return
     if not any(card.get("kind") == "gbt" for card in model.values()):
         write_json(path, model_document(model, threshold, training))
         return
@@ -421,7 +455,27 @@ def add_training_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fixed-threshold", action="store_true",
                         help=f"Use the fixed threshold {THRESHOLD:.3f} instead of choosing it on the val split of --extra-data.")
     parser.add_argument("--model", default="scorecard", choices=MODEL_KINDS,
-                        help="scorecard (logistic regression, the shipped kind) or gbt (gradient-boosted trees).")
+                        help="scorecard (logistic regression, the shipped kind), gbt (gradient-boosted trees) "
+                             "or gnn (graph network over the drawing, restoration/gnn.py).")
+    parser.add_argument("--gnn-relations", default=None,
+                        help="Comma-separated relations the graph model passes messages over "
+                             "(default: all of stroke,near,parallel,candidate,symmetric; none for no context).")
+    parser.add_argument("--gnn-epochs", type=int, default=None, help="Training epochs of the graph model (default 30).")
+
+
+def configure_gnn(args: argparse.Namespace) -> None:
+    """Set GNN_OPTIONS from --gnn-relations / --gnn-epochs (used by fit(kind="gnn"))."""
+    GNN_OPTIONS.clear()
+    if getattr(args, "gnn_relations", None):
+        from restoration.graph_features import RELATIONS
+        # "none": no message passing, the network sees only each candidate's own measurements (ablation).
+        relations = () if args.gnn_relations == "none" else tuple(r for r in args.gnn_relations.split(",") if r)
+        unknown = set(relations) - set(RELATIONS)
+        if unknown:
+            raise SystemExit(f"unknown relations {sorted(unknown)}; known: {', '.join(RELATIONS)}")
+        GNN_OPTIONS["relations"] = relations
+    if getattr(args, "gnn_epochs", None):
+        GNN_OPTIONS["epochs"] = int(args.gnn_epochs)
 
 
 def training_options(
@@ -438,7 +492,7 @@ def training_options(
     return args.extra_data, levels, not args.fixed_threshold
 
 
-THRESHOLD_GRID = tuple(np.round(np.arange(0.30, 0.901, 0.025), 3))
+THRESHOLD_GRID = tuple(np.round(np.arange(0.05, 0.901, 0.025), 3))   # wide enough that no model sits on its floor
 
 
 def choose_threshold(
@@ -473,12 +527,13 @@ def write_json(path: str, document: Dict[str, Any]) -> None:
 
 def validation_images(
     extra_data: str, difficulties: Optional[Sequence[str]], workers: int, exclude: Sequence[str] = (),
+    with_graph: bool = False,
 ) -> List[Dict[str, Any]]:
     """Labelled candidates of the val split of a synthetic dataset, without the drawings in *exclude*
     (the benchmark's, so that no threshold is tuned on a drawing it is later tested on)."""
     from synthetic_damage import load_dataset
 
-    jobs = [(e["drawing"], f"val_{e['difficulty']}", e["clean"], e["damaged"], e["gapped"])
+    jobs = [(e["drawing"], f"val_{e['difficulty']}", e["clean"], e["damaged"], e["gapped"], with_graph)
             for e in load_dataset(extra_data, "val")
             if e["drawing"] not in set(exclude) and (not difficulties or e["difficulty"] in difficulties)]
     return [image for image in map_in_processes(labelled_candidates, jobs, workers) if not image.get("skipped")]
@@ -516,6 +571,7 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=default_workers())
     args = parser.parse_args()
     extra_data, difficulties, tune = training_options(args, parser)
+    configure_gnn(args)
 
     if args.dataset and os.path.exists(args.dataset):
         with open(args.dataset, "rb") as f:
@@ -524,7 +580,8 @@ def main() -> None:
     else:
         work_dir = args.work_dir or tempfile.mkdtemp(prefix="train_scoring_")
         os.makedirs(work_dir, exist_ok=True)
-        images = build_dataset(work_dir, args.workers, args.filter, extra_data, args.extra_split, difficulties)
+        images = build_dataset(work_dir, args.workers, args.filter, extra_data, args.extra_split, difficulties,
+                               with_graph=args.model == "gnn")
         if args.dataset:
             with open(args.dataset, "wb") as f:
                 pickle.dump(images, f)
@@ -541,7 +598,7 @@ def main() -> None:
     val = None
     if tune:
         benchmark = {image["drawing"] for image in images if not image["kind"].startswith("extra_")}
-        val = validation_images(extra_data, difficulties, args.workers, sorted(benchmark))
+        val = validation_images(extra_data, difficulties, args.workers, sorted(benchmark), with_graph=args.model == "gnn")
         print(f"  {len(val)} validation images for the threshold")
 
     # ---- every candidate's probability from a model fitted without its drawing
@@ -596,6 +653,9 @@ def main() -> None:
     for shape, card in final_model.items():
         if card.get("kind") == "gbt":
             print(f"  Boosted trees for {shape} bridges on: {', '.join(card['names'])}")
+            continue
+        if card.get("kind") == "gnn":
+            print(f"  Graph network over relations: {', '.join(card['scorer'].config.relations)}")
             continue
         print(f"  Scorecard for {shape} bridges, weights on standardized measurements:")
         for name, weight in sorted(zip(card["names"], card["weights"]), key=lambda item: -abs(item[1])):

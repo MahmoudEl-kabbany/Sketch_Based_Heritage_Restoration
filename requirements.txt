@@ -8,3 +8,4 @@ clingo
 dtaidistance
 sknw
 scikit-learn
+torch

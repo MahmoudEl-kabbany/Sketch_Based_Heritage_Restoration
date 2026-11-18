@@ -446,6 +446,15 @@ def load_model(path: str = MODEL_PATH) -> ScoringModel:
     with open(path) as f:
         data = json.load(f)
 
+    if data.get("kind") == "gnn":
+        import torch   # only needed for graph models
+
+        from restoration.gnn import GnnScorer
+
+        state = torch.load(os.path.join(os.path.dirname(path), data["weights"]), weights_only=False)
+        return ScoringModel(scorecards={"all": GnnScorer.from_state(state)},
+                            threshold=float(data["threshold"]), kind="gnn")
+
     if data.get("kind") == "gbt":
         import joblib   # scikit-learn's dependency; only needed for boosted models
 
@@ -503,6 +512,10 @@ def score_candidates(
         model = load_model(model or MODEL_PATH)
 
     measurements = measure_candidates(candidates, result)
+    if model.kind == "gnn":
+        _score_graph(candidates, measurements, result, model)
+        candidates.sort(key=lambda c: (-c.score, c.distance, c.id))
+        return candidates
     if model.kind == "gbt":
         _score_boosted(candidates, measurements, model)
         candidates.sort(key=lambda c: (-c.score, c.distance, c.id))
@@ -541,3 +554,21 @@ def _score_boosted(candidates: List[ConnectionCandidate], measurements: np.ndarr
             c.contributions = {}
             c.probability = float(p)
             c.score = float(np.log(p / (1.0 - p))) - model.threshold_log_odds
+
+
+def _score_graph(
+    candidates: List[ConnectionCandidate], measurements: np.ndarray, result: ExtractionResult, model: ScoringModel,
+) -> None:
+    """score_candidates for a graph model (restoration/gnn.py): all candidates of the drawing at once, in context."""
+    from restoration.graph_features import build_graph
+
+    scorer = model.scorecards["all"]
+    graph = build_graph(result, candidates)
+    probability = np.clip(scorer.probability(graph, on_scorecard_scale(measurements), [c.shape for c in candidates]),
+                          1e-9, 1.0 - 1e-9)
+    for c, p, measured in zip(candidates, probability, measurements):
+        names = SHAPE_FEATURES.get(c.shape, ())
+        c.features = {name: float(measured[FEATURE_NAMES.index(name)]) for name in names}
+        c.contributions = {}
+        c.probability = float(p)
+        c.score = float(np.log(p / (1.0 - p))) - model.threshold_log_odds

@@ -196,6 +196,20 @@ Do the probabilities mean what they say?
 
 Since WP-5 the shipped model is the scorecard trained with the synthetic easy and medium levels, with the threshold tuned on the val split. These are the defaults of `train_scoring.py` and `check_changes.py`; `--no-extra-data` and `--fixed-threshold` restore the earlier training. The comparison is in [experiments/WP-5.md](experiments/WP-5.md).
 
+### 5.6 A context-aware scorer: graph network (`--model gnn`)
+
+The scorecards judge a candidate from its two stroke ends alone. At a junction, several ends compete, and the right pairing depends on what surrounds them. `--model gnn` (WP-7) scores every candidate of a drawing together, in context:
+
+- **The graph** (`restoration/graph_features.py`):
+  - Nodes are the free stroke ends, junctions, and samples every 4 line widths along each stroke.
+  - Node features: position / diagonal, outward tangent, orientation, signed curvature, stroke radius, node type.
+  - Five relations: `stroke` (along a stroke), `near` (6 nearest within 8 line widths), `parallel` (near, other stroke, same direction), `candidate` (the two ends of every candidate, so competing candidates see each other) and `symmetric` (mirror partners across the drawing's reflection axis, from Phase 6's detector).
+- **The network** (`restoration/gnn.py`): 3 rounds of relational message passing in plain PyTorch, with one weight matrix per relation, mean aggregation and residual connections (no PyTorch Geometric needed). Each candidate is then classified from its two ends' states (sum and product, so the order of the ends does not matter), its standardized measurements and its shape.
+- **Training:** binary cross-entropy, Adam, 30 epochs, seeded, with deterministic algorithms. `--gnn-relations` limits the relations (for ablations), `--gnn-epochs` sets the epochs.
+- **The model file:** `"kind": "gnn"` with a `.pt` file next to it. Like the boosted trees, it gives probabilities but no per-measurement explanation.
+
+Results are in [experiments/WP-7.md](experiments/WP-7.md).
+
 ## 6. Entry Points
 
 ```python
@@ -217,5 +231,6 @@ def load_model(path=MODEL_PATH) -> ScoringModel
 |---|---|
 | `dtaidistance` | DTW distance (compiled version when available) |
 | `scikit-learn` | only for `--model gbt` (boosted trees) |
+| `torch` | only for `--model gnn` (graph network) |
 | `scipy` | LAPACK tridiagonal solver (`gtsv`) for the MJerk spline, KD-tree for nearest free ends; the fit in `train_scoring.py` |
 | `numpy` | everything else |
